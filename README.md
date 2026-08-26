@@ -52,6 +52,26 @@ reports each in its own unit — dividing bytes by wall-time would be nonsense:
 |---|---|---|
 | `…:cpu:nanoseconds:delta` | `CORES` | average cores busy |
 | `…:wallclock:nanoseconds:…` | `BLOCKED` | average threads waiting (off-CPU) |
+
+### Reading `BLOCKED` (off-CPU) honestly
+
+Off-CPU totals are dominated by threads that are **idle, not stuck**. A thread
+pool parked waiting for work is "blocked" in exactly the same way as a thread
+stuck behind a lock, and there are usually far more of the former:
+
+```
+WORKLOAD     BLOCKED   %TOTAL      FUNCTION
+clickhouse   1816.692    41.4      ThreadPoolImpl::ThreadFromThreadPool::worker  100%
+agentloop     232.447     5.3      runtime.mstart                                 86%
+```
+
+Both of those are idleness — ClickHouse's pool workers and Go's parked Ms — not
+bottlenecks. A fleet-wide off-CPU sweep therefore tends to rank services by how
+many idle threads they keep, which is not interesting.
+
+Off-CPU earns its keep **targeted**, not swept: profile one operation you
+already believe is slow, and look for waits on its critical path. Judge the
+stacks, never the totals.
 | `memory:inuse_space:…` | `BYTES` | live heap |
 | `goroutine:…` / `mutex:contentions:…` | `COUNT` | totals |
 
