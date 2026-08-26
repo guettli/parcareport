@@ -70,18 +70,48 @@ parcareport types [flags]      list profile types the server offers
 Break down by anything the agents label:
 
 ```sh
-parcareport --by=comm --from=-24h --top=0          # which processes burn CPU
-parcareport --by=node --match='comm="clickhouse"'  # where that process runs
-parcareport labels comm                            # what values exist
+parcareport --by=namespace --from=-24h --top=0        # which namespace burns CPU
+parcareport --by=workload  --from=-24h                # which Deployment/DaemonSet
+parcareport --by=comm      --from=-24h --top=0        # which processes
+parcareport --by=node --match='workload="clickhouse"' # where that workload runs
+parcareport labels workload                           # what values exist
 ```
+
+`namespace`, `container`, `workload` and `workload_kind` only exist if the
+agents are given `relabel_configs` via `--config-path` — parca-agent discovers
+Kubernetes metadata but exposes it as `__meta_*` labels, which relabelling drops
+unless you map them:
+
+```yaml
+relabel_configs:
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  - source_labels: [__meta_kubernetes_pod_container_name]
+    target_label: container
+  - source_labels: [__meta_kubernetes_pod_controller_name]
+    target_label: workload
+  # A Deployment's pods are owned by a ReplicaSet, so the controller name
+  # carries a hash that changes every redeploy. Strip it back.
+  - source_labels: [__meta_kubernetes_pod_controller_kind, __meta_kubernetes_pod_controller_name]
+    regex: ReplicaSet;(.+)-[^-]+
+    target_label: workload
+    replacement: ${1}
+```
+
+There is no `pod` label to map: parca-agent v0.38.0 does not emit
+`__meta_kubernetes_pod_name` (upstream's own `kubernetes-config.yaml` example
+is stale on this point). Group by `workload` instead — lower cardinality, and
+stable across pod restarts.
 
 ### The `(unlabeled)` row
 
 If some series lack the `--by` label entirely, their CPU appears as
 `(unlabeled)` rather than being dropped. This is deliberate: a single agent
 deployed without the label would otherwise vanish from the breakdown while
-still burning CPU, and the table would quietly fail to add up. A large
-`(unlabeled)` row usually means an agent is missing its external label:
+still burning CPU, and the table would quietly fail to add up. When grouping by `namespace` or `workload` a large `(unlabeled)` row is
+expected and correct — it is every process outside a Kubernetes pod (kernel
+threads, the kubelet, anything on the host). When grouping by `cluster` it
+usually means an agent is missing its external label:
 
 ```yaml
 # parca-agent DaemonSet
