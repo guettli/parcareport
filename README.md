@@ -70,6 +70,40 @@ series carry `job`/`instance` labels rather than the agent's
 When a profile type only covers some series, group values with no samples are
 counted and omitted rather than printed as a wall of zero rows.
 
+### Partial results are never presented as complete
+
+A breakdown runs one query per label value, and any of them can fail — a slow
+merge over a wide window, a restarting server. If that happens, the totals and
+percentages would silently exclude whatever failed, and the table would still
+look complete.
+
+So failures are printed **on stdout**, next to the numbers they invalidate,
+and the command exits non-zero:
+
+```
+!! INCOMPLETE: 3 of 47 workload queries failed. The totals and
+!! percentages above EXCLUDE them and are therefore wrong.
+!!   workload=agentloop: context deadline exceeded
+```
+
+Deliberately not stderr alone: `2>/dev/null` is common in scripts, and hiding
+this is exactly how a broken run gets mistaken for a real measurement. For the
+same reason, a run where *every* query fails says so rather than reporting
+"no data in this window", which would read as an idle cluster.
+
+`--timeout` (default 60s) bounds each query so one slow group fails visibly
+instead of stalling the run.
+
+### Measuring before and after a change
+
+Use the **CPU** profile. It is a delta, so a merge over a window is a genuine
+rate. Memory profiles are **cumulative since process start** (`delta=false`),
+so comparing `alloc_space` between two processes of different ages measures
+their ages, not their allocation rates — which will make a change look
+dramatically better or worse than it was.
+
+Sanity-check absolute numbers against `kubectl top` at least once.
+
 ## Install
 
 ```sh

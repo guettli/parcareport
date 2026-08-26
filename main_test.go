@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -146,5 +147,18 @@ func TestTopFunctions(t *testing.T) {
 func TestFuncNameBucketsUnsymbolized(t *testing.T) {
 	if got := funcName(profile.Line{}); got != "[unsymbolized]" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestShortErrTrimsGRPCBoilerplate(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"rpc error: code = DeadlineExceeded desc = context deadline exceeded", "context deadline exceeded"},
+		{"merge query \"x\": boom", "boom"},
+		{"plain", "plain"},
+	}
+	for _, tc := range tests {
+		if got := shortErr(errors.New(tc.in)); got != tc.want {
+			t.Errorf("shortErr(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

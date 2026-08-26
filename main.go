@@ -37,6 +37,7 @@ type options struct {
 	match       string
 	top         int
 	concurrency int
+	timeout     time.Duration
 }
 
 func run(args []string) error {
@@ -51,6 +52,7 @@ func run(args []string) error {
 	fs.StringVar(&o.match, "match", "", `extra label matchers, e.g. 'cluster="tc",comm="clickhouse"'`)
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel merge queries")
+	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), usage)
 		fs.PrintDefaults()
@@ -178,8 +180,10 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			qctx, qcancel := context.WithTimeout(ctx, o.timeout)
+			defer qcancel()
 			sel := selector(profType, o.by, g, o.match)
-			raw, err := c.MergePprof(ctx, sel, start, end)
+			raw, err := c.MergePprof(qctx, sel, start, end)
 			if err != nil {
 				results[i] = result{name: g, err: err}
 				return
@@ -198,9 +202,13 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	rows := make([]Row, 0, len(results))
 	var total float64
 	empty := 0
+	var failed []string
 	for _, r := range results {
 		if r.err != nil {
-			fmt.Fprintf(os.Stderr, "warning: %s=%s: %v\n", o.by, r.name, r.err)
+			// Collected, not just warned about. A warning on stderr vanishes
+			// under `2>/dev/null` and leaves a table that looks complete but
+			// whose totals and percentages silently omit whatever failed.
+			failed = append(failed, fmt.Sprintf("%s=%s: %s", o.by, r.name, shortErr(r.err)))
 			continue
 		}
 		total += r.cores
@@ -215,6 +223,13 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		rows = append(rows, Row{Name: r.name, Cores: r.cores})
 	}
 	if len(rows) == 0 {
+		// Distinguish "the window is genuinely empty" from "every query
+		// failed". Reporting the second as the first is how a broken run gets
+		// mistaken for an idle cluster.
+		if len(failed) > 0 {
+			printFailures(failed)
+			return fmt.Errorf("all %d %s queries failed; no results", len(failed), o.by)
+		}
 		return errors.New("no data in this window")
 	}
 	// Everything matching the selector, including series that carry no value
@@ -254,6 +269,13 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	if empty > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", empty, o.by)
 	}
+	if len(failed) > 0 {
+		// On stdout, next to the numbers it invalidates -- never only stderr.
+		fmt.Printf("\n!! INCOMPLETE: %d of %d %s queries failed. The totals and\n"+
+			"!! percentages above EXCLUDE them and are therefore wrong.\n",
+			len(failed), len(groups), o.by)
+		printFailures(failed)
+	}
 
 	if o.top > 0 && overall != nil {
 		fmt.Println()
@@ -264,6 +286,10 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		// Percentages are against the same profile the functions came from,
 		// so CUM for a root frame approaches 100% rather than exceeding it.
 		printFunctionTable(fns, header, o.top, grand)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d of %d %s queries failed; results above are incomplete",
+			len(failed), len(groups), o.by)
 	}
 	return nil
 }
@@ -341,6 +367,31 @@ func parseTime(s string, now time.Time) (time.Time, error) {
 		d = -d // "6h" reads as "6h ago", same as "-6h"
 	}
 	return now.Add(d), nil
+}
+
+// printFailures lists what broke, capped so a wholesale outage does not bury
+// the numbers under hundreds of identical lines.
+func printFailures(failed []string) {
+	const show = 5
+	for i, f := range failed {
+		if i == show {
+			fmt.Printf("!!   ... and %d more\n", len(failed)-show)
+			break
+		}
+		fmt.Printf("!!   %s\n", f)
+	}
+}
+
+// shortErr trims the gRPC boilerplate so the reason is readable at a glance.
+func shortErr(err error) string {
+	msg := err.Error()
+	if i := strings.LastIndex(msg, "desc = "); i >= 0 {
+		return msg[i+len("desc = "):]
+	}
+	if i := strings.LastIndex(msg, ": "); i >= 0 {
+		return msg[i+2:]
+	}
+	return msg
 }
 
 func max(a, b int) int {
