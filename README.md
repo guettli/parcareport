@@ -42,6 +42,34 @@ value is a **count of stack samples, not a duration**. Multiplying by the
 sampling period converts it to CPU time. Skip that and every number in the
 report is silently off by a constant factor.
 
+## Beyond CPU
+
+A CPU sampler cannot see a thread that is *blocked*, and knows nothing about the
+heap. If your Parca has more than CPU in it, `parcareport` reads those too and
+reports each in its own unit — dividing bytes by wall-time would be nonsense:
+
+| profile | column | means |
+|---|---|---|
+| `…:cpu:nanoseconds:delta` | `CORES` | average cores busy |
+| `…:wallclock:nanoseconds:…` | `BLOCKED` | average threads waiting (off-CPU) |
+| `memory:inuse_space:…` | `BYTES` | live heap |
+| `goroutine:…` / `mutex:contentions:…` | `COUNT` | totals |
+
+```sh
+parcareport types                                        # what the server has
+parcareport --profile-type='...wallclock...' --by=cluster  # who is blocking
+parcareport --profile-type='memory:inuse_space:bytes:space:bytes' --by=instance
+```
+
+Off-CPU needs `--off-cpu-threshold` on the agents (per-mille, `0` = off; note
+the dashes — `--offcpu-threshold` is rejected). Heap, goroutine and mutex
+profiles come from `scrape_configs` against Go `/debug/pprof` endpoints; those
+series carry `job`/`instance` labels rather than the agent's
+`cluster`/`comm`, so group them with `--by=instance`.
+
+When a profile type only covers some series, group values with no samples are
+counted and omitted rather than printed as a wall of zero rows.
+
 ## Install
 
 ```sh

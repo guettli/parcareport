@@ -189,21 +189,30 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 				results[i] = result{name: g, err: err}
 				return
 			}
-			cs, err := cpuSeconds(p)
-			results[i] = result{name: g, cores: cores(cs, window), err: err}
+			m, err := interpret(p, window)
+			results[i] = result{name: g, cores: m.Value, err: err}
 		}(i, g)
 	}
 	wg.Wait()
 
 	rows := make([]Row, 0, len(results))
 	var total float64
+	empty := 0
 	for _, r := range results {
 		if r.err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %s=%s: %v\n", o.by, r.name, r.err)
 			continue
 		}
-		rows = append(rows, Row{Name: r.name, Cores: r.cores})
 		total += r.cores
+		// A label value with no samples in the window says nothing, and there
+		// can be hundreds of them -- every `comm` on the box when the profile
+		// came from a scrape target, for instance. Count them, do not print
+		// them.
+		if r.cores == 0 {
+			empty++
+			continue
+		}
+		rows = append(rows, Row{Name: r.name, Cores: r.cores})
 	}
 	if len(rows) == 0 {
 		return errors.New("no data in this window")
@@ -223,12 +232,14 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		return err
 	}
 	grand := total
+	header := "CORES"
 	if overall != nil {
-		cs, err := cpuSeconds(overall)
+		m, err := interpret(overall, window)
 		if err != nil {
 			return err
 		}
-		grand = cores(cs, window)
+		header = m.Header
+		grand = m.Value
 		if residual := grand - total; residual > grand*0.001 {
 			rows = append(rows, Row{Name: "(unlabeled)", Cores: residual})
 		}
@@ -239,7 +250,10 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Cores > rows[j].Cores })
-	printGroupTable(strings.ToUpper(o.by), rows, grand)
+	printGroupTable(strings.ToUpper(o.by), header, rows, grand)
+	if empty > 0 {
+		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", empty, o.by)
+	}
 
 	if o.top > 0 && overall != nil {
 		fmt.Println()
@@ -249,7 +263,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		}
 		// Percentages are against the same profile the functions came from,
 		// so CUM for a root frame approaches 100% rather than exceeding it.
-		printFunctionTable(fns, o.top, grand)
+		printFunctionTable(fns, header, o.top, grand)
 	}
 	return nil
 }

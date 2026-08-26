@@ -17,6 +17,77 @@ type Row struct {
 	Pct   float64
 }
 
+// Metric is how one profile type wants to be summarized. Not every profile is
+// a rate: dividing a heap size or a goroutine count by the window is nonsense,
+// so the unit decides both the number and the column header.
+type Metric struct {
+	Header string  // column title, e.g. CORES / BLOCKED / BYTES / COUNT
+	Value  float64 // already normalized per the header's meaning
+	Rate   bool    // true if Value was divided by the window
+}
+
+// interpret summarizes a profile the way its units actually mean.
+//
+//   - CPU time (samples x period, or an explicit time unit under a "cpu" period)
+//     becomes average cores busy.
+//   - Off-CPU wallclock time becomes the average number of threads blocked --
+//     the same arithmetic, but it is not a core and must not say so.
+//   - Heap profiles are byte totals; goroutine and mutex profiles are counts.
+//     Neither is divided by anything.
+func interpret(p *profile.Profile, window time.Duration) (Metric, error) {
+	idx, unit := valueIndex(p)
+	var total int64
+	for _, s := range p.Sample {
+		if idx < len(s.Value) {
+			total += s.Value[idx]
+		}
+	}
+
+	switch unit {
+	case "bytes":
+		return Metric{Header: "BYTES", Value: float64(total)}, nil
+	case "count":
+		// A count with a time-based period is a sampled duration (parca-agent's
+		// CPU profile); a count with no such period is a real count.
+		if p.Period > 0 && p.PeriodType != nil && isTimeUnit(p.PeriodType.Unit) {
+			secs, err := scaleToSeconds(p, total, unit)
+			if err != nil {
+				return Metric{}, err
+			}
+			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true}, nil
+		}
+		return Metric{Header: "COUNT", Value: float64(total)}, nil
+	}
+
+	if isTimeUnit(unit) {
+		secs, err := scaleToSeconds(p, total, unit)
+		if err != nil {
+			return Metric{}, err
+		}
+		header := "BLOCKED" // wallclock: average threads waiting, not cores
+		if sampleTypeIsCPU(p, idx) {
+			header = "CORES"
+		}
+		return Metric{Header: header, Value: cores(secs, window), Rate: true}, nil
+	}
+	return Metric{}, fmt.Errorf("unsupported sample unit %q", unit)
+}
+
+func isTimeUnit(u string) bool {
+	switch u {
+	case "nanoseconds", "microseconds", "milliseconds", "seconds":
+		return true
+	}
+	return false
+}
+
+func sampleTypeIsCPU(p *profile.Profile, idx int) bool {
+	if idx < len(p.SampleType) && p.SampleType[idx].Type == "cpu" {
+		return true
+	}
+	return p.PeriodType != nil && p.PeriodType.Type == "cpu"
+}
+
 // cpuSeconds converts a merged pprof into CPU-seconds.
 //
 // This is the subtle part. parca-agent's CPU profile has sample type
@@ -105,6 +176,11 @@ func parsePprof(raw []byte) (*profile.Profile, error) {
 // cores. Cumulative counts a function once per sample even if it recurses.
 func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
 	idx, unit := valueIndex(p)
+	m, err := interpret(p, window)
+	if err != nil {
+		return nil, err
+	}
+	rate := m.Rate
 	cum := map[string]int64{}
 	flat := map[string]int64{}
 
@@ -134,13 +210,20 @@ func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
 
 	rows := make([]Row, 0, len(cum))
 	for name, c := range cum {
-		cs, err := scaleToSeconds(p, c, unit)
-		if err != nil {
-			return nil, err
+		var cs, fs float64
+		if rate {
+			var err error
+			if cs, err = scaleToSeconds(p, c, unit); err != nil {
+				return nil, err
+			}
+			if fs, err = scaleToSeconds(p, flat[name], unit); err != nil {
+				return nil, err
+			}
 		}
-		fs, err := scaleToSeconds(p, flat[name], unit)
-		if err != nil {
-			return nil, err
+		if !rate {
+			// Byte and count profiles are totals, not per-second rates.
+			rows = append(rows, Row{Name: name, Cores: float64(c), Flat: float64(flat[name])})
+			continue
 		}
 		rows = append(rows, Row{Name: name, Cores: cores(cs, window), Flat: cores(fs, window)})
 	}
