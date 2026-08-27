@@ -58,10 +58,25 @@ func run(args []string) error {
 		fs.PrintDefaults()
 	}
 
-	// Subcommands come before flags: `parcareport labels --url=...`.
-	sub := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		sub, args = args[0], args[1:]
+	// Subcommands, and the one argument `labels` takes, come before flags:
+	// `parcareport labels comm --url=...`.
+	//
+	// Both have to be peeled off here, not just the subcommand. Go's flag
+	// package stops parsing at the first non-flag argument, so with only the
+	// subcommand removed everything after `comm` became an ignored positional
+	// -- including --url, which silently sent the query to localhost instead
+	// of the server that was asked for.
+	var positional []string
+	for len(args) > 0 && !strings.HasPrefix(args[0], "-") && len(positional) < 2 {
+		positional = append(positional, args[0])
+		args = args[1:]
+	}
+	sub, subArg := "", ""
+	if len(positional) > 0 {
+		sub = positional[0]
+	}
+	if len(positional) > 1 {
+		subArg = positional[1]
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -75,7 +90,7 @@ func run(args []string) error {
 		return err
 	}
 
-	c, err := Dial(o.addr, o.insecure)
+	c, err := Dial(o.addr, o.insecure, o.timeout)
 	if err != nil {
 		return err
 	}
@@ -86,10 +101,21 @@ func run(args []string) error {
 
 	switch sub {
 	case "", "report":
+		if subArg != "" {
+			return fmt.Errorf("report takes no argument, got %q (break it down with --by=%s)", subArg, subArg)
+		}
 		return report(ctx, c, o, start, end)
 	case "labels":
-		return listLabels(ctx, c, fs.Arg(0), start, end)
+		// Flags may also precede the name (`labels --url=x comm`), in which
+		// case flag parsing leaves it as the first positional.
+		if subArg == "" {
+			subArg = fs.Arg(0)
+		}
+		return listLabels(ctx, c, subArg, start, end)
 	case "types":
+		if subArg != "" {
+			return fmt.Errorf("types takes no argument, got %q", subArg)
+		}
 		names, err := c.ProfileTypeNames(ctx)
 		if err != nil {
 			return err
@@ -111,6 +137,12 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 		vals, err := c.LabelValues(ctx, name, start, end)
 		if err != nil {
 			return err
+		}
+		if len(vals) == 0 {
+			// Printing nothing and exiting 0 is the worst of the three
+			// readings: a typo'd label, an empty window and a failed query all
+			// looked like success. Say which one it is.
+			return explainNoValues(ctx, c, name, start, end)
 		}
 		sort.Strings(vals)
 		for _, v := range vals {
@@ -156,7 +188,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		return err
 	}
 	if len(groups) == 0 {
-		return fmt.Errorf("label %q has no values in this window -- run `parcareport labels` to see what exists", o.by)
+		return explainNoValues(ctx, c, o.by, start, end)
 	}
 	sort.Strings(groups)
 
@@ -292,6 +324,45 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 			len(failed), len(groups), o.by)
 	}
 	return nil
+}
+
+// explainNoValues turns an empty label-values response into a specific
+// conclusion instead of the most convenient one.
+//
+// The values query answers "no values" for several unrelated reasons, and at
+// this layer they are indistinguishable: the label does not exist, the window
+// holds nothing at all, or the query quietly came back short. The old message
+// asserted the first without checking -- and a retry, once, produced values
+// for the very label it had just declared empty. So cross-check against the
+// label names in the same window and name the reason.
+//
+// The cross-check is one cheap query, and it only runs on a path that is
+// already about to fail.
+func explainNoValues(ctx context.Context, c *Client, label string, start, end time.Time) error {
+	window := fmt.Sprintf("%s .. %s", start.Format(time.RFC3339), end.Format(time.RFC3339))
+
+	names, err := c.LabelNames(ctx, start, end)
+	if err != nil {
+		return fmt.Errorf("label %q returned no values, and the cross-check failed too, so "+
+			"this is more likely a server problem than an empty window -- retry before believing it: %w",
+			label, err)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("the server has no labels at all in %s: nothing was written in this window. "+
+			"Widen --from/--to, or check that an agent is still writing", window)
+	}
+	for _, n := range names {
+		if n == label {
+			// Parca listed the label for this window, so at least one series
+			// carries it -- and a label cannot exist without a value. The two
+			// answers contradict each other, which points at the values query,
+			// not at the data.
+			return fmt.Errorf("label %q exists in %s but returned no values, which is contradictory: "+
+				"the values query most likely failed rather than found nothing. Retry it", label, window)
+		}
+	}
+	sort.Strings(names)
+	return fmt.Errorf("no label %q in %s; the server has: %s", label, window, strings.Join(names, ", "))
 }
 
 func resolveProfileType(ctx context.Context, c *Client, want string) (string, error) {

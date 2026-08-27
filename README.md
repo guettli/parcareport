@@ -112,7 +112,25 @@ same reason, a run where *every* query fails says so rather than reporting
 "no data in this window", which would read as an idle cluster.
 
 `--timeout` (default 60s) bounds each query so one slow group fails visibly
-instead of stalling the run.
+instead of stalling the run. That includes the label and profile-type lookups,
+which used to have no deadline at all and would hold a run for minutes against
+an unwell server before failing as something else.
+
+An **empty** answer gets the same scepticism as a failed one. Parca reports
+"no values" for a label that does not exist, for a window that holds nothing,
+and for a query that simply came back short — the same response in all three
+cases. Rather than assert the most convenient reading, the tool cross-checks
+against the label names in the same window and names the reason:
+
+```
+no label "clustr" in 2026-08-27T06:00:00Z .. 2026-08-27T07:00:00Z; the server has: cluster, comm, node
+the server has no labels at all in <window>: nothing was written in this window
+label "cluster" exists in <window> but returned no values, which is contradictory:
+  the values query most likely failed rather than found nothing. Retry it
+```
+
+The third one is real: a retry once produced values for the very label the
+previous run had just declared empty.
 
 ### Measuring before and after a change
 
