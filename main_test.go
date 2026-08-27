@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
+	qgrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/query/v1alpha1/queryv1alpha1grpc"
+	qv1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"github.com/google/pprof/profile"
+	"google.golang.org/grpc"
 )
 
 func TestParseTime(t *testing.T) {
@@ -160,5 +165,114 @@ func TestShortErrTrimsGRPCBoilerplate(t *testing.T) {
 		if got := shortErr(errors.New(tc.in)); got != tc.want {
 			t.Errorf("shortErr(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// fakeQuery implements just the two metadata calls the tests exercise.
+// Embedding the interface satisfies the rest; anything else panics, which is
+// the correct outcome for a call these tests did not intend to make.
+type fakeQuery struct {
+	qgrpc.QueryServiceClient
+	names     []string
+	values    map[string][]string
+	namesErr  error
+	valuesErr error
+	block     time.Duration // make Values hang, to exercise the deadline
+}
+
+func (f *fakeQuery) Labels(ctx context.Context, _ *qv1.LabelsRequest, _ ...grpc.CallOption) (*qv1.LabelsResponse, error) {
+	if f.namesErr != nil {
+		return nil, f.namesErr
+	}
+	return &qv1.LabelsResponse{LabelNames: f.names}, nil
+}
+
+func (f *fakeQuery) Values(ctx context.Context, in *qv1.ValuesRequest, _ ...grpc.CallOption) (*qv1.ValuesResponse, error) {
+	if f.block > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(f.block):
+		}
+	}
+	if f.valuesErr != nil {
+		return nil, f.valuesErr
+	}
+	return &qv1.ValuesResponse{LabelValues: f.values[in.GetLabelName()]}, nil
+}
+
+func testClient(f *fakeQuery, timeout time.Duration) *Client {
+	return &Client{q: f, timeout: timeout}
+}
+
+// The bug this guards: a label query with no deadline of its own inherited the
+// process-wide one and stalled the run for minutes.
+func TestMetadataQueriesRespectTimeout(t *testing.T) {
+	c := testClient(&fakeQuery{block: time.Hour}, 20*time.Millisecond)
+	start := time.Now()
+	_, err := c.LabelValues(context.Background(), "cluster", start.Add(-time.Hour), start)
+	if err == nil {
+		t.Fatal("a hung Values call must fail, not hang")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s; the per-query timeout did not apply", elapsed)
+	}
+	if !strings.Contains(err.Error(), "timed out") || !strings.Contains(err.Error(), "--timeout") {
+		t.Errorf("a deadline should say so and say what to do about it, got: %v", err)
+	}
+}
+
+// The three readings of an empty values response must not collapse into one
+// message. Getting this wrong once meant a transient failure was reported as
+// an empty window.
+func TestExplainNoValuesDistinguishesTheReasons(t *testing.T) {
+	start, end := time.Now().Add(-time.Hour), time.Now()
+	tests := []struct {
+		name string
+		f    *fakeQuery
+		want string
+	}{
+		{
+			name: "label is absent from the window",
+			f:    &fakeQuery{names: []string{"node", "comm"}},
+			want: `no label "cluster"`,
+		},
+		{
+			name: "window holds nothing at all",
+			f:    &fakeQuery{names: nil},
+			want: "no labels at all",
+		},
+		{
+			// Parca listed the label, so a series carries it -- yet the values
+			// query found none. That contradiction is the values query's fault.
+			name: "label exists but yielded no values",
+			f:    &fakeQuery{names: []string{"cluster", "node"}},
+			want: "contradictory",
+		},
+		{
+			name: "cross-check itself failed",
+			f:    &fakeQuery{namesErr: errors.New("unavailable")},
+			want: "retry before believing it",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := explainNoValues(context.Background(), testClient(tc.f, 0), "cluster", start, end)
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("got %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// `parcareport labels typo` used to print nothing and exit 0.
+func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
+	c := testClient(&fakeQuery{names: []string{"node"}}, 0)
+	err := listLabels(context.Background(), c, "cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("an unknown label must not look like an empty success")
 	}
 }
