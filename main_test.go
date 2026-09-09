@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -16,6 +19,8 @@ import (
 	qv1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"github.com/google/pprof/profile"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestParseTime(t *testing.T) {
@@ -205,8 +210,14 @@ type fakeQuery struct {
 	values    map[string][]string
 	namesErr  error
 	valuesErr error
-	types     []*qv1.ProfileType
-	typesErr  error
+	// valuesErrFor fails only the named labels, so a partial failure can be
+	// exercised without failing every query.
+	valuesErrFor map[string]error
+	// valuesDelay makes each Values call take time, so a bounded fan-out
+	// actually has to queue.
+	valuesDelay time.Duration
+	types       []*qv1.ProfileType
+	typesErr    error
 	// merges answers MergePprof by selector. A selector with no entry gets an
 	// empty pprof, which is what Parca returns for a window with no samples.
 	merges    map[string]*profile.Profile
@@ -235,6 +246,16 @@ func (f *fakeQuery) Values(ctx context.Context, in *qv1.ValuesRequest, _ ...grpc
 			return nil, ctx.Err()
 		case <-time.After(f.block):
 		}
+	}
+	if f.valuesDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(f.valuesDelay):
+		}
+	}
+	if err := f.valuesErrFor[in.GetLabelName()]; err != nil {
+		return nil, err
 	}
 	if f.valuesErr != nil {
 		return nil, f.valuesErr
@@ -312,7 +333,7 @@ func TestExplainNoValuesDistinguishesTheReasons(t *testing.T) {
 // `parcareport labels typo` used to print nothing and exit 0.
 func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
 	c := testClient(&fakeQuery{names: []string{"node"}}, 0)
-	err := listLabels(context.Background(), c, "cluster", time.Now().Add(-time.Hour), time.Now())
+	err := listLabels(context.Background(), c, "cluster", time.Now().Add(-time.Hour), time.Now(), 4)
 	if err == nil {
 		t.Fatal("an unknown label must not look like an empty success")
 	}
@@ -368,7 +389,7 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 	}
 	failed = append(failed, failure{group: "instance=z", msg: "something else entirely"})
 
-	out := captureStdout(t, func() { printFailures(failed) })
+	out := captureStdout(t, func() { printFailures(failed, mergeQuery) })
 
 	if !strings.Contains(out, "something else entirely") {
 		t.Errorf("the rare cause was hidden:\n%s", out)
@@ -383,10 +404,10 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 }
 
 func TestHintForOnlyFiresWhenItHasSomethingToSay(t *testing.T) {
-	if h := hintFor([]string{"no such label"}); h != "" {
+	if h := hintFor([]string{"no such label"}, mergeQuery); h != "" {
 		t.Errorf("want no hint, got %q", h)
 	}
-	if h := hintFor([]string{"context deadline exceeded"}); !strings.Contains(h, "--timeout") {
+	if h := hintFor([]string{"context deadline exceeded"}, mergeQuery); !strings.Contains(h, "--timeout") {
 		t.Errorf("want a timeout hint, got %q", h)
 	}
 }
@@ -793,5 +814,213 @@ func TestDefaultSortIsSelfTime(t *testing.T) {
 	}
 	if got != sortFlat {
 		t.Errorf("default --sort is %q, want self time", defaultSortBy)
+	}
+}
+
+// The bug this guards: one label's Values failure aborted the whole summary,
+// so every label that did work was lost with it.
+func TestListLabelsSurvivesOneFailingLabel(t *testing.T) {
+	f := &fakeQuery{
+		names: []string{"cluster", "broken", "node"},
+		values: map[string][]string{
+			"cluster": {"tc", "vps"},
+			"node":    {"n1"},
+		},
+		valuesErrFor: map[string]error{"broken": errors.New("boom")},
+	}
+
+	var err error
+	out := captureStdout(t, func() {
+		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4)
+	})
+
+	if err == nil {
+		t.Error("a failed label query must not exit 0")
+	}
+	for _, want := range []string{"cluster", "node", "tc", "vps"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("labels that worked should still be printed, missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "broken") || !strings.Contains(out, "!!") {
+		t.Errorf("the failed label should be marked:\n%s", out)
+	}
+}
+
+// Rows must stay with their labels however the queries interleave, so this
+// runs with concurrency 1 against 5 slow labels: the semaphore genuinely
+// queues rather than letting every goroutine straight through.
+func TestListLabelsKeepsRowsWithTheirLabelsUnderContention(t *testing.T) {
+	f := &fakeQuery{
+		names: []string{"a", "b", "c", "d", "e"},
+		values: map[string][]string{
+			"a": {"av"}, "b": {"bv"}, "c": {"cv"}, "d": {"dv"}, "e": {"ev"},
+		},
+		valuesDelay: 2 * time.Millisecond,
+	}
+	out := captureStdout(t, func() {
+		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 1); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, pair := range [][2]string{{"a", "av"}, {"b", "bv"}, {"c", "cv"}, {"d", "dv"}, {"e", "ev"}} {
+		// Anchored per line, so a match cannot span two rows.
+		re := regexp.MustCompile(`(?m)^` + pair[0] + `[ \t]+1[ \t]+` + pair[1] + `[ \t]*$`)
+		if !re.MatchString(out) {
+			t.Errorf("label %q should carry value %q:\n%s", pair[0], pair[1], out)
+		}
+	}
+}
+
+// A non-positive --concurrency must still make progress rather than deadlock
+// on a zero-capacity semaphore.
+func TestListLabelsToleratesZeroConcurrency(t *testing.T) {
+	f := &fakeQuery{names: []string{"a", "b"}, values: map[string][]string{"a": {"av"}, "b": {"bv"}}}
+	out := captureStdout(t, func() {
+		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 0); err != nil {
+			t.Error(err)
+		}
+	})
+	if !strings.Contains(out, "av") || !strings.Contains(out, "bv") {
+		t.Errorf("want both labels:\n%s", out)
+	}
+}
+
+// Every line step writes must be the same width. Otherwise a shorter line
+// leaves the tail of a longer one behind -- "... 6/20" over "... 16/20"
+// rendered as "... 6/200" -- and stop must clear the whole thing.
+func TestProgressLinesAreFixedWidth(t *testing.T) {
+	var buf strings.Builder
+	p := newProgressTo(&buf, "merging", "labels", 20, true)
+	for i := 0; i < 20; i++ {
+		p.step()
+	}
+	var widths []int
+	for _, seg := range strings.Split(buf.String(), "\r") {
+		if seg == "" {
+			continue
+		}
+		widths = append(widths, len(seg))
+	}
+	for i, w := range widths {
+		if w != widths[0] {
+			t.Fatalf("line %d is %d chars, first was %d; a shorter line leaves stale characters: %q",
+				i, w, widths[0], buf.String())
+		}
+		if w > p.lineLen() {
+			t.Fatalf("line %d is %d chars but stop clears only %d", i, w, p.lineLen())
+		}
+	}
+}
+
+// Concurrent steps must not interleave into a corrupt line, and the count must
+// not go backwards.
+func TestProgressIsSerializedUnderConcurrency(t *testing.T) {
+	var buf strings.Builder
+	const total = 50
+	p := newProgressTo(&buf, "merging", "groups", total, true)
+	var wg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); p.step() }()
+	}
+	wg.Wait()
+
+	last := 0
+	for _, seg := range strings.Split(buf.String(), "\r") {
+		if seg == "" {
+			continue
+		}
+		var done, tot int
+		if _, err := fmt.Sscanf(seg, "merging %d groups... %d/%d", &tot, &done, &tot); err != nil {
+			t.Fatalf("unparseable line %q: %v", seg, err)
+		}
+		if done <= last {
+			t.Errorf("count went backwards: %d after %d in %q", done, last, buf.String())
+		}
+		last = done
+	}
+	if last != total {
+		t.Errorf("final count %d, want %d", last, total)
+	}
+}
+
+// The verb has to match the work. `labels` runs Values queries; nothing is
+// merged, and saying so contradicted both the code and the README.
+func TestProgressUsesTheCallersVerb(t *testing.T) {
+	var buf strings.Builder
+	newProgressTo(&buf, "querying", "labels", 5, true).start()
+	if got := buf.String(); !strings.HasPrefix(got, "querying 5 labels") {
+		t.Errorf("got %q, want the caller's verb", got)
+	}
+}
+
+// Off means silent, and must not panic.
+func TestProgressWritesNothingWhenOff(t *testing.T) {
+	var buf strings.Builder
+	p := newProgressTo(&buf, "merging", "groups", 10, false)
+	p.start()
+	p.step()
+	p.stop()
+	if buf.String() != "" {
+		t.Errorf("want no output when off, got %q", buf.String())
+	}
+}
+
+// A job of one unit is not a fan-out worth narrating.
+func TestProgressIsOffForTrivialJobs(t *testing.T) {
+	if newProgress("merging", "x", 1).on {
+		t.Error("progress should be off for a single unit")
+	}
+	if newProgress("merging", "x", 0).on {
+		t.Error("progress should be off for an empty job")
+	}
+}
+
+// The bug this guards: the labels path reused the merge advice, telling the
+// reader to narrow --from or use --match after a failed label lookup. Neither
+// applies -- listLabels passes no matchers at all and merges nothing.
+func TestLabelFailuresGetMetadataAdviceNotMergeAdvice(t *testing.T) {
+	f := &fakeQuery{
+		names:  []string{"cluster", "slow"},
+		values: map[string][]string{"cluster": {"tc"}},
+		valuesErrFor: map[string]error{
+			"slow": status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
+		},
+	}
+	var err error
+	out := captureStdout(t, func() {
+		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4)
+	})
+	if err == nil {
+		t.Fatal("want a non-zero exit")
+	}
+	// The advice that does apply.
+	if !strings.Contains(out, "--timeout") {
+		t.Errorf("want the timeout advice:\n%s", out)
+	}
+	// The advice that does not.
+	for _, forbidden := range []string{"--match", "merge"} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("labels advice must not mention %q:\n%s", forbidden, out)
+		}
+	}
+	// And it belongs above the next-step line, not below it.
+	hint := strings.Index(out, "--timeout")
+	next := strings.Index(out, "Run `parcareport labels")
+	if hint > next {
+		t.Errorf("the failure explanation should precede the next-step line:\n%s", out)
+	}
+}
+
+// A merge failure keeps the merge advice, which is the half that can be acted
+// on by changing the query.
+func TestMergeFailuresKeepMergeAdvice(t *testing.T) {
+	h := hintFor([]string{"stream terminated by RST_STREAM"}, mergeQuery)
+	if !strings.Contains(h, "--match") {
+		t.Errorf("want merge advice, got %q", h)
+	}
+	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery); strings.Contains(m, "--match") {
+		t.Errorf("metadata advice must not suggest --match, got %q", m)
 	}
 }

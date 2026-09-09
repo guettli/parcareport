@@ -60,7 +60,7 @@ func run(args []string) error {
 	fs.StringVar(&o.match, "match", "", `extra label matchers, e.g. 'cluster="tc",comm="clickhouse"'`)
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
-	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel merge queries")
+	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), usage)
@@ -120,7 +120,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end)
+		return listLabels(ctx, c, subArg, start, end, o.concurrency)
 	case "types":
 		if subArg != "" {
 			return fmt.Errorf("types takes no argument, got %q", subArg)
@@ -141,7 +141,7 @@ func run(args []string) error {
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time) error {
+func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int) error {
 	if name != "" {
 		vals, err := c.LabelValues(ctx, name, start, end)
 		if err != nil {
@@ -164,25 +164,72 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 	if err != nil {
 		return err
 	}
+	// One Values query per label name, fanned out. Sequentially this was the
+	// slowest thing in the tool and the first thing anyone runs: against a
+	// loaded server it never finished, printing not even the header. `report`
+	// already had --concurrency for exactly this shape of work.
+	type row struct {
+		name string
+		vals []string
+		err  error
+	}
+	rows := make([]row, len(names))
+	prog := newProgress("querying", "labels", len(names))
+	prog.start()
+	sem := make(chan struct{}, max(1, concurrency))
+	var wg sync.WaitGroup
+	for i, n := range names {
+		wg.Add(1)
+		go func(i int, n string) {
+			defer wg.Done()
+			defer prog.step()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// The deadline is taken inside LabelValues, after the semaphore,
+			// so a goroutine parked waiting for a slot does not burn it.
+			vals, err := c.LabelValues(ctx, n, start, end)
+			rows[i] = row{name: n, vals: vals, err: err}
+		}(i, n)
+	}
+	wg.Wait()
+	prog.stop()
+
 	w := newTab()
 	fmt.Fprintf(w, "LABEL\tVALUES\tSAMPLE\n")
-	for _, n := range names {
-		vals, err := c.LabelValues(ctx, n, start, end)
-		if err != nil {
-			return err
+	var failedMsgs []string
+	for _, r := range rows {
+		// One label's failure used to abort the whole summary, losing every
+		// label that did work. Name the missing row and keep going.
+		if r.err != nil {
+			failedMsgs = append(failedMsgs, shortErr(r.err))
+			fmt.Fprintf(w, "%s\t?\t!! %s\n", r.name, shortErr(r.err))
+			continue
 		}
-		sort.Strings(vals)
-		sample := vals
-		suffix := ""
+		sort.Strings(r.vals)
+		sample, suffix := r.vals, ""
 		if len(sample) > 6 {
 			sample, suffix = sample[:6], " …"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s%s\n", n, len(vals), strings.Join(sample, " "), suffix)
+		fmt.Fprintf(w, "%s\t%d\t%s%s\n", r.name, len(r.vals), strings.Join(sample, " "), suffix)
 	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
+	// Immediately after the table it annotates, and before the unrelated
+	// next-step line -- report puts the explanation right under the numbers
+	// too.
+	if len(failedMsgs) > 0 {
+		// shortErr keeps only the gRPC tail, which for a deadline is the least
+		// useful half: the advice metaErr attached sits in front of it.
+		if h := hintFor(failedMsgs, metadataQuery); h != "" {
+			fmt.Print(h)
+		}
+	}
 	fmt.Println("\nRun `parcareport labels <name>` to list one label's values in full.")
+	if len(failedMsgs) > 0 {
+		return fmt.Errorf("%d of %d label queries failed; the rows marked !! are missing",
+			len(failedMsgs), len(names))
+	}
 	return nil
 }
 
@@ -219,12 +266,19 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	}
 	results := make([]result, len(groups))
 
+	// A run can take minutes. With no output at all, "still merging" and
+	// "hung" look identical -- and with the default --timeout the first thing
+	// you saw could be an error after a minute of silence.
+	prog := newProgress("merging", o.by+" groups", len(groups))
+	prog.start()
+
 	sem := make(chan struct{}, max(1, o.concurrency))
 	var wg sync.WaitGroup
 	for i, g := range groups {
 		wg.Add(1)
 		go func(i int, g string) {
 			defer wg.Done()
+			defer prog.step()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -246,6 +300,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		}(i, g)
 	}
 	wg.Wait()
+	prog.stop()
 
 	rows := make([]Row, 0, len(results))
 	var total float64
@@ -300,7 +355,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 					"!! the failed queries were never answered.\n",
 					len(failed), len(groups), o.by, empty)
 			}
-			printFailures(failed)
+			printFailures(failed, mergeQuery)
 			return fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by)
 		}
 		if !typeVerified {
@@ -397,7 +452,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 			all = append(append([]failure{}, failed...),
 				failure{group: "(overall)", msg: shortErr(overallErr)})
 		}
-		printFailures(all)
+		printFailures(all, mergeQuery)
 	}
 
 	if o.top > 0 && overall != nil {
@@ -556,6 +611,19 @@ func parseTime(s string, now time.Time) (time.Time, error) {
 	return now.Add(d), nil
 }
 
+// failureKind distinguishes the two sorts of query the tool makes, because the
+// advice for them differs. A merge can be made smaller -- a narrower window,
+// fewer series -- while a metadata query already asks for almost nothing, so
+// there is nothing to trim and a failure says something about the server.
+// Telling someone to narrow --from or use --match after a failed label lookup
+// suggests an action that does not apply: listLabels passes no matchers at all.
+type failureKind int
+
+const (
+	mergeQuery failureKind = iota
+	metadataQuery
+)
+
 // failure is one group's query that did not come back.
 type failure struct {
 	group string // e.g. `cluster=tc`
@@ -568,7 +636,7 @@ type failure struct {
 // same way showed five lines and "and 3 more", while a single group failing
 // for a different reason might be the one truncated away. Grouping by message
 // gives every distinct cause a line, and collapses a wholesale outage to one.
-func printFailures(failed []failure) {
+func printFailures(failed []failure, kind failureKind) {
 	var order []string
 	byMsg := map[string][]string{}
 	for _, f := range failed {
@@ -605,7 +673,7 @@ func printFailures(failed []failure) {
 	}
 	// Only the causes actually on screen, so a hint never refers to a line
 	// that was truncated away.
-	if h := hintFor(shown); h != "" {
+	if h := hintFor(shown, kind); h != "" {
 		fmt.Print(h)
 	}
 }
@@ -615,7 +683,7 @@ func printFailures(failed []failure) {
 // "stream terminated by RST_STREAM with error code: INTERNAL_ERROR" is the
 // motivating case: there is no gRPC boilerplate for shortErr to strip and
 // nothing in it says what to do, yet it can take minutes to arrive.
-func hintFor(msgs []string) string {
+func hintFor(msgs []string, kind failureKind) string {
 	var reset, deadline bool
 	for _, m := range msgs {
 		switch {
@@ -627,12 +695,24 @@ func hintFor(msgs []string) string {
 	}
 	var b strings.Builder
 	if reset {
-		b.WriteString("!! The server closed the stream mid-merge, which usually means the merge hit a\n" +
-			"!! server limit or the server errored on it. Try a narrower --from window, or\n" +
-			"!! fewer series with --match.\n")
+		if kind == mergeQuery {
+			b.WriteString("!! The server closed the stream mid-merge, which usually means the merge hit a\n" +
+				"!! server limit or the server errored on it. Try a narrower --from window, or\n" +
+				"!! fewer series with --match.\n")
+		} else {
+			b.WriteString("!! The server closed the stream on a query that asks for almost nothing, so\n" +
+				"!! this points at the server rather than at what was asked of it. Retry.\n")
+		}
 	}
 	if deadline {
-		b.WriteString("!! Raise --timeout, or narrow the window with --from so each merge is smaller.\n")
+		if kind == mergeQuery {
+			b.WriteString("!! Raise --timeout, or narrow the window with --from so each merge is smaller.\n")
+		} else {
+			// metaErr already says this, but shortErr keeps only the gRPC tail.
+			b.WriteString("!! These queries are normally instant, so a timeout means the server is slow\n" +
+				"!! or unreachable rather than the window being too large. Retry, or raise\n" +
+				"!! --timeout.\n")
+		}
 	}
 	return b.String()
 }

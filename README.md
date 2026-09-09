@@ -318,8 +318,43 @@ args:
   and routes by `Content-Type`, so a plain JSON POST returns the UI's HTML with
   status 200 instead of an error — a confusing thing to debug from `curl`.
 - Breakdowns run one merged query per label value, in parallel
-  (`--concurrency`). Wide windows over high-cardinality labels are work for the
-  server; start narrow.
+  (`--concurrency`). `parcareport labels` fans out the same way — it runs one
+  query per label name, which sequentially made the first command anyone
+  reaches for the slowest thing in the tool. Wide windows over
+  high-cardinality labels are work for the server; start narrow.
+- While a fan-out runs, progress goes to **stderr**, and only when stderr is a
+  terminal:
+
+  ```
+  merging 12 cluster groups...  7/12
+  querying 24 labels... 18/24
+  ```
+
+  The counter is padded to the width of the total, so every line is exactly as
+  wide as the last. `\r` does not erase, so a shorter line would otherwise
+  leave the tail of a longer one behind and `7/12` would render as `7/120`.
+
+  Stderr so a redirected report is unaffected, and terminal-only because the
+  carriage returns that keep it to one line are noise in a log. Without it, a
+  run that takes minutes looked exactly like one that had hung.
+- A label whose values query fails no longer aborts the whole summary. Its row
+  is marked `!!` and the rest is printed, because a partial summary that says
+  what is missing beats no summary:
+
+  ```
+  LABEL    VALUES  SAMPLE
+  cluster  2       tc vps
+  comm     ?       !! context deadline exceeded
+  node     3       n1 n2 n3
+  !! These queries are normally instant, so a timeout means the server is slow
+  !! or unreachable rather than the window being too large. Retry, or raise
+  !! --timeout.
+  ```
+
+  The advice differs from the one a failed *merge* gets. A merge can be made
+  smaller — a narrower window, fewer series — while a label query already asks
+  for almost nothing, so telling someone to narrow `--from` or add `--match`
+  would suggest an action that does not apply.
 - Frames without debuginfo are bucketed as `[unsymbolized]` so they don't
   fragment the top-N into hex noise.
 
