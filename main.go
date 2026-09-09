@@ -61,7 +61,7 @@ func run(args []string) error {
 	fs.StringVar(&o.from, "from", "-1h", "window start: RFC3339, or relative like -6h / -30m")
 	fs.StringVar(&o.to, "to", "now", "window end: RFC3339, or 'now'")
 	fs.StringVar(&o.by, "by", "cluster", "label to break the report down by (e.g. cluster, node, comm)")
-	fs.StringVar(&o.profileType, "profile-type", "", "profile type selector (default: auto-detect when the server offers exactly one)")
+	fs.StringVar(&o.profileType, "profile-type", "", "profile type: full selector or a unique substring like 'cpu' (default: the CPU profile)")
 	fs.StringVar(&o.match, "match", "", `extra label matchers, e.g. 'cluster="tc",comm="clickhouse"'`)
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
@@ -615,12 +615,11 @@ func resolveProfileType(ctx context.Context, c *Client, want string) (string, bo
 				"(%s); using %q as given\n", shortErr(err), want)
 			return want, false, nil
 		}
-		for _, n := range names {
-			if n == want {
-				return n, true, nil
-			}
+		got, err := matchProfileType(want, names)
+		if err != nil {
+			return "", false, err
 		}
-		return "", false, fmt.Errorf("profile type %q not offered by this server; available:\n  %s", want, strings.Join(names, "\n  "))
+		return got, true, nil
 	}
 
 	names, err := c.ProfileTypeNames(ctx)
@@ -632,10 +631,73 @@ func resolveProfileType(ctx context.Context, c *Client, want string) (string, bo
 		return "", false, errors.New("server offers no profile types -- is any agent writing to it?")
 	case 1:
 		return names[0], true, nil
-	default:
-		return "", false, fmt.Errorf("server offers %d profile types; pick one with --profile-type:\n  %s",
-			len(names), strings.Join(names, "\n  "))
 	}
+	// Several types, and no answer given. Refusing was defensible when the
+	// alternative was guessing, but a real server offers many -- eleven on the
+	// one this was tested against -- so auto-detect never applied and every
+	// invocation had to paste the full selector. This tool is a CPU report and
+	// CORES is its headline unit, so a CPU delta profile is the right default;
+	// the chosen type is echoed in the report heading, so it is visible rather
+	// than hidden.
+	if cpu := cpuDeltaTypes(names); len(cpu) == 1 {
+		return cpu[0], true, nil
+	}
+	return "", false, fmt.Errorf("server offers %d profile types and none is an obvious CPU default; "+
+		"pick one with --profile-type:\n  %s", len(names), strings.Join(names, "\n  "))
+}
+
+// matchProfileType resolves --profile-type against what the server offers.
+//
+// An exact selector always wins. Failing that it is treated as a substring,
+// because the full six-part form is long, easy to get subtly wrong -- the
+// order of `samples:count:cpu:nanoseconds` matters -- and had to be retyped for
+// every single invocation. `--profile-type=cpu` is what people mean.
+//
+// An ambiguous abbreviation is an error listing the candidates, never a guess:
+// `memory` matches four types on a typical server, and silently picking
+// inuse_space over alloc_space would be answering a different question than
+// the one asked.
+func matchProfileType(want string, names []string) (string, error) {
+	for _, n := range names {
+		if n == want {
+			return n, nil
+		}
+	}
+	var hits []string
+	for _, n := range names {
+		if strings.Contains(n, want) {
+			hits = append(hits, n)
+		}
+	}
+	switch len(hits) {
+	case 1:
+		return hits[0], nil
+	case 0:
+		return "", fmt.Errorf("no profile type matching %q on this server; available:\n  %s",
+			want, strings.Join(names, "\n  "))
+	default:
+		return "", fmt.Errorf("%q matches %d profile types; be more specific:\n  %s",
+			want, len(hits), strings.Join(hits, "\n  "))
+	}
+}
+
+// cpuDeltaTypes finds the on-CPU delta profiles among the server's types.
+//
+// The period type carries the meaning: parca-agent's CPU profile is
+// `parca_agent:samples:count:cpu:nanoseconds:delta`, where `cpu` is the period
+// type. Matching on the substring "cpu" alone would also catch a wallclock
+// profile from a target that happens to have "cpu" in its name, and off-CPU
+// time is emphatically not what CORES means.
+func cpuDeltaTypes(names []string) []string {
+	var out []string
+	for _, n := range names {
+		parts := strings.Split(n, ":")
+		// name:sampleType:sampleUnit:periodType:periodUnit[:delta]
+		if len(parts) == 6 && parts[3] == "cpu" && parts[5] == "delta" {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // selector builds the PromQL-ish series selector Parca expects:

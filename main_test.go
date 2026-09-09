@@ -874,6 +874,56 @@ func TestListLabelsKeepsRowsWithTheirLabelsUnderContention(t *testing.T) {
 	}
 }
 
+// The eleven types a real Parca offered, in the order it returned them.
+var realServerTypes = []string{
+	"goroutine:goroutine:count:goroutine:count",
+	"parca_agent:samples:count:cpu:nanoseconds:delta",
+	"parca_agent:wallclock:nanoseconds:samples:count:delta",
+	"mutex:contentions:count:contentions:count",
+	"mutex:delay:nanoseconds:contentions:count",
+	"block:contentions:count:contentions:count",
+	"block:delay:nanoseconds:contentions:count",
+	"memory:alloc_objects:count:space:bytes",
+	"memory:alloc_space:bytes:space:bytes",
+	"memory:inuse_objects:count:space:bytes",
+	"memory:inuse_space:bytes:space:bytes",
+}
+
+func TestMatchProfileType(t *testing.T) {
+	// An exact selector always wins, even though it is also a substring of
+	// itself and of nothing else.
+	const full = "parca_agent:samples:count:cpu:nanoseconds:delta"
+	if got, err := matchProfileType(full, realServerTypes); err != nil || got != full {
+		t.Errorf("exact match: got (%q, %v)", got, err)
+	}
+
+	// The whole point: "cpu" is what people mean, and it is unambiguous even
+	// though a wallclock type also mentions "samples" and "nanoseconds".
+	if got, err := matchProfileType("cpu", realServerTypes); err != nil || got != full {
+		t.Errorf(`matchProfileType("cpu"): got (%q, %v), want %q`, got, err, full)
+	}
+
+	if got, err := matchProfileType("inuse_space", realServerTypes); err != nil ||
+		got != "memory:inuse_space:bytes:space:bytes" {
+		t.Errorf("got (%q, %v)", got, err)
+	}
+}
+
+// An ambiguous abbreviation must never be guessed: picking inuse_space over
+// alloc_space answers a different question than the one asked.
+func TestMatchProfileTypeRefusesToGuess(t *testing.T) {
+	_, err := matchProfileType("memory", realServerTypes)
+	if err == nil {
+		t.Fatal("want an error for an ambiguous abbreviation")
+	}
+	// The candidates have to be listed, or the error is a dead end.
+	for _, want := range []string{"alloc_space", "inuse_space", "matches 4"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q: %v", want, err)
+		}
+	}
+}
+
 // A non-positive --concurrency must still make progress rather than deadlock
 // on a zero-capacity semaphore.
 func TestListLabelsToleratesZeroConcurrency(t *testing.T) {
@@ -1199,4 +1249,89 @@ func TestSecretFileRejectsInteriorWhitespace(t *testing.T) {
 			t.Errorf("%s: want a rejection for %q", name, content)
 		}
 	}
+}
+
+func TestMatchProfileTypeRejectsNoMatch(t *testing.T) {
+	_, err := matchProfileType("sideways", realServerTypes)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "goroutine:goroutine") {
+		t.Errorf("the available types should be listed: %v", err)
+	}
+}
+
+// The bug this guards: with several types and none asked for, the tool
+// refused. A real server offers eleven, so auto-detect never applied and every
+// invocation had to paste the full six-part selector.
+func TestAutoDetectPrefersTheCPUProfile(t *testing.T) {
+	c := testClient(&fakeQuery{types: profileTypesFrom(realServerTypes)}, 0)
+	got, verified, err := resolveProfileType(context.Background(), c, "")
+	if err != nil {
+		t.Fatalf("want a CPU default rather than a refusal: %v", err)
+	}
+	if got != "parca_agent:samples:count:cpu:nanoseconds:delta" {
+		t.Errorf("got %q", got)
+	}
+	if !verified {
+		t.Error("a type read from the server's own list is verified")
+	}
+}
+
+// Off-CPU time is not what CORES means, so a wallclock profile must not be
+// mistaken for the CPU default even though its name contains "samples".
+func TestAutoDetectIgnoresWallclock(t *testing.T) {
+	only := []string{"parca_agent:wallclock:nanoseconds:samples:count:delta"}
+	if got := cpuDeltaTypes(only); len(got) != 0 {
+		t.Errorf("wallclock is not a CPU profile, got %v", got)
+	}
+	// A non-delta cpu profile is not a rate either.
+	if got := cpuDeltaTypes([]string{"x:samples:count:cpu:nanoseconds"}); len(got) != 0 {
+		t.Errorf("a non-delta profile is not a CPU default, got %v", got)
+	}
+}
+
+// With no CPU profile at all there is nothing to default to, so refusing is
+// still right -- and the message must say why.
+func TestAutoDetectStillRefusesWithoutACPUProfile(t *testing.T) {
+	noCPU := []string{
+		"memory:alloc_space:bytes:space:bytes",
+		"memory:inuse_space:bytes:space:bytes",
+	}
+	c := testClient(&fakeQuery{types: profileTypesFrom(noCPU)}, 0)
+	_, _, err := resolveProfileType(context.Background(), c, "")
+	if err == nil {
+		t.Fatal("want a refusal when there is no CPU profile to default to")
+	}
+	if !strings.Contains(err.Error(), "--profile-type") {
+		t.Errorf("the error should say how to choose: %v", err)
+	}
+}
+
+// A single type still wins outright, CPU or not.
+func TestAutoDetectTakesTheOnlyType(t *testing.T) {
+	one := []string{"memory:inuse_space:bytes:space:bytes"}
+	c := testClient(&fakeQuery{types: profileTypesFrom(one)}, 0)
+	got, _, err := resolveProfileType(context.Background(), c, "")
+	if err != nil || got != one[0] {
+		t.Errorf("got (%q, %v)", got, err)
+	}
+}
+
+// profileTypesFrom turns selector strings back into the protobuf the server
+// sends, so tests can be written in the form a user actually sees.
+func profileTypesFrom(selectors []string) []*qv1.ProfileType {
+	out := make([]*qv1.ProfileType, 0, len(selectors))
+	for _, s := range selectors {
+		p := strings.Split(s, ":")
+		t := &qv1.ProfileType{
+			Name: p[0], SampleType: p[1], SampleUnit: p[2],
+			PeriodType: p[3], PeriodUnit: p[4],
+		}
+		if len(p) == 6 && p[5] == "delta" {
+			t.Delta = true
+		}
+		out = append(out, t)
+	}
+	return out
 }
