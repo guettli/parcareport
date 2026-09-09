@@ -62,9 +62,16 @@ func printFunctionTable(rows []Row, unitHeader string, top int, total float64) {
 	w.Flush()
 }
 
+// truncate shortens a name to n runes. Counting bytes would both cut a
+// multi-byte symbol mid-rune and misjudge the column width.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	// n-1 runes plus the one-rune ellipsis, so the result is exactly n wide.
+	return string(r[:n-1]) + "…"
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	qgrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/query/v1alpha1/queryv1alpha1grpc"
 	qv1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
@@ -146,6 +147,30 @@ func TestTopFunctions(t *testing.T) {
 	}
 	if byName["B"].Flat != 0 {
 		t.Errorf("caller B flat = %v, want 0", byName["B"].Flat)
+	}
+}
+
+func TestTruncateCountsRunesNotBytes(t *testing.T) {
+	// Ten runes, but twenty bytes. Truncating at 10 must leave it be, which a
+	// byte-based implementation would not have done.
+	const s = "ФункцияАБВ"
+	if got := truncate(s, 10); got != s {
+		t.Errorf("truncate(%q, 10) = %q, want it unchanged", s, got)
+	}
+	// Cutting must land on a rune boundary, not mid-sequence.
+	got := truncate(s, 5)
+	if utf8.RuneCountInString(got) != 5 {
+		t.Errorf("truncate(%q, 5) = %q, want 5 runes, got %d", s, got, utf8.RuneCountInString(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("truncate produced invalid UTF-8: %q", got)
+	}
+	// n <= 0 used to slice r[:-1] and panic.
+	if got := truncate(s, 0); got != "" {
+		t.Errorf("truncate(%q, 0) = %q, want empty", s, got)
+	}
+	if got := truncate(s, 1); got != "…" {
+		t.Errorf("truncate(%q, 1) = %q, want the ellipsis alone", s, got)
 	}
 }
 

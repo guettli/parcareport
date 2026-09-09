@@ -88,24 +88,6 @@ func sampleTypeIsCPU(p *profile.Profile, idx int) bool {
 	return p.PeriodType != nil && p.PeriodType.Type == "cpu"
 }
 
-// cpuSeconds converts a merged pprof into CPU-seconds.
-//
-// This is the subtle part. parca-agent's CPU profile has sample type
-// "samples:count" with period type "cpu:nanoseconds" -- the sample VALUE is a
-// count of stack samples, not a duration. Multiplying by the period converts it
-// to CPU time. Profiles whose sample unit is already a time unit are used
-// as-is. Getting this wrong silently scales the whole report.
-func cpuSeconds(p *profile.Profile) (float64, error) {
-	idx, unit := valueIndex(p)
-	var total int64
-	for _, s := range p.Sample {
-		if idx < len(s.Value) {
-			total += s.Value[idx]
-		}
-	}
-	return scaleToSeconds(p, total, unit)
-}
-
 // valueIndex picks which of a profile's sample values to report on, preferring
 // an explicit time-unit column over a raw count.
 func valueIndex(p *profile.Profile) (int, string) {
