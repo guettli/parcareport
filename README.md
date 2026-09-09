@@ -265,6 +265,62 @@ dramatically better or worse than it was.
 
 Sanity-check absolute numbers against `kubectl top` at least once.
 
+## `--output=json`, for scripts and agents
+
+The table is written for a person: columns padded to a width, function names
+cut to 60 characters with an ellipsis, shortfalls as prose beginning `!!`. None
+of that survives being parsed — and the truncation is lossy enough that two
+different frames once rendered identically, so the output could not be mapped
+back to a symbol at all.
+
+`--output=json` emits one document with the full names, the raw numbers, and
+the failures as data:
+
+```json
+{
+  "profile_type": "parca_agent:samples:count:cpu:nanoseconds:delta",
+  "profile_type_verified": true,
+  "start": "2026-09-09T14:43:26Z",
+  "end": "2026-09-09T14:58:26Z",
+  "window_seconds": 900,
+  "group_by": "cluster",
+  "unit": "cores",
+  "rate": true,
+  "groups": [
+    {"name": "tc", "value": 2.316, "pct": 77.9},
+    {"name": "vps", "value": 0.655, "pct": 22.1}
+  ],
+  "empty_groups": 0,
+  "total": 2.971,
+  "functions": [
+    {"name": "github.com/parquet-go/parquet-go/encoding/thrift.(*structDecoder).decode",
+     "cum": 0.831, "flat": 0.120, "pct": 4.0}
+  ],
+  "functions_sorted_by": "flat",
+  "failed": [],
+  "complete": true
+}
+```
+
+Two fields matter more than the rest. **`complete`** is the machine-checkable
+form of the `!! INCOMPLETE` banner, and **`failed`** says exactly which groups
+are missing and why. Without them a consumer would have to grep stdout for
+`!!` to notice the totals were wrong, which is the same trap the banner exists
+to avoid for human readers.
+
+**`total` is `null`** when the unfiltered merge failed or came back empty, and
+every `pct` is `null` with it. The sum of the listed groups is not the total —
+it omits every series carrying no group-by label — so there is no honest number
+to put there.
+
+`unit` is a stable machine name (`cores`, `blocked_threads`, `bytes`, `count`)
+rather than the column heading, which is free to be reworded. `rate` says
+whether the value was divided by the window; bytes and counts are not rates.
+
+A run that produces nothing still emits a document, with `complete: false` and
+`error` set. Printing only prose in that case would leave a script unable to
+tell an empty window from a broken command.
+
 ## Install
 
 ```sh
@@ -288,6 +344,7 @@ parcareport types [flags]      list profile types the server offers
 | `--match` | | extra matchers, e.g. `comm="clickhouse"` |
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
+| `--output` | `table` | `json` for a machine-readable report |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
