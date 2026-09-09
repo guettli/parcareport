@@ -331,9 +331,88 @@ go install github.com/guettli/parcareport@latest
 
 ```
 parcareport [report] [flags]   break CPU down by a label, then list hot functions
+parcareport overview [flags]   what this server has, and what is busy in it
 parcareport labels [name]      summarize labels, or list one label's values
 parcareport types [flags]      list profile types the server offers
 ```
+
+## `parcareport overview`
+
+Getting oriented otherwise meant running the tool once per question, and each
+run needed a profile type and a `--by` label chosen in advance — so you had to
+know the answers before you could ask. `overview` asks the server what it has
+and reports on that:
+
+```console
+$ parcareport overview --from=-15m
+
+2026-09-09T14:43:26Z .. 2026-09-09T14:58:26Z  (15m0s)
+11 profile types, 3 labels: cluster comm node
+
+parca_agent:samples:count:cpu:nanoseconds:delta  ...
+
+CLUSTER  CORES  %TOTAL
+tc       2.316  77.9
+vps      0.655  22.1
+TOTAL    2.971  100.0
+
+FUNCTION                                                      CUM    FLAT*  %TOTAL
+github.com/parquet-go/parquet-go/encoding/thrift.(*structDe…  0.831  0.120  4.0
+
+parca_agent:samples:count:cpu:nanoseconds:delta  ...
+
+COMM     CORES  %TOTAL
+parca    2.284  76.9
+...
+```
+
+It breaks CPU down by whichever of `cluster`, `namespace`, `workload` and
+`comm` exist in the window, and reports live heap by `instance` or `job` if the
+server has a heap profile. Which of those exist depends on how the agents were
+configured, and the label list is one cheap query — cheaper than making you
+know in advance.
+
+Heap is grouped only by `instance` or `job`, never by `cluster`. Heap profiles
+come from `scrape_configs` against Go `/debug/pprof` endpoints, whose series
+carry those labels; `cluster` comes from parca-agent's external labels. Pairing
+the heap with `cluster` merged once per cluster, found nothing, and reported
+"no data" for a heap profile with plenty in it.
+
+**It is not cheap overall.** A breakdown costs one merge per label value, and
+merges are the slow part — a single 15-minute breakdown over two clusters took
+about two minutes against a real server. So a label with more than
+`--max-group-values` (default 50) values is skipped rather than run:
+
+```
+-- not reported: CPU by comm (203 values is more than --max-group-values=50,
+   and each one costs a merge; run `parcareport --by=comm` directly if you want it)
+```
+
+`--concurrency` bounds the queries within one section, not across sections;
+sections run one after another. Start with a narrow `--from`.
+
+The hot functions come from the unfiltered merge, so every breakdown of one
+profile type would produce the same table. It is shown once per type.
+
+**A section it could not run is named, not dropped.** Otherwise there is no way
+to tell "this server has no heap profile" from "the heap query failed":
+
+```
+-- not reported: live heap (no instance, job or cluster label to group by)
+```
+
+A section that fails part-way still prints, carrying its own `!! INCOMPLETE`
+banner, and the command exits non-zero. One breakdown failing is not a reason
+to discard the others — that is the point of running several.
+
+`--output=json` gives the whole thing as one document, with each section
+carrying its own `unit`, `total`, `functions` and `failed`. The function table
+is deduplicated only in the table output, where a repeat would be
+byte-identical; in JSON every section keeps its own, since an empty array
+would read as "nothing was hot".
+
+`--by` and `--profile-type` are refused rather than ignored: `overview` picks
+both per section, so accepting them would silently do something else.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -345,6 +424,7 @@ parcareport types [flags]      list profile types the server offers
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--output` | `table` | `json` for a machine-readable report |
+| `--max-group-values` | `50` | overview: skip a breakdown with more values than this |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |

@@ -33,16 +33,20 @@ func main() {
 }
 
 type options struct {
-	addr         string
-	insecure     bool
-	from         string
-	to           string
-	by           string
-	profileType  string
-	match        string
-	top          int
-	sortBy       string
-	output       string
+	addr        string
+	insecure    bool
+	from        string
+	to          string
+	by          string
+	profileType string
+	match       string
+	top         int
+	sortBy      string
+	output      string
+	maxGroups   int
+	// setFlags records which flags were given, so a subcommand can refuse one
+	// it would otherwise ignore.
+	setFlags     map[string]bool
 	concurrency  int
 	timeout      time.Duration
 	bearerToken  string
@@ -65,6 +69,7 @@ func run(args []string) error {
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.StringVar(&o.output, "output", outputTable, "'table' for a person, 'json' for a script")
+	fs.IntVar(&o.maxGroups, "max-group-values", 50, "overview: skip a breakdown whose label has more values than this")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
@@ -103,6 +108,11 @@ func run(args []string) error {
 		}
 		return err
 	}
+	// Which flags were actually given. A default is indistinguishable from an
+	// explicit value otherwise, and overview needs to tell them apart to
+	// refuse the ones it would overwrite.
+	o.setFlags = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { o.setFlags[f.Name] = true })
 
 	start, end, err := parseWindow(o.from, o.to)
 	if err != nil {
@@ -136,6 +146,11 @@ func run(args []string) error {
 			subArg = fs.Arg(0)
 		}
 		return listLabels(ctx, c, subArg, start, end, o.concurrency)
+	case "overview":
+		if subArg != "" {
+			return fmt.Errorf("overview takes no argument, got %q", subArg)
+		}
+		return overview(ctx, c, o, start, end)
 	case "types":
 		if subArg != "" {
 			return fmt.Errorf("types takes no argument, got %q", subArg)
@@ -149,7 +164,7 @@ func run(args []string) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (want: report, labels, types)", sub)
+		return fmt.Errorf("unknown command %q (want: report, overview, labels, types)", sub)
 	}
 }
 
@@ -698,6 +713,7 @@ const usage = `parcareport - cross-cluster CPU bottleneck report from a Parca se
 
 Usage:
   parcareport [report] [flags]   break CPU down by a label, then list hot functions
+  parcareport overview [flags]   what this server has, and what is busy in it
   parcareport labels [name]      summarize labels, or list one label's values
   parcareport types [flags]      list profile types the server offers
 
