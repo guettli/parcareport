@@ -42,8 +42,21 @@ golang.org/x/sync/errgroup.(*Group).Go.func1  1.563  0.000  52.6
 
 "76.9% of the CPU was spent inside a goroutine" is true of almost every Go
 program. Worse, the frames that *do* burn CPU are pushed below the `--top`
-cutoff and never printed at all — in the run above, the largest self time
-anywhere in the top 15 was 0.120.
+cutoff and never printed at all. That run totalled 2.971 cores, and the
+largest self time anywhere in its top 15 was 0.120 — so sorted by self time
+the same profile reads:
+
+```
+FUNCTION                                                      CUM    FLAT*  %TOTAL
+github.com/parquet-go/parquet-go/encoding/thrift.(*structDe…  0.831  0.120  4.0
+github.com/parquet-go/parquet-go/encoding/thrift.readStruct   0.867  0.031  1.0
+github.com/parquet-go/parquet-go/encoding/thrift.decodeFunc…  0.783  0.028  0.9
+```
+
+Self-time percentages are small and spread out, because self time sums to the
+profile's total across *all* functions rather than being counted once per
+frame in every stack. Small numbers spread thin is the honest shape of this
+workload; a single frame at 76.9% was not.
 
 `--sort=cum` restores the cumulative order when that is the question: it shows
 what larger piece of work a frame was part of, which is what you want once you

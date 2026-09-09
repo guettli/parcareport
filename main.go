@@ -20,7 +20,12 @@ import (
 	"github.com/google/pprof/profile"
 )
 
-const defaultAddr = "localhost:7070"
+const (
+	defaultAddr = "localhost:7070"
+	// defaultSortBy is named so a test can pin it: the point of this default
+	// is that it is flat, and flipping it back is the regression to catch.
+	defaultSortBy = "flat"
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -54,7 +59,7 @@ func run(args []string) error {
 	fs.StringVar(&o.profileType, "profile-type", "", "profile type selector (default: auto-detect when the server offers exactly one)")
 	fs.StringVar(&o.match, "match", "", `extra label matchers, e.g. 'cluster="tc",comm="clickhouse"'`)
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
-	fs.StringVar(&o.sortBy, "sort", "flat", "order functions by 'flat' (self time) or 'cum' (cumulative)")
+	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel merge queries")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.Usage = func() {
@@ -402,7 +407,9 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 			return err
 		}
 		// Percentages are against the same profile the functions came from,
-		// so CUM for a root frame approaches 100% rather than exceeding it.
+		// and against the sorted column: self time sums to the total across
+		// all functions, so FLAT percentages are small and spread out, while
+		// CUM for a root frame approaches 100% rather than exceeding it.
 		printFunctionTable(fns, header, o.top, grand, sortBy)
 	}
 	switch {
