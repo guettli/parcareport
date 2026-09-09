@@ -132,7 +132,7 @@ func TestTopFunctions(t *testing.T) {
 		Sample: []*profile.Sample{{Location: []*profile.Location{locA, locB}, Value: []int64{100}}},
 	}
 
-	rows, err := topFunctions(p, time.Second)
+	rows, err := topFunctions(p, time.Second, sortCum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,6 +414,94 @@ func TestGroupTableOmitsPercentagesWhenTheTotalIsUnknown(t *testing.T) {
 	}
 }
 
+// The bug this guards: the table was always ordered by cumulative value, so
+// the top rows were runtime and framework frames. A real run put
+// `runtime.goexit` first at 76.9% with 0.000 self time, while the largest self
+// time anywhere in the top 15 was 0.120 -- the code actually burning CPU was
+// below the cutoff and never printed.
+func TestTopFunctionsSortsBySelfTimeByDefault(t *testing.T) {
+	// goexit calls work: goexit is on every stack but runs no code itself.
+	goexit := &profile.Function{ID: 1, Name: "runtime.goexit"}
+	work := &profile.Function{ID: 2, Name: "app.work"}
+	locGoexit := &profile.Location{ID: 1, Line: []profile.Line{{Function: goexit}}}
+	locWork := &profile.Location{ID: 2, Line: []profile.Line{{Function: work}}}
+
+	p := &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}},
+		Period:     10_000_000,
+		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		Function:   []*profile.Function{goexit, work},
+		Location:   []*profile.Location{locGoexit, locWork},
+		// Leaf-first: work is the leaf, goexit the caller.
+		Sample: []*profile.Sample{{Location: []*profile.Location{locWork, locGoexit}, Value: []int64{100}}},
+	}
+
+	flat, err := topFunctions(p, time.Second, sortFlat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flat[0].Name != "app.work" {
+		t.Errorf("sorted by self time, want app.work first, got %q", flat[0].Name)
+	}
+
+	cum, err := topFunctions(p, time.Second, sortCum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both have cumulative 1.0, so the tie-break decides -- and self time is
+	// the secondary key, which still puts the frame that ran the code first.
+	if cum[0].Cores != cum[1].Cores {
+		t.Fatalf("expected a cumulative tie, got %v", cum)
+	}
+	if cum[0].Name != "app.work" {
+		t.Errorf("cumulative ties should fall back to self time, got %q", cum[0].Name)
+	}
+}
+
+func TestParseSortKey(t *testing.T) {
+	for _, in := range []string{"flat", "self"} {
+		if got, err := parseSortKey(in); err != nil || got != sortFlat {
+			t.Errorf("parseSortKey(%q) = (%v, %v), want sortFlat", in, got, err)
+		}
+	}
+	for _, in := range []string{"cum", "cumulative"} {
+		if got, err := parseSortKey(in); err != nil || got != sortCum {
+			t.Errorf("parseSortKey(%q) = (%v, %v), want sortCum", in, got, err)
+		}
+	}
+	if _, err := parseSortKey("sideways"); err == nil {
+		t.Error("want an error for an unknown sort key")
+	}
+	// An unset field means the default, so a caller building options directly
+	// does not have to know this one is load-bearing.
+	if got, err := parseSortKey(""); err != nil || got != sortFlat {
+		t.Errorf(`parseSortKey("") = (%v, %v), want sortFlat`, got, err)
+	}
+}
+
+// The percentage must follow the sorted column, or the table shows rows
+// ordered by one number and a percentage derived from another.
+func TestFunctionTablePercentageFollowsTheSortedColumn(t *testing.T) {
+	rows := []Row{{Name: "app.work", Cores: 1.0, Flat: 0.25}}
+
+	flatOut := captureStdout(t, func() { printFunctionTable(rows, "CORES", 5, 1.0, sortFlat) })
+	if !strings.Contains(flatOut, "FLAT*") {
+		t.Errorf("the sorted column should be marked:\n%s", flatOut)
+	}
+	// 0.25 of a 1.0 total.
+	if !strings.Contains(flatOut, "25.0") {
+		t.Errorf("want the self-time percentage:\n%s", flatOut)
+	}
+
+	cumOut := captureStdout(t, func() { printFunctionTable(rows, "CORES", 5, 1.0, sortCum) })
+	if !strings.Contains(cumOut, "CUM*") {
+		t.Errorf("the sorted column should be marked:\n%s", cumOut)
+	}
+	if !strings.Contains(cumOut, "100.0") {
+		t.Errorf("want the cumulative percentage:\n%s", cumOut)
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -472,7 +560,8 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 const testType = "parca_agent:samples:count:cpu:nanoseconds:delta"
 
 func testOptions() options {
-	return options{by: "cluster", profileType: testType, top: 0, concurrency: 4, timeout: time.Minute}
+	return options{by: "cluster", profileType: testType, top: 0, concurrency: 4,
+		timeout: time.Minute, sortBy: defaultSortBy}
 }
 
 func reportFixture(t *testing.T) *fakeQuery {
@@ -605,5 +694,104 @@ func TestReportReportsTheUnlabeledResidual(t *testing.T) {
 	}
 	if !strings.Contains(out, "%TOTAL") || !strings.Contains(out, "100.0") {
 		t.Errorf("want percentages against the measured total:\n%s", out)
+	}
+}
+
+// The bug this guards: the leaf test compared profile.Line by value, and
+// profile.Line is a comparable struct. A recursive inline chain f -> g -> f
+// has two identical Line entries in the leaf location, so both matched
+// loc.Line[0] and the leaf's self time was added twice -- FLAT came out
+// larger than CUM, and as the sorted column and %TOTAL numerator that put an
+// inflated row at the top of the table reading 200%.
+func TestFlatIsNotDoubleCountedForRecursiveInlining(t *testing.T) {
+	f := &profile.Function{ID: 1, Name: "app.f"}
+	g := &profile.Function{ID: 2, Name: "app.g"}
+	// One location, three inlined frames: f (leaf), g, f again -- the two f
+	// entries are identical structs.
+	leaf := &profile.Location{ID: 1, Line: []profile.Line{
+		{Function: f, Line: 10},
+		{Function: g, Line: 20},
+		{Function: f, Line: 10},
+	}}
+	p := &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}},
+		Period:     10_000_000,
+		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		Function:   []*profile.Function{f, g},
+		Location:   []*profile.Location{leaf},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{leaf}, Value: []int64{100}}},
+	}
+
+	rows, err := topFunctions(p, time.Second, sortFlat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Flat > r.Cores {
+			t.Errorf("%s: flat %v exceeds cum %v", r.Name, r.Flat, r.Cores)
+		}
+	}
+	byName := map[string]Row{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	// 100 samples x 10ms = 1 CPU-second over 1s = 1.0 cores, counted once.
+	if math.Abs(byName["app.f"].Flat-1.0) > 1e-9 {
+		t.Errorf("app.f flat = %v, want 1.0 counted once", byName["app.f"].Flat)
+	}
+}
+
+// The bug this guards: a location with no debuginfo has no Line entries at
+// all, so ranging over them skipped the frame and its time vanished from both
+// columns. For a partially symbolized target every symbolized frame was the
+// caller of such a leaf, so FLAT read 0.000 all the way down -- unusable as
+// the default sort key.
+func TestUnsymbolizedLeafStillCarriesSelfTime(t *testing.T) {
+	caller := &profile.Function{ID: 1, Name: "app.caller"}
+	locCaller := &profile.Location{ID: 1, Line: []profile.Line{{Function: caller}}}
+	// Address only: no Line entries, which is what "no debuginfo" looks like.
+	locLeaf := &profile.Location{ID: 2, Address: 0x4010}
+
+	p := &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}},
+		Period:     10_000_000,
+		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		Function:   []*profile.Function{caller},
+		Location:   []*profile.Location{locCaller, locLeaf},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{locLeaf, locCaller}, Value: []int64{100}}},
+	}
+
+	rows, err := topFunctions(p, time.Second, sortFlat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flatTotal float64
+	byName := map[string]Row{}
+	for _, r := range rows {
+		flatTotal += r.Flat
+		byName[r.Name] = r
+	}
+	// All the self time is the unsymbolized leaf's, and it must not be lost:
+	// self time has to sum to the profile's total or every %TOTAL reads 0.0.
+	if math.Abs(flatTotal-1.0) > 1e-9 {
+		t.Errorf("self time summed to %v, want 1.0", flatTotal)
+	}
+	if math.Abs(byName["[unsymbolized]"].Flat-1.0) > 1e-9 {
+		t.Errorf("[unsymbolized] flat = %v, want 1.0", byName["[unsymbolized]"].Flat)
+	}
+	if math.Abs(byName["app.caller"].Cores-1.0) > 1e-9 {
+		t.Errorf("the caller should still have cumulative 1.0, got %v", byName["app.caller"].Cores)
+	}
+}
+
+// The default is the point of the change, so pin it. Flipping the flag back to
+// "cum" should fail a test, which it previously did not.
+func TestDefaultSortIsSelfTime(t *testing.T) {
+	got, err := parseSortKey(defaultSortBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != sortFlat {
+		t.Errorf("default --sort is %q, want self time", defaultSortBy)
 	}
 }

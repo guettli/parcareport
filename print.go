@@ -62,16 +62,27 @@ func humanBytes(v float64) string {
 	return fmt.Sprintf("%.1f %ciB", v/div, "KMGTP"[exp])
 }
 
-func printFunctionTable(rows []Row, unitHeader string, top int, total float64) {
+// printFunctionTable lists the top functions. The sorted column is marked with
+// a `*` and the percentage follows it, so which question the table answers is
+// visible in the table itself rather than inferred from the flags.
+func printFunctionTable(rows []Row, unitHeader string, top int, total float64, by sortKey) {
 	if len(rows) > top {
 		rows = rows[:top]
 	}
+	cumHdr, flatHdr := "CUM", "FLAT*"
+	if by == sortCum {
+		cumHdr, flatHdr = "CUM*", "FLAT"
+	}
 	w := newTab()
-	fmt.Fprintf(w, "FUNCTION\tCUM\tFLAT\t%%TOTAL\n")
+	fmt.Fprintf(w, "FUNCTION\t%s\t%s\t%%TOTAL\n", cumHdr, flatHdr)
 	for _, r := range rows {
+		v := r.Flat
+		if by == sortCum {
+			v = r.Cores
+		}
 		pct := 0.0
 		if total > 0 {
-			pct = r.Cores / total * 100
+			pct = v / total * 100
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%.1f\n",
 			truncate(r.Name, 60), formatValue(r.Cores, unitHeader), formatValue(r.Flat, unitHeader), pct)

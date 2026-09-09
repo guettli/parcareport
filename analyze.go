@@ -154,9 +154,38 @@ func parsePprof(raw []byte) (*profile.Profile, error) {
 	return p, nil
 }
 
+// sortKey says which column orders the function table.
+type sortKey int
+
+const (
+	// sortFlat orders by self time: the code that was actually on-CPU.
+	sortFlat sortKey = iota
+	// sortCum orders by cumulative time: the work a frame was part of.
+	sortCum
+)
+
+func parseSortKey(s string) (sortKey, error) {
+	switch s {
+	// An unset value means the default rather than an error: report takes an
+	// options struct, and a caller that builds one directly should not have to
+	// know that this field is load-bearing.
+	case "", "flat", "self":
+		return sortFlat, nil
+	case "cum", "cumulative":
+		return sortCum, nil
+	}
+	return 0, fmt.Errorf("--sort must be flat or cum, got %q", s)
+}
+
 // topFunctions aggregates a profile by function, returning cumulative and flat
 // cores. Cumulative counts a function once per sample even if it recurses.
-func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
+//
+// The sort key is the whole question the table answers. Ordering by cumulative
+// value puts `runtime.goexit` on top of every Go profile at some enormous
+// percentage, which is true and useless; the frames actually burning CPU sit
+// below the cutoff and never appear. Self time asks "what code was running",
+// which is what the tool is for, so it is the default.
+func topFunctions(p *profile.Profile, window time.Duration, by sortKey) ([]Row, error) {
 	idx, unit := valueIndex(p)
 	m, err := interpret(p, window)
 	if err != nil {
@@ -176,14 +205,31 @@ func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
 		}
 		seen := map[string]bool{}
 		for i, loc := range s.Location {
-			for _, line := range loc.Line {
+			lines := loc.Line
+			if len(lines) == 0 {
+				// A location with no debuginfo at all has no Line entries,
+				// so ranging over them skipped the frame and its time
+				// disappeared from both columns. For a partially symbolized
+				// target that meant every symbolized frame was the caller of
+				// a leaf that contributed nothing, and FLAT read 0.000 all
+				// the way down. Bucket it like a nil Function instead.
+				lines = []profile.Line{{}}
+			}
+			for j, line := range lines {
 				name := funcName(line)
 				if !seen[name] {
 					seen[name] = true
 					cum[name] += v
 				}
 				// Leaf frame of the leaf location carries the self time.
-				if i == 0 && len(loc.Line) > 0 && line == loc.Line[0] {
+				//
+				// Compared by position, not by value. profile.Line is a
+				// comparable struct, so `line == loc.Line[0]` also matched any
+				// later identical frame -- a recursive inline chain f->g->f
+				// added the leaf's time twice, making FLAT exceed CUM and, now
+				// that FLAT is the sorted column and the %TOTAL numerator,
+				// promoting the inflated row to the top at 200%.
+				if i == 0 && j == 0 {
 					flat[name] += v
 				}
 			}
@@ -209,13 +255,29 @@ func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
 		}
 		rows = append(rows, Row{Name: name, Cores: cores(cs, window), Flat: cores(fs, window)})
 	}
+	sortRows(rows, by)
+	return rows, nil
+}
+
+// sortRows orders by the chosen column, falling back to the other one and then
+// to the name so the output is stable. Ties are common: every frame in a stack
+// that appears once shares a cumulative value, and most frames have no self
+// time at all.
+func sortRows(rows []Row, by sortKey) {
+	primary := func(r Row) float64 { return r.Flat }
+	secondary := func(r Row) float64 { return r.Cores }
+	if by == sortCum {
+		primary, secondary = secondary, primary
+	}
 	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Cores != rows[j].Cores {
-			return rows[i].Cores > rows[j].Cores
+		if a, b := primary(rows[i]), primary(rows[j]); a != b {
+			return a > b
+		}
+		if a, b := secondary(rows[i]), secondary(rows[j]); a != b {
+			return a > b
 		}
 		return rows[i].Name < rows[j].Name
 	})
-	return rows, nil
 }
 
 func funcName(l profile.Line) string {

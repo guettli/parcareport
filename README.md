@@ -19,11 +19,48 @@ tc       0.697  30.1
 p16      0.330  14.2
 TOTAL    2.317  100.0
 
-FUNCTION                                                      CUM    FLAT   %TOTAL
-github.com/example/app/internal/webui.(*Data).readIssues      0.941  0.000  40.6
-encoding/json.Unmarshal                                       0.895  0.001  38.6
-do_syscall_64                                                 0.817  0.030  35.3
+FUNCTION                                                      CUM    FLAT*  %TOTAL
+do_syscall_64                                                 0.817  0.330  14.2
+encoding/json.(*decodeState).object                           0.412  0.298  12.9
+runtime.memmove                                               0.221  0.221   9.5
 ```
+
+## Self time, not cumulative
+
+The function table is ordered by **self time** (`FLAT`) — the code that was
+actually on-CPU when the sampler looked. The sorted column is marked `*`, and
+`%TOTAL` follows it.
+
+This is not a cosmetic default. Ordering by cumulative value puts
+`runtime.goexit` on top of every Go profile:
+
+```
+FUNCTION                                      CUM*   FLAT   %TOTAL
+runtime.goexit                                2.284  0.000  76.9
+golang.org/x/sync/errgroup.(*Group).Go.func1  1.563  0.000  52.6
+```
+
+"76.9% of the CPU was spent inside a goroutine" is true of almost every Go
+program. Worse, the frames that *do* burn CPU are pushed below the `--top`
+cutoff and never printed at all. That run totalled 2.971 cores, and the
+largest self time anywhere in its top 15 was 0.120 — so sorted by self time
+the same profile reads:
+
+```
+FUNCTION                                                      CUM    FLAT*  %TOTAL
+github.com/parquet-go/parquet-go/encoding/thrift.(*structDe…  0.831  0.120  4.0
+github.com/parquet-go/parquet-go/encoding/thrift.readStruct   0.867  0.031  1.0
+github.com/parquet-go/parquet-go/encoding/thrift.decodeFunc…  0.783  0.028  0.9
+```
+
+Self-time percentages are small and spread out, because self time sums to the
+profile's total across *all* functions rather than being counted once per
+frame in every stack. Small numbers spread thin is the honest shape of this
+workload; a single frame at 76.9% was not.
+
+`--sort=cum` restores the cumulative order when that is the question: it shows
+what larger piece of work a frame was part of, which is what you want once you
+already know which function is hot.
 
 ## CORES, and why not percentages of a flamegraph
 
@@ -220,6 +257,7 @@ parcareport types [flags]      list profile types the server offers
 | `--match` | | extra matchers, e.g. `comm="clickhouse"` |
 | `--profile-type` | auto | required only if the server offers more than one |
 | `--top` | `15` | functions to list; `0` disables the table |
+| `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
 | `--insecure` | `true` | plaintext connection |
 
 Break down by anything the agents label:
