@@ -611,6 +611,18 @@ func resolveProfileType(ctx context.Context, c *Client, want string) (string, bo
 	if want != "" {
 		names, err := c.ProfileTypeNames(ctx)
 		if err != nil {
+			// A full selector needs nothing from the server, so it can be
+			// taken on trust. An abbreviation cannot: expanding it IS the
+			// lookup. Passing it through unexpanded produced a run that could
+			// only fail -- against a real server, `--profile-type=cpu` with a
+			// failed lookup sent "cpu" as the selector and every merge came
+			// back "profile-type selection must be of the form ...", after
+			// minutes of waiting.
+			if !looksLikeSelector(want) {
+				return "", false, fmt.Errorf("cannot expand --profile-type %q: that is an abbreviation, "+
+					"and the profile type list it would be matched against could not be read (%s). "+
+					"Retry, or pass the full selector", want, shortErr(err))
+			}
 			fmt.Fprintf(os.Stderr, "parcareport: could not check --profile-type against the server "+
 				"(%s); using %q as given\n", shortErr(err), want)
 			return want, false, nil
@@ -652,6 +664,26 @@ func resolveProfileType(ctx context.Context, c *Client, want string) (string, bo
 	}
 	return "", false, fmt.Errorf("server offers %d profile types and none of them is a CPU profile "+
 		"to default to; pick one with --profile-type:\n  %s", len(names), strings.Join(names, "\n  "))
+}
+
+// looksLikeSelector reports whether a value is a complete profile type
+// selector rather than an abbreviation of one.
+//
+// Parca wants name:sampleType:sampleUnit:periodType:periodUnit, optionally
+// followed by :delta, and rejects anything else outright. That is exactly the
+// line between a value that can be used without asking the server and one
+// that cannot.
+func looksLikeSelector(s string) bool {
+	parts := strings.Split(s, ":")
+	if len(parts) != 5 && len(parts) != 6 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+	}
+	return len(parts) == 5 || parts[5] == "delta"
 }
 
 // matchProfileType resolves --profile-type against what the server offers.
