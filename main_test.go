@@ -19,6 +19,8 @@ import (
 	qv1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"github.com/google/pprof/profile"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestParseTime(t *testing.T) {
@@ -387,7 +389,7 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 	}
 	failed = append(failed, failure{group: "instance=z", msg: "something else entirely"})
 
-	out := captureStdout(t, func() { printFailures(failed) })
+	out := captureStdout(t, func() { printFailures(failed, mergeQuery) })
 
 	if !strings.Contains(out, "something else entirely") {
 		t.Errorf("the rare cause was hidden:\n%s", out)
@@ -402,10 +404,10 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 }
 
 func TestHintForOnlyFiresWhenItHasSomethingToSay(t *testing.T) {
-	if h := hintFor([]string{"no such label"}); h != "" {
+	if h := hintFor([]string{"no such label"}, mergeQuery); h != "" {
 		t.Errorf("want no hint, got %q", h)
 	}
-	if h := hintFor([]string{"context deadline exceeded"}); !strings.Contains(h, "--timeout") {
+	if h := hintFor([]string{"context deadline exceeded"}, mergeQuery); !strings.Contains(h, "--timeout") {
 		t.Errorf("want a timeout hint, got %q", h)
 	}
 }
@@ -863,7 +865,7 @@ func TestListLabelsKeepsRowsWithTheirLabelsUnderContention(t *testing.T) {
 	})
 	for _, pair := range [][2]string{{"a", "av"}, {"b", "bv"}, {"c", "cv"}, {"d", "dv"}, {"e", "ev"}} {
 		// Anchored per line, so a match cannot span two rows.
-		re := regexp.MustCompile(`(?m)^` + pair[0] + `\s+1\s+` + pair[1] + `\s*$`)
+		re := regexp.MustCompile(`(?m)^` + pair[0] + `[ \t]+1[ \t]+` + pair[1] + `[ \t]*$`)
 		if !re.MatchString(out) {
 			t.Errorf("label %q should carry value %q:\n%s", pair[0], pair[1], out)
 		}
@@ -972,5 +974,53 @@ func TestProgressIsOffForTrivialJobs(t *testing.T) {
 	}
 	if newProgress("merging", "x", 0).on {
 		t.Error("progress should be off for an empty job")
+	}
+}
+
+// The bug this guards: the labels path reused the merge advice, telling the
+// reader to narrow --from or use --match after a failed label lookup. Neither
+// applies -- listLabels passes no matchers at all and merges nothing.
+func TestLabelFailuresGetMetadataAdviceNotMergeAdvice(t *testing.T) {
+	f := &fakeQuery{
+		names:  []string{"cluster", "slow"},
+		values: map[string][]string{"cluster": {"tc"}},
+		valuesErrFor: map[string]error{
+			"slow": status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
+		},
+	}
+	var err error
+	out := captureStdout(t, func() {
+		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4)
+	})
+	if err == nil {
+		t.Fatal("want a non-zero exit")
+	}
+	// The advice that does apply.
+	if !strings.Contains(out, "--timeout") {
+		t.Errorf("want the timeout advice:\n%s", out)
+	}
+	// The advice that does not.
+	for _, forbidden := range []string{"--match", "merge"} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("labels advice must not mention %q:\n%s", forbidden, out)
+		}
+	}
+	// And it belongs above the next-step line, not below it.
+	hint := strings.Index(out, "--timeout")
+	next := strings.Index(out, "Run `parcareport labels")
+	if hint > next {
+		t.Errorf("the failure explanation should precede the next-step line:\n%s", out)
+	}
+}
+
+// A merge failure keeps the merge advice, which is the half that can be acted
+// on by changing the query.
+func TestMergeFailuresKeepMergeAdvice(t *testing.T) {
+	h := hintFor([]string{"stream terminated by RST_STREAM"}, mergeQuery)
+	if !strings.Contains(h, "--match") {
+		t.Errorf("want merge advice, got %q", h)
+	}
+	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery); strings.Contains(m, "--match") {
+		t.Errorf("metadata advice must not suggest --match, got %q", m)
 	}
 }
