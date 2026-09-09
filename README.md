@@ -19,10 +19,10 @@ tc       0.697  30.1
 p16      0.330  14.2
 TOTAL    2.317  100.0
 
-FUNCTION                                                      CUM    FLAT*  %TOTAL
-do_syscall_64                                                 0.817  0.330  14.2
-encoding/json.(*decodeState).object                           0.412  0.298  12.9
-runtime.memmove                                               0.221  0.221   9.5
+FUNCTION                             CUM    FLAT*  %TOTAL
+do_syscall_64                        0.817  0.330  14.2
+encoding/json.(*decodeState).object  0.412  0.298  12.9
+runtime.memmove                      0.221  0.221  9.5
 ```
 
 ## Self time, not cumulative
@@ -99,13 +99,14 @@ pool parked waiting for work is "blocked" in exactly the same way as a thread
 stuck behind a lock, and there are usually far more of the former:
 
 ```
-WORKLOAD     BLOCKED   %TOTAL      FUNCTION
-clickhouse   1816.692    41.4      ThreadPoolImpl::ThreadFromThreadPool::worker  100%
-agentloop     232.447     5.3      runtime.mstart                                 86%
+WORKLOAD    BLOCKED   %TOTAL
+clickhouse  1816.692  41.4
+agentloop   232.447   5.3
 ```
 
-Both of those are idleness — ClickHouse's pool workers and Go's parked Ms — not
-bottlenecks. A fleet-wide off-CPU sweep therefore tends to rank services by how
+Almost all of the first row is `ThreadPoolImpl::ThreadFromThreadPool::worker`
+and almost all of the second is `runtime.mstart` — ClickHouse's pool workers
+and Go's parked Ms. Both are idleness, not bottlenecks. A fleet-wide off-CPU sweep therefore tends to rank services by how
 many idle threads they keep, which is not interesting.
 
 Off-CPU earns its keep **targeted**, not swept: profile one operation you
@@ -162,15 +163,22 @@ So failures are printed **on stdout**, next to the numbers they invalidate,
 and the command exits non-zero:
 
 ```
-!! INCOMPLETE: 3 of 47 workload queries failed. The totals and
-!! percentages above EXCLUDE them and are therefore wrong.
+!! INCOMPLETE
+!! 3 of 47 workload queries failed. The totals and percentages above
+!! EXCLUDE them and are therefore wrong.
 !!   workload=agentloop: context deadline exceeded
+!! Raise --timeout, or narrow the window with --from so each merge is smaller.
 ```
 
 Deliberately not stderr alone: `2>/dev/null` is common in scripts, and hiding
 this is exactly how a broken run gets mistaken for a real measurement. For the
-same reason, a run where *every* query fails gets the same banner rather than
-reporting "no data in this window", which would read as an idle cluster.
+same reason, a run where *every* query fails says so on stdout rather than
+reporting "no data in this window", which would read as an idle cluster:
+
+```
+!! FAILED: all 47 workload queries failed, so there is nothing to report.
+!! This is not an empty window -- the queries did not come back.
+```
 
 The two mix, and the counts have to keep them apart. Some queries can fail
 while every survivor comes back genuinely empty, so the banner reports both
@@ -287,14 +295,14 @@ the failures as data:
   "unit": "cores",
   "rate": true,
   "groups": [
-    {"name": "tc", "value": 2.316, "pct": 77.9},
-    {"name": "vps", "value": 0.655, "pct": 22.1}
+    {"name": "tc", "value": 2.3160163, "pct": 77.95355099293167},
+    {"name": "vps", "value": 0.6549837, "pct": 22.04644900706833}
   ],
   "empty_groups": 0,
   "total": 2.971,
   "functions": [
     {"name": "github.com/parquet-go/parquet-go/encoding/thrift.(*structDecoder).decode",
-     "cum": 0.831, "flat": 0.120, "pct": 4.0}
+     "cum": 0.8312841, "flat": 0.1203611, "pct": 4.050860316391788}
   ],
   "functions_sorted_by": "flat",
   "failed": [],
@@ -352,8 +360,8 @@ $ parcareport overview --from=-15m
 parca_agent:samples:count:cpu:nanoseconds:delta  ...
 
 CLUSTER  CORES  %TOTAL
-tc       2.316  77.9
-vps      0.655  22.1
+tc       2.316  78.0
+vps      0.655  22.0
 TOTAL    2.971  100.0
 
 FUNCTION                                                      CUM    FLAT*  %TOTAL
@@ -372,11 +380,10 @@ server has a heap profile. Which of those exist depends on how the agents were
 configured, and the label list is one cheap query — cheaper than making you
 know in advance.
 
-Heap is grouped only by `instance` or `job`, never by `cluster`. Heap profiles
-come from `scrape_configs` against Go `/debug/pprof` endpoints, whose series
-carry those labels; `cluster` comes from parca-agent's external labels. Pairing
-the heap with `cluster` merged once per cluster, found nothing, and reported
-"no data" for a heap profile with plenty in it.
+Heap is grouped only by `instance` or `job`, never by `cluster` — those are the
+labels heap series actually carry, for the reason given under [Beyond
+CPU](#beyond-cpu). Pairing the heap with `cluster` merged once per cluster,
+found nothing, and reported "no data" for a heap profile with plenty in it.
 
 **It is not cheap overall.** A breakdown costs one merge per label value, and
 merges are the slow part — a single 15-minute breakdown over two clusters took
@@ -384,8 +391,7 @@ about two minutes against a real server. So a label with more than
 `--max-group-values` (default 50) values is skipped rather than run:
 
 ```
--- not reported: CPU by comm (203 values is more than --max-group-values=50,
-   and each one costs a merge; run `parcareport --by=comm` directly if you want it)
+-- not reported: CPU by comm (203 values is more than --max-group-values=50, and each one costs a merge; run `parcareport --by=comm` directly if you want it)
 ```
 
 `--concurrency` bounds the queries within one section, not across sections;
@@ -398,7 +404,8 @@ profile type would produce the same table. It is shown once per type.
 to tell "this server has no heap profile" from "the heap query failed":
 
 ```
--- not reported: live heap (no instance, job or cluster label to group by)
+-- not reported: live heap (no instance or job label to group by; heap profiles
+   come from scrape targets, which carry those)
 ```
 
 A section that fails part-way still prints, carrying its own `!! INCOMPLETE`
@@ -414,6 +421,8 @@ would read as "nothing was hot".
 `--by` and `--profile-type` are refused rather than ignored: `overview` picks
 both per section, so accepting them would silently do something else.
 
+## Flags
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--url` | `localhost:7070` | Parca server gRPC address |
@@ -424,11 +433,15 @@ both per section, so accepting them would silently do something else.
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--output` | `table` | `json` for a machine-readable report |
-| `--max-group-values` | `50` | overview: skip a breakdown with more values than this |
-| `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
+| `--max-group-values` | `50` | overview: skip a breakdown with more values than this; `0` disables the skip |
+| `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
+| `--concurrency` | `4` | parallel queries, within one breakdown |
+| `--timeout` | `60s` | per-query deadline |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
 | `--username` / `--password-file` | | basic auth (needs `--insecure=false`) |
+
+## Breaking down by other labels
 
 Break down by anything the agents label:
 
@@ -469,7 +482,10 @@ stable across pod restarts.
 ### The `(unlabeled)` row
 
 If some series lack the `--by` label entirely, their CPU appears as
-`(unlabeled)` rather than being dropped. This is deliberate: a single agent
+`(unlabeled)` rather than being dropped — as long as it is more than 0.1% of
+the total. Below that the row is omitted, since a residual that small is
+usually rounding between the group merges and the unfiltered one rather than
+a real unlabelled series. This is deliberate: a single agent
 deployed without the label would otherwise vanish from the breakdown while
 still burning CPU, and the table would quietly fail to add up. When grouping by `namespace` or `workload` a large `(unlabeled)` row is
 expected and correct — it is every process outside a Kubernetes pod (kernel
@@ -481,6 +497,7 @@ usually means an agent is missing its external label:
 args:
   - --metadata-external-labels=cluster=tc
 ```
+
 
 ## Reaching a Parca that is not on localhost
 
@@ -530,6 +547,11 @@ something other than a single credential — two lines, or a comment — and an
 `Authorization` header containing a newline is refused far away from the flag
 that caused it.
 
+Two more combinations are refused rather than half-honoured: a bearer token
+together with basic auth, and a `--username` containing a colon (RFC 7617
+gives the colon to the first separator, so `a:b` with password `pw` would
+authenticate as `a` with password `b:pw`).
+
 `--password` without `--username` is refused rather than ignored. On its own
 it produces no header at all, so the request would go out unauthenticated and
 come back as a bare 401 that says nothing about the flag having been dropped.
@@ -571,6 +593,8 @@ come back as a bare 401 that says nothing about the flag having been dropped.
   !! These queries are normally instant, so a timeout means the server is slow
   !! or unreachable rather than the window being too large. Retry, or raise
   !! --timeout.
+
+  Run `parcareport labels <name>` to list one label's values in full.
   ```
 
   The advice differs from the one a failed *merge* gets. A merge can be made
