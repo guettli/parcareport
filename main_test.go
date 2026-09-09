@@ -151,7 +151,8 @@ func TestTopFunctions(t *testing.T) {
 }
 
 func TestTruncateCountsRunesNotBytes(t *testing.T) {
-	// Nine runes, but more than nine bytes. Truncating at 10 must leave it be.
+	// Ten runes, but twenty bytes. Truncating at 10 must leave it be, which a
+	// byte-based implementation would not have done.
 	const s = "ФункцияАБВ"
 	if got := truncate(s, 10); got != s {
 		t.Errorf("truncate(%q, 10) = %q, want it unchanged", s, got)
@@ -163,6 +164,13 @@ func TestTruncateCountsRunesNotBytes(t *testing.T) {
 	}
 	if !utf8.ValidString(got) {
 		t.Errorf("truncate produced invalid UTF-8: %q", got)
+	}
+	// n <= 0 used to slice r[:-1] and panic.
+	if got := truncate(s, 0); got != "" {
+		t.Errorf("truncate(%q, 0) = %q, want empty", s, got)
+	}
+	if got := truncate(s, 1); got != "…" {
+		t.Errorf("truncate(%q, 1) = %q, want the ellipsis alone", s, got)
 	}
 }
 

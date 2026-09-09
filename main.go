@@ -430,7 +430,8 @@ func parseWindow(from, to string) (time.Time, time.Time, error) {
 		return time.Time{}, time.Time{}, fmt.Errorf("--from: %w", err)
 	}
 	if !start.Before(end) {
-		return time.Time{}, time.Time{}, fmt.Errorf("--from (%s) must be before --to (%s)", start.Format(time.RFC3339), end.Format(time.RFC3339))
+		return time.Time{}, time.Time{}, fmt.Errorf("--from (%s) must be before --to (%s)",
+			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
 	}
 	return start, end, nil
 }
