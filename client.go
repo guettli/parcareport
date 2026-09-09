@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -10,6 +12,7 @@ import (
 	qv1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -31,12 +34,59 @@ type Client struct {
 	timeout time.Duration
 }
 
-func Dial(addr string, insecureTransport bool, timeout time.Duration) (*Client, error) {
+// Auth is how to authenticate to the server, if at all. Anything reachable
+// through an ingress is usually behind something, so TLS on its own would only
+// have helped for an unauthenticated endpoint.
+type Auth struct {
+	BearerToken string
+	Username    string // basic auth; ignored unless set
+	Password    string
+}
+
+// header returns the Authorization value, or "" for no authentication.
+func (a Auth) header() string {
+	switch {
+	case a.BearerToken != "":
+		return "Bearer " + a.BearerToken
+	case a.Username != "":
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(a.Username+":"+a.Password))
+	}
+	return ""
+}
+
+// authCreds attaches the Authorization header to every call.
+//
+// PerRPCCredentials rather than an interceptor, so gRPC itself enforces the
+// rule that credentials do not travel in cleartext: RequireTransportSecurity
+// makes sending a token over a plaintext connection an error rather than a
+// silent leak.
+type authCreds struct{ value string }
+
+func (a authCreds) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": a.value}, nil
+}
+
+func (authCreds) RequireTransportSecurity() bool { return true }
+
+func Dial(addr string, insecureTransport bool, timeout time.Duration, auth Auth) (*Client, error) {
 	var opts []grpc.DialOption
 	if insecureTransport {
+		if auth.header() != "" {
+			// gRPC would refuse this anyway, but its error does not say that
+			// the flags contradict each other.
+			return nil, errors.New("refusing to send credentials over a plaintext connection; " +
+				"pass --insecure=false to use TLS, or drop the credentials")
+		}
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		return nil, fmt.Errorf("TLS transport not implemented yet; pass --insecure")
+		// System roots. A Parca behind an ingress presents an ordinary
+		// publicly-trusted certificate, which is the case worth making easy.
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			MinVersion: tls.VersionTLS12,
+		})))
+		if v := auth.header(); v != "" {
+			opts = append(opts, grpc.WithPerRPCCredentials(authCreds{value: v}))
+		}
 	}
 	// Merged profiles over a long window can exceed the 4MiB default.
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(256<<20)))

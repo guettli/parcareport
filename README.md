@@ -258,7 +258,8 @@ parcareport types [flags]      list profile types the server offers
 | `--profile-type` | auto | required only if the server offers more than one |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
-| `--insecure` | `true` | plaintext connection |
+| `--insecure` | `true` | plaintext connection; `false` uses TLS |
+| `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
 
 Break down by anything the agents label:
 
@@ -311,6 +312,34 @@ usually means an agent is missing its external label:
 args:
   - --metadata-external-labels=cluster=tc
 ```
+
+## Reaching a Parca that is not on localhost
+
+`--insecure` defaults to true, which is right for a port-forward — the way
+most people first try the tool:
+
+```sh
+kubectl -n monitoring port-forward svc/parca 7070:7070
+parcareport --from=-6h
+```
+
+A Parca that is only reachable through an ingress needs `--insecure=false`,
+which uses TLS with the system root certificates:
+
+```sh
+parcareport --url parca.example.com:443 --insecure=false \
+            --bearer-token-file ~/.parca-token
+```
+
+Credentials go in an `Authorization` header. They are attached as gRPC
+per-RPC credentials rather than by an interceptor, so gRPC itself enforces
+that they never travel over a plaintext connection: combining them with
+`--insecure` is refused rather than quietly leaking the token.
+
+Prefer `--bearer-token-file` over `--bearer-token`. A token on the command
+line is visible in the process list to anyone on the box. The file's contents
+are trimmed, because token files almost always end in a newline and a token
+carrying one fails as an opaque 401.
 
 ## Notes
 

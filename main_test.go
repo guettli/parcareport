@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -1022,5 +1023,108 @@ func TestMergeFailuresKeepMergeAdvice(t *testing.T) {
 	}
 	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery); strings.Contains(m, "--match") {
 		t.Errorf("metadata advice must not suggest --match, got %q", m)
+	}
+}
+
+func TestAuthHeader(t *testing.T) {
+	if got := (Auth{}).header(); got != "" {
+		t.Errorf("no credentials should mean no header, got %q", got)
+	}
+	if got := (Auth{BearerToken: "tok"}).header(); got != "Bearer tok" {
+		t.Errorf("got %q", got)
+	}
+	// "user:pw" base64-encoded.
+	if got := (Auth{Username: "user", Password: "pw"}).header(); got != "Basic dXNlcjpwdw==" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Credentials must never travel in cleartext. gRPC would refuse this too, but
+// its error does not say that the flags contradict each other.
+func TestDialRefusesCredentialsOverPlaintext(t *testing.T) {
+	_, err := Dial("localhost:7070", true, time.Minute, Auth{BearerToken: "tok"})
+	if err == nil {
+		t.Fatal("want a refusal")
+	}
+	if !strings.Contains(err.Error(), "plaintext") {
+		t.Errorf("the error should name the problem, got %v", err)
+	}
+}
+
+// The plaintext default still works, which is how most people first reach for
+// the tool (a port-forward).
+func TestDialPlaintextWithoutCredentials(t *testing.T) {
+	c, err := Dial("localhost:7070", true, time.Minute, Auth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+// TLS is no longer "not implemented".
+func TestDialTLS(t *testing.T) {
+	c, err := Dial("parca.example.com:443", false, time.Minute, Auth{BearerToken: "tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+// RequireTransportSecurity is what makes gRPC itself enforce the rule, so it
+// must stay true.
+func TestAuthCredsRequireTransportSecurity(t *testing.T) {
+	if !(authCreds{}).RequireTransportSecurity() {
+		t.Error("credentials must require a secure transport")
+	}
+	md, err := authCreds{value: "Bearer tok"}.GetRequestMetadata(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md["authorization"] != "Bearer tok" {
+		t.Errorf("got %v", md)
+	}
+}
+
+func TestAuthFromFlags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	// Token files almost always end in a newline, and a token carrying one
+	// fails as an opaque 401.
+	if err := os.WriteFile(path, []byte("  tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := options{tokenFile: path}.auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BearerToken != "tok" {
+		t.Errorf("token = %q, want it trimmed", got.BearerToken)
+	}
+
+	// The file wins over the flag, because the flag is visible in the process
+	// list to anyone on the box.
+	got, err = options{tokenFile: path, bearerToken: "fromflag"}.auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BearerToken != "tok" {
+		t.Errorf("the file should win, got %q", got.BearerToken)
+	}
+
+	if _, err := (options{tokenFile: filepath.Join(dir, "nope")}).auth(); err == nil {
+		t.Error("a missing token file must be an error")
+	}
+
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (options{tokenFile: empty}).auth(); err == nil {
+		t.Error("an empty token file must be an error, not a silent no-auth")
+	}
+
+	if _, err := (options{bearerToken: "tok", username: "u"}).auth(); err == nil {
+		t.Error("two kinds of credentials at once must be rejected")
 	}
 }

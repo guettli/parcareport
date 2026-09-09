@@ -46,6 +46,10 @@ type options struct {
 	sortBy      string
 	concurrency int
 	timeout     time.Duration
+	bearerToken string
+	tokenFile   string
+	username    string
+	password    string
 }
 
 func run(args []string) error {
@@ -62,6 +66,10 @@ func run(args []string) error {
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
+	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
+	fs.StringVar(&o.tokenFile, "bearer-token-file", "", "read the bearer token from a file, keeping it out of the process list")
+	fs.StringVar(&o.username, "username", "", "basic auth username (requires --insecure=false)")
+	fs.StringVar(&o.password, "password", "", "basic auth password")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), usage)
 		fs.PrintDefaults()
@@ -99,7 +107,12 @@ func run(args []string) error {
 		return err
 	}
 
-	c, err := Dial(o.addr, o.insecure, o.timeout)
+	auth, err := o.auth()
+	if err != nil {
+		return err
+	}
+
+	c, err := Dial(o.addr, o.insecure, o.timeout, auth)
 	if err != nil {
 		return err
 	}
@@ -136,6 +149,30 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (want: report, labels, types)", sub)
 	}
+}
+
+// auth assembles the credentials from the flags.
+//
+// A token on the command line is visible in the process list to anyone on the
+// box, so --bearer-token-file exists and wins when both are given.
+func (o options) auth() (Auth, error) {
+	a := Auth{BearerToken: o.bearerToken, Username: o.username, Password: o.password}
+	if o.tokenFile != "" {
+		b, err := os.ReadFile(o.tokenFile)
+		if err != nil {
+			return Auth{}, fmt.Errorf("--bearer-token-file: %w", err)
+		}
+		// Trailing newlines are near-universal in token files, and a token
+		// with one attached fails as an opaque 401.
+		a.BearerToken = strings.TrimSpace(string(b))
+		if a.BearerToken == "" {
+			return Auth{}, fmt.Errorf("--bearer-token-file %s is empty", o.tokenFile)
+		}
+	}
+	if a.BearerToken != "" && a.Username != "" {
+		return Auth{}, errors.New("pass either a bearer token or basic auth, not both")
+	}
+	return a, nil
 }
 
 // listLabels summarizes label names, or dumps one label's values in full.
