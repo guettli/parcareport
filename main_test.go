@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -206,6 +207,10 @@ type fakeQuery struct {
 	valuesErr error
 	types     []*qv1.ProfileType
 	typesErr  error
+	// merges answers MergePprof by selector. A selector with no entry gets an
+	// empty pprof, which is what Parca returns for a window with no samples.
+	merges    map[string]*profile.Profile
+	mergeErrs map[string]error
 	block     time.Duration // make Values hang, to exercise the deadline
 }
 
@@ -319,12 +324,17 @@ func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
 func TestExplicitProfileTypeSurvivesAFailedLookup(t *testing.T) {
 	const want = "parca_agent:samples:count:cpu:nanoseconds:delta"
 	c := testClient(&fakeQuery{typesErr: errors.New("boom")}, 0)
-	got, err := resolveProfileType(context.Background(), c, want)
+	got, verified, err := resolveProfileType(context.Background(), c, want)
 	if err != nil {
 		t.Fatalf("explicit type should survive a failed lookup, got %v", err)
 	}
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+	// The caller needs to know the check never happened, so it can say so if
+	// the report then comes back empty.
+	if verified {
+		t.Error("a failed lookup must not report the type as verified")
 	}
 }
 
@@ -335,7 +345,7 @@ func TestExplicitProfileTypeStillRejectsATypo(t *testing.T) {
 		Name: "parca_agent", SampleType: "samples", SampleUnit: "count",
 		PeriodType: "cpu", PeriodUnit: "nanoseconds", Delta: true,
 	}}}, 0)
-	if _, err := resolveProfileType(context.Background(), c, "nope:x:y:z:w"); err == nil {
+	if _, _, err := resolveProfileType(context.Background(), c, "nope:x:y:z:w"); err == nil {
 		t.Fatal("want an error for a selector the server does not offer")
 	}
 }
@@ -344,7 +354,7 @@ func TestExplicitProfileTypeStillRejectsATypo(t *testing.T) {
 // to fall back to.
 func TestAutoDetectStillFailsWhenTheLookupFails(t *testing.T) {
 	c := testClient(&fakeQuery{typesErr: errors.New("boom")}, 0)
-	if _, err := resolveProfileType(context.Background(), c, ""); err == nil {
+	if _, _, err := resolveProfileType(context.Background(), c, ""); err == nil {
 		t.Fatal("want an error when the lookup fails and no type was given")
 	}
 }
@@ -418,10 +428,182 @@ func captureStdout(t *testing.T, fn func()) string {
 		io.Copy(&b, r)
 		done <- b.String()
 	}()
+	defer func() {
+		os.Stdout = saved
+		r.Close()
+	}()
 	fn()
 	w.Close()
-	os.Stdout = saved
-	out := <-done
-	r.Close()
-	return out
+	return <-done
+}
+
+// cpuProfile builds a parca-agent-shaped CPU profile: sample values are stack
+// counts, and the sampling period turns them into time.
+func cpuProfile(t *testing.T, samples int64) *profile.Profile {
+	t.Helper()
+	fn := &profile.Function{ID: 1, Name: "app.work"}
+	loc := &profile.Location{ID: 1, Line: []profile.Line{{Function: fn}}}
+	return &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}},
+		Period:     10_000_000, // 10ms
+		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		Function:   []*profile.Function{fn},
+		Location:   []*profile.Location{loc},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{loc}, Value: []int64{samples}}},
+	}
+}
+
+func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.CallOption) (*qv1.QueryResponse, error) {
+	sel := in.GetMerge().GetQuery()
+	if err := f.mergeErrs[sel]; err != nil {
+		return nil, err
+	}
+	p := f.merges[sel]
+	if p == nil {
+		return &qv1.QueryResponse{}, nil // no samples in this window
+	}
+	var buf bytes.Buffer
+	if err := p.Write(&buf); err != nil {
+		return nil, err
+	}
+	return &qv1.QueryResponse{Report: &qv1.QueryResponse_Pprof{Pprof: buf.Bytes()}}, nil
+}
+
+const testType = "parca_agent:samples:count:cpu:nanoseconds:delta"
+
+func testOptions() options {
+	return options{by: "cluster", profileType: testType, top: 0, concurrency: 4, timeout: time.Minute}
+}
+
+func reportFixture(t *testing.T) *fakeQuery {
+	t.Helper()
+	return &fakeQuery{
+		types: []*qv1.ProfileType{{
+			Name: "parca_agent", SampleType: "samples", SampleUnit: "count",
+			PeriodType: "cpu", PeriodUnit: "nanoseconds", Delta: true,
+		}},
+		values:    map[string][]string{"cluster": {"tc", "vps"}},
+		names:     []string{"cluster"},
+		merges:    map[string]*profile.Profile{},
+		mergeErrs: map[string]error{},
+	}
+}
+
+func runReport(t *testing.T, f *fakeQuery, o options) (string, error) {
+	t.Helper()
+	var err error
+	out := captureStdout(t, func() {
+		start := time.Now().Add(-time.Hour)
+		err = report(context.Background(), testClient(f, time.Minute), o, start, time.Now())
+	})
+	return out, err
+}
+
+// The bug this guards: the unfiltered merge's failure returned early and threw
+// away every group result that had already succeeded, so the main output of
+// the command vanished because an auxiliary query failed.
+func TestReportKeepsTheBreakdownWhenTheUnfilteredMergeFails(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.mergeErrs[testType] = errors.New("boom")
+
+	out, err := runReport(t, f, testOptions())
+
+	if err == nil {
+		t.Error("a failed unfiltered merge must exit non-zero")
+	}
+	for _, want := range []string{"tc", "vps"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the breakdown should survive, missing %q:\n%s", want, out)
+		}
+	}
+	// No denominator, so no percentages and no total that reads as fleet-wide.
+	if strings.Contains(out, "%TOTAL") {
+		t.Errorf("percentages must be dropped:\n%s", out)
+	}
+	if !strings.Contains(out, "SUM OF LISTED") {
+		t.Errorf("the subtotal must be labelled as such:\n%s", out)
+	}
+	if !strings.Contains(out, "!! INCOMPLETE") {
+		t.Errorf("the shortfall must be on stdout:\n%s", out)
+	}
+	// The function table is gone too, and saying so is part of being honest.
+	if !strings.Contains(out, "hot-function table") {
+		t.Errorf("the missing function table should be mentioned:\n%s", out)
+	}
+}
+
+// The bug this guards: "all N queries failed" was computed from len(failed),
+// so a run where one query failed and the rest were genuinely empty claimed
+// every query had failed -- inverting the empty/failed distinction the tool
+// exists to keep straight.
+func TestReportDistinguishesFailedFromEmpty(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"a", "b", "c", "d"}
+	// a, b, c return empty merges; only d fails.
+	f.mergeErrs[testType+`{cluster="d"}`] = errors.New("boom")
+
+	out, err := runReport(t, f, testOptions())
+
+	if err == nil {
+		t.Fatal("want a non-zero exit")
+	}
+	if strings.Contains(out, "all 1 cluster queries failed") {
+		t.Errorf("must not claim every query failed:\n%s", out)
+	}
+	if !strings.Contains(out, "1 of 4") {
+		t.Errorf("want both counts:\n%s", out)
+	}
+	if !strings.Contains(out, "no samples") {
+		t.Errorf("the empty groups should be accounted for:\n%s", out)
+	}
+}
+
+// A window that is genuinely empty must not be dressed up as a failure.
+func TestReportSaysNoDataWhenNothingFailed(t *testing.T) {
+	f := reportFixture(t)
+	_, err := runReport(t, f, testOptions())
+	if err == nil || !strings.Contains(err.Error(), "no data") {
+		t.Errorf("want a plain no-data error, got %v", err)
+	}
+}
+
+// The bug this guards: an unfiltered merge that came back empty left
+// knowTotal true, so the group sum was printed as an authoritative
+// fleet-wide TOTAL ... 100.0 that nothing had measured.
+func TestReportDoesNotInventATotalFromAnEmptyOverallMerge(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	// The unfiltered selector has no entry, so it returns an empty pprof.
+
+	out, err := runReport(t, f, testOptions())
+	if err != nil {
+		t.Fatalf("an empty overall merge is not an error: %v", err)
+	}
+	if strings.Contains(out, "%TOTAL") {
+		t.Errorf("an unmeasured total must not carry percentages:\n%s", out)
+	}
+}
+
+// The happy path still adds up, and the residual is reported rather than
+// dropped.
+func TestReportReportsTheUnlabeledResidual(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	// The unfiltered merge sees more than the two labelled clusters together.
+	f.merges[testType] = cpuProfile(t, 200)
+
+	out, err := runReport(t, f, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "(unlabeled)") {
+		t.Errorf("the residual should be shown:\n%s", out)
+	}
+	if !strings.Contains(out, "%TOTAL") || !strings.Contains(out, "100.0") {
+		t.Errorf("want percentages against the measured total:\n%s", out)
+	}
 }

@@ -111,6 +111,12 @@ this is exactly how a broken run gets mistaken for a real measurement. For the
 same reason, a run where *every* query fails gets the same banner rather than
 reporting "no data in this window", which would read as an idle cluster.
 
+The two mix, and the counts have to keep them apart. Some queries can fail
+while every survivor comes back genuinely empty, so the banner reports both
+numbers rather than calling that "all queries failed" — with `--by=comm` one
+flaky query would otherwise turn "199 values had no samples, 1 failed" into
+"all 1 comm queries failed".
+
 Failures are grouped by cause, so a wholesale outage collapses to one line and
 a rare cause is never the one truncated away:
 
@@ -127,10 +133,10 @@ boilerplate to strip and says nothing about what to do, yet it can take
 minutes to arrive.
 
 `--timeout` (default 60s) bounds each query so one slow group fails visibly
-instead of stalling the run. That includes the label lookups, and the
-unfiltered merge behind the `(unlabeled)` row — which, carrying no matcher at
-all, is the widest query in the run and was the one query with no bound of its
-own.
+instead of stalling the run. That includes the label and profile-type lookups,
+and the unfiltered merge behind the `(unlabeled)` row — which, carrying no
+matcher at all, is the widest query in the run and was the one query with no
+bound of its own.
 
 If that unfiltered merge is the thing that fails, the group breakdown is
 already computed and is still printed. What goes away is the total: there is no
@@ -143,15 +149,27 @@ tc             2.316
 vps            0.655
 SUM OF LISTED  2.971
 
-!! INCOMPLETE: the unfiltered merge failed, so percentages and the
-!! (unlabeled) row are missing, and any series carrying no "cluster" label
-!! is absent from the total above.
+!! INCOMPLETE
+!! The unfiltered merge failed, so percentages, the (unlabeled) row
+!! and the hot-function table are missing, and any series carrying no
+!! "cluster" label is absent from the sum above.
+!!   (overall): context deadline exceeded
+!! Raise --timeout, or narrow the window with --from so each merge is smaller.
 ```
+
+However many things go wrong, there is one `!! INCOMPLETE` block. Two banners,
+each describing the run as though it were the only problem, read as two
+unrelated reports — and the group-failure wording talked about percentages
+that the other banner had just explained were absent.
 
 An explicit `--profile-type` is checked against the server's list, but the
 check can no longer fail the run on its own. The selector is already complete
 and the merges do not need the lookup; a slow server used to kill
 fully-specified runs here.
+
+When that check could not run and the report then comes back empty, the report
+says so on stdout, because those two facts together are almost certainly one
+fact: a selector the server does not offer looks exactly like an idle window.
 
 An **empty** answer gets the same scepticism as a failed one. Parca reports
 "no values" for a label that does not exist, for a window that holds nothing,
