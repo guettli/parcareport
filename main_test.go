@@ -1808,3 +1808,262 @@ func TestWindowSecondsIsRounded(t *testing.T) {
 		t.Errorf("window_seconds carries float noise:\n%s", out)
 	}
 }
+
+const heapType = "memory:inuse_space:bytes:space:bytes"
+
+func heapProfile(t *testing.T, bytes int64) *profile.Profile {
+	t.Helper()
+	fn := &profile.Function{ID: 1, Name: "app.alloc"}
+	loc := &profile.Location{ID: 1, Line: []profile.Line{{Function: fn}}}
+	return &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "inuse_space", Unit: "bytes"}},
+		PeriodType: &profile.ValueType{Type: "space", Unit: "bytes"},
+		Function:   []*profile.Function{fn},
+		Location:   []*profile.Location{loc},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{loc}, Value: []int64{bytes}}},
+	}
+}
+
+func overviewFixture(t *testing.T) *fakeQuery {
+	t.Helper()
+	return &fakeQuery{
+		types: profileTypesFrom([]string{testType, heapType,
+			"parca_agent:wallclock:nanoseconds:samples:count:delta"}),
+		names: []string{"cluster", "comm", "instance"},
+		values: map[string][]string{
+			"cluster":  {"tc", "vps"},
+			"comm":     {"parca"},
+			"instance": {"10.0.0.1:6060"},
+		},
+		merges:    map[string]*profile.Profile{},
+		mergeErrs: map[string]error{},
+	}
+}
+
+func runOverview(t *testing.T, f *fakeQuery, o options) (string, error) {
+	t.Helper()
+	var err error
+	out := captureStdout(t, func() {
+		end := time.Now()
+		err = overview(context.Background(), testClient(f, time.Minute), o, end.Add(-10*time.Second), end)
+	})
+	return out, err
+}
+
+// The point of the command: one run answers the questions you would otherwise
+// have to know the answers to before asking.
+func TestOverviewReportsEachBreakdownTheServerCanSupport(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 3
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\n%s", err, out)
+	}
+	// It says what the server has before reporting on it.
+	for _, want := range []string{"3 profile types", "cluster comm instance"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
+	// CPU by cluster and by comm, and the heap by instance.
+	for _, want := range []string{"CLUSTER", "COMM", "INSTANCE", "CORES", "BYTES"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing section %q:\n%s", want, out)
+		}
+	}
+	// namespace and workload do not exist here, and must not be invented.
+	if strings.Contains(out, "NAMESPACE") {
+		t.Errorf("a label the server does not have was reported:\n%s", out)
+	}
+}
+
+// An overview that quietly leaves a section out is worse than one that says it
+// could not run it: the reader cannot tell "no heap profile here" from "the
+// heap query failed".
+func TestOverviewSaysWhatItDidNotReport(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType}) // no heap profile
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 0
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("a missing heap profile is not a failure: %v", err)
+	}
+	if strings.Contains(out, "BYTES") {
+		t.Errorf("no heap profile exists, so no heap section:\n%s", out)
+	}
+	// Nothing was skipped for a reason worth stating here -- the heap simply
+	// is not offered, so it never entered the plan.
+	if !strings.Contains(out, "CLUSTER") || !strings.Contains(out, "COMM") {
+		t.Errorf("the CPU sections should still be there:\n%s", out)
+	}
+}
+
+// One failing section must not take the whole overview with it.
+func TestOverviewSurvivesOneFailingSection(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType] = cpuProfile(t, 150)
+	// Every comm query fails, so that whole section has nothing.
+	f.mergeErrs[testType+`{comm="parca"}`] = errors.New("boom")
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 0
+	out, err := runOverview(t, f, o)
+	if err == nil {
+		t.Error("an incomplete overview must exit non-zero")
+	}
+	if !strings.Contains(out, "CLUSTER") {
+		t.Errorf("the sections that worked should still print:\n%s", out)
+	}
+	// The failing section still prints, carrying its own banner, so the
+	// reader sees which breakdown is missing and why rather than just noticing
+	// that one is absent.
+	if !strings.Contains(out, "!! FAILED") || !strings.Contains(out, "comm=parca") {
+		t.Errorf("the section that failed should explain itself in place:\n%s", out)
+	}
+	if !strings.Contains(out, "BYTES") {
+		t.Errorf("later sections should still run:\n%s", out)
+	}
+}
+
+// A section that could not even be attempted is named, since the reader
+// otherwise cannot tell it apart from one the server simply does not support.
+func TestOverviewNamesASectionItCouldNotAttempt(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+	// The heap profile exists but none of the labels it could be grouped by
+	// does. `comm` is not one of them: a heap by process name would merge
+	// unrelated processes across hosts.
+	f.names = []string{"comm"}
+
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 0
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("an unreportable heap is not a failed run: %v", err)
+	}
+	if !strings.Contains(out, "not reported: live heap") {
+		t.Errorf("the skipped section should be named:\n%s", out)
+	}
+}
+
+// Several CPU profiles means no single one to report on, and guessing would
+// misattribute the fleet.
+func TestOverviewRefusesToPickBetweenCPUProfiles(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{
+		testType,
+		"otheragent:samples:count:cpu:nanoseconds:delta",
+	})
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 0
+	out, err := runOverview(t, f, o)
+	if err == nil {
+		t.Error("want a non-zero exit when nothing could be reported")
+	}
+	if !strings.Contains(out, "2 CPU delta profiles") {
+		t.Errorf("the reason should be stated:\n%s", out)
+	}
+}
+
+func TestOverviewJSON(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 2
+	o.output = outputJSON
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var d overviewData
+	if e := json.Unmarshal([]byte(out), &d); e != nil {
+		t.Fatalf("not one JSON document: %v\n%s", e, out)
+	}
+	if !d.Complete {
+		t.Error("nothing failed, so it is complete")
+	}
+	if len(d.Sections) != 3 {
+		t.Fatalf("want cluster, comm and instance sections, got %d", len(d.Sections))
+	}
+	units := map[string]bool{}
+	for _, s := range d.Sections {
+		units[s.Unit] = true
+		if s.GroupBy == "" {
+			t.Error("each section should name what it grouped by")
+		}
+	}
+	// The heap section must not be reported in cores.
+	if !units["cores"] || !units["bytes"] {
+		t.Errorf("each profile should keep its own unit, got %v", units)
+	}
+	// Banners must never accompany the document.
+	if strings.Contains(out, "!!") || strings.Contains(out, "not reported") {
+		t.Errorf("prose must not accompany JSON:\n%s", out)
+	}
+}
+
+// A section with nothing in it must say so. A heading followed by silence
+// reads as truncated output, especially beside sections that did produce
+// tables.
+func TestEmptySectionSaysSo(t *testing.T) {
+	f := reportFixture(t) // no merges: every group comes back empty
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), testOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	if !strings.Contains(out, "no data in this window") {
+		t.Errorf("an empty result should say so on stdout:\n%q", out)
+	}
+}
+
+// Every breakdown of one profile type draws its functions from the same
+// unfiltered merge, so the table would be identical each time.
+func TestOverviewShowsTheFunctionTableOncePerProfileType(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := testOptions()
+	o.profileType, o.by, o.top = "", "", 3
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two CPU breakdowns, one CPU function table.
+	if n := strings.Count(out, "app.work"); n != 1 {
+		t.Errorf("the CPU function table should appear once, appeared %d times:\n%s", n, out)
+	}
+	// The heap is a different profile, so it keeps its own.
+	if !strings.Contains(out, "app.alloc") {
+		t.Errorf("the heap function table should still appear:\n%s", out)
+	}
+}

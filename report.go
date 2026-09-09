@@ -367,7 +367,10 @@ func noRows(o options, groups []string, failed []failure, empty int, profType st
 				"!! looks exactly like this. Check it with `parcareport types`.\n",
 			fmt.Errorf("no data in this window, and %q was never verified", profType)
 	}
-	return "", errors.New("no data in this window")
+	// Say so on stdout as well. A section heading followed by silence reads
+	// as truncated output, especially in an overview where other sections did
+	// produce tables.
+	return "(no data in this window)\n", errors.New("no data in this window")
 }
 
 // reportShortfall is the non-zero exit, naming what is missing.

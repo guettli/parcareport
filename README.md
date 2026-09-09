@@ -331,9 +331,63 @@ go install github.com/guettli/parcareport@latest
 
 ```
 parcareport [report] [flags]   break CPU down by a label, then list hot functions
+parcareport overview [flags]   what this server has, and what is busy in it
 parcareport labels [name]      summarize labels, or list one label's values
 parcareport types [flags]      list profile types the server offers
 ```
+
+## `parcareport overview`
+
+Getting oriented otherwise meant running the tool once per question, and each
+run needed a profile type and a `--by` label chosen in advance — so you had to
+know the answers before you could ask. `overview` asks the server what it has
+and reports on that:
+
+```console
+$ parcareport overview --from=-15m
+
+2026-09-09T14:43:26Z .. 2026-09-09T14:58:26Z  (15m0s)
+11 profile types, 3 labels: cluster comm node
+
+parca_agent:samples:count:cpu:nanoseconds:delta  ...
+
+CLUSTER  CORES  %TOTAL
+tc       2.316  77.9
+vps      0.655  22.1
+TOTAL    2.971  100.0
+
+FUNCTION                                                      CUM    FLAT*  %TOTAL
+github.com/parquet-go/parquet-go/encoding/thrift.(*structDe…  0.831  0.120  4.0
+
+parca_agent:samples:count:cpu:nanoseconds:delta  ...
+
+COMM     CORES  %TOTAL
+parca    2.284  76.9
+...
+```
+
+It breaks CPU down by whichever of `cluster`, `namespace`, `workload` and
+`comm` exist in the window, and reports live heap by `instance` (or `job`, or
+`cluster`) if the server has a heap profile. Which of those exist depends on
+how the agents were configured, and asking is one cheap query — cheaper than
+making you know in advance.
+
+The hot functions come from the unfiltered merge, so every breakdown of one
+profile type would produce the same table. It is shown once per type.
+
+**A section it could not run is named, not dropped.** Otherwise there is no way
+to tell "this server has no heap profile" from "the heap query failed":
+
+```
+-- not reported: live heap (no instance, job or cluster label to group by)
+```
+
+A section that fails part-way still prints, carrying its own `!! INCOMPLETE`
+banner, and the command exits non-zero. One breakdown failing is not a reason
+to discard the others — that is the point of running several.
+
+`--output=json` gives the whole thing as one document, with each section
+carrying its own `unit`, `total` and `failed`.
 
 | Flag | Default | Meaning |
 |---|---|---|

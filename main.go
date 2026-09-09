@@ -136,6 +136,11 @@ func run(args []string) error {
 			subArg = fs.Arg(0)
 		}
 		return listLabels(ctx, c, subArg, start, end, o.concurrency)
+	case "overview":
+		if subArg != "" {
+			return fmt.Errorf("overview takes no argument, got %q", subArg)
+		}
+		return overview(ctx, c, o, start, end)
 	case "types":
 		if subArg != "" {
 			return fmt.Errorf("types takes no argument, got %q", subArg)
@@ -149,7 +154,7 @@ func run(args []string) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (want: report, labels, types)", sub)
+		return fmt.Errorf("unknown command %q (want: report, overview, labels, types)", sub)
 	}
 }
 
@@ -698,6 +703,7 @@ const usage = `parcareport - cross-cluster CPU bottleneck report from a Parca se
 
 Usage:
   parcareport [report] [flags]   break CPU down by a label, then list hot functions
+  parcareport overview [flags]   what this server has, and what is busy in it
   parcareport labels [name]      summarize labels, or list one label's values
   parcareport types [flags]      list profile types the server offers
 
