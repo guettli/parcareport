@@ -164,6 +164,14 @@ const (
 	sortCum
 )
 
+// String is the stable machine name for the sort key, for JSON output.
+func (k sortKey) String() string {
+	if k == sortCum {
+		return "cum"
+	}
+	return "flat"
+}
+
 func parseSortKey(s string) (sortKey, error) {
 	switch s {
 	// An unset value means the default rather than an error: report takes an

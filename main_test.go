@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1437,5 +1438,243 @@ func TestFullSelectorStillSurvivesAFailedLookup(t *testing.T) {
 	}
 	if got != full || verified {
 		t.Errorf("got (%q, %v)", got, verified)
+	}
+}
+
+func jsonOptions() options {
+	o := testOptions()
+	o.output = outputJSON
+	o.top = 5
+	return o
+}
+
+func decodeReport(t *testing.T, out string) reportData {
+	t.Helper()
+	var d reportData
+	if err := json.Unmarshal([]byte(out), &d); err != nil {
+		t.Fatalf("output is not one JSON document: %v\n%s", err, out)
+	}
+	return d
+}
+
+func TestJSONReportCarriesTheNumbersAndTheirUnit(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType] = cpuProfile(t, 200)
+
+	var err error
+	out := captureStdout(t, func() {
+		err = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := decodeReport(t, out)
+
+	if !d.Complete {
+		t.Error("a run where nothing failed is complete")
+	}
+	if d.Unit != "cores" || !d.Rate {
+		t.Errorf("unit = %q rate = %v, want cores as a rate", d.Unit, d.Rate)
+	}
+	if d.Total == nil {
+		t.Fatal("a measured total must be present")
+	}
+	// tc 100, vps 50, unlabeled 50 of an overall 200.
+	var unlabeled *groupJSON
+	for i := range d.Groups {
+		if d.Groups[i].Unlabeled {
+			unlabeled = &d.Groups[i]
+		}
+		if d.Groups[i].Pct == nil {
+			t.Errorf("group %q has no percentage though the total is known", d.Groups[i].Name)
+		}
+	}
+	if unlabeled == nil {
+		t.Error("the residual should be marked as such, not just named")
+	}
+	if d.ProfileType != testType || !d.TypeVerified {
+		t.Errorf("profile type = %q verified = %v", d.ProfileType, d.TypeVerified)
+	}
+	if d.SortedBy != "flat" {
+		t.Errorf("functions_sorted_by = %q", d.SortedBy)
+	}
+}
+
+// The whole point of the format: a consumer must not have to grep stdout for
+// `!!` to notice the numbers are wrong.
+func TestJSONMarksAnIncompleteRunAndNamesTheFailures(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"tc", "vps", "broken"}
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType] = cpuProfile(t, 200)
+	f.mergeErrs[testType+`{cluster="broken"}`] = errors.New("boom")
+
+	var err error
+	out := captureStdout(t, func() {
+		err = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	if err == nil {
+		t.Error("an incomplete run must still exit non-zero")
+	}
+	d := decodeReport(t, out)
+	if d.Complete {
+		t.Error("complete must be false when a query failed")
+	}
+	if len(d.Failed) != 1 || d.Failed[0].Group != "cluster=broken" {
+		t.Errorf("the failure should be named as data: %+v", d.Failed)
+	}
+	if d.Error == "" {
+		t.Error("the shortfall should be stated")
+	}
+	// The groups that worked are still reported.
+	if len(d.Groups) < 2 {
+		t.Errorf("surviving groups should still be present: %+v", d.Groups)
+	}
+}
+
+// Without the unfiltered merge there is no denominator, and null is the honest
+// answer -- not the sum of the labelled groups, which omits whatever is
+// missing.
+func TestJSONLeavesTheTotalNullWhenItIsUnknown(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.mergeErrs[testType] = errors.New("boom")
+
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	d := decodeReport(t, out)
+	if d.Total != nil {
+		t.Errorf("total = %v, want null", *d.Total)
+	}
+	for _, g := range d.Groups {
+		if g.Pct != nil {
+			t.Errorf("group %q has a percentage with no denominator", g.Name)
+		}
+	}
+	if d.Complete {
+		t.Error("complete must be false")
+	}
+}
+
+// A run that produced nothing still emits a document. Printing only prose
+// would make "the window was empty" and "the command broke" indistinguishable
+// to a script -- the conflation the tool refuses everywhere else.
+func TestJSONEmitsADocumentEvenWhenThereIsNothingToReport(t *testing.T) {
+	f := reportFixture(t) // no merges configured: every group comes back empty
+
+	var err error
+	out := captureStdout(t, func() {
+		err = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	if err == nil {
+		t.Error("want a non-zero exit")
+	}
+	d := decodeReport(t, out)
+	if d.Complete {
+		t.Error("complete must be false")
+	}
+	if d.Error == "" {
+		t.Error("the reason should be in the document")
+	}
+}
+
+// The human banners must never land beside the document.
+func TestJSONOutputIsNotPollutedByBanners(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"a", "b"}
+	f.mergeErrs[testType+`{cluster="a"}`] = errors.New("boom")
+	f.mergeErrs[testType+`{cluster="b"}`] = errors.New("boom")
+
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	if strings.Contains(out, "!!") {
+		t.Errorf("banners must not accompany JSON:\n%s", out)
+	}
+	d := decodeReport(t, out)
+	if len(d.Failed) != 2 {
+		t.Errorf("both failures should be data: %+v", d.Failed)
+	}
+}
+
+// Function names are the reason the table cannot be parsed: it cuts them to 60
+// characters, which made two different frames render identically.
+func TestJSONDoesNotTruncateFunctionNames(t *testing.T) {
+	long := "github.com/parquet-go/parquet-go/encoding/thrift.(*structDecoder).decodeSomethingVeryLongIndeed"
+	if len(long) <= 60 {
+		t.Fatal("the fixture name must be longer than the table's cutoff")
+	}
+	fn := &profile.Function{ID: 1, Name: long}
+	loc := &profile.Location{ID: 1, Line: []profile.Line{{Function: fn}}}
+	p := &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}},
+		Period:     10_000_000,
+		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		Function:   []*profile.Function{fn},
+		Location:   []*profile.Location{loc},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{loc}, Value: []int64{100}}},
+	}
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = p
+	f.merges[testType] = p
+
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	d := decodeReport(t, out)
+	if len(d.Functions) == 0 {
+		t.Fatal("want a function")
+	}
+	if d.Functions[0].Name != long {
+		t.Errorf("name was altered:\n got %q\nwant %q", d.Functions[0].Name, long)
+	}
+}
+
+func TestParseOutput(t *testing.T) {
+	for _, in := range []string{"", "table"} {
+		if got, err := parseOutput(in); err != nil || got != outputTable {
+			t.Errorf("parseOutput(%q) = (%q, %v)", in, got, err)
+		}
+	}
+	if got, err := parseOutput("json"); err != nil || got != outputJSON {
+		t.Errorf("got (%q, %v)", got, err)
+	}
+	if _, err := parseOutput("yaml"); err == nil {
+		t.Error("want an error for an unsupported format")
+	}
+}
+
+// The table is unchanged by the refactor that made JSON possible.
+func TestTableOutputStillLooksTheSame(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType] = cpuProfile(t, 150)
+	o := testOptions()
+	o.top = 3
+
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			time.Now().Add(-time.Hour), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, want := range []string{testType, "CLUSTER", "CORES", "%TOTAL", "TOTAL", "tc", "vps", "FUNCTION"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q from the table:\n%s", want, out)
+		}
 	}
 }

@@ -16,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/pprof/profile"
 )
 
 const (
@@ -44,6 +42,7 @@ type options struct {
 	match        string
 	top          int
 	sortBy       string
+	output       string
 	concurrency  int
 	timeout      time.Duration
 	bearerToken  string
@@ -65,6 +64,7 @@ func run(args []string) error {
 	fs.StringVar(&o.match, "match", "", `extra label matchers, e.g. 'cluster="tc",comm="clickhouse"'`)
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
+	fs.StringVar(&o.output, "output", outputTable, "'table' for a person, 'json' for a script")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
@@ -313,251 +313,27 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 }
 
 func report(ctx context.Context, c *Client, o options, start, end time.Time) error {
-	// Before any query: a typo here should not cost minutes of merging first.
-	sortBy, err := parseSortKey(o.sortBy)
+	out, err := parseOutput(o.output)
 	if err != nil {
 		return err
 	}
-
-	profType, typeVerified, err := resolveProfileType(ctx, c, o.profileType)
-	if err != nil {
-		return err
-	}
-
-	groups, err := c.LabelValues(ctx, o.by, start, end)
-	if err != nil {
-		return err
-	}
-	if len(groups) == 0 {
-		return explainNoValues(ctx, c, o.by, start, end)
-	}
-	sort.Strings(groups)
-
-	window := end.Sub(start)
-	fmt.Printf("%s  %s .. %s  (%s)\n\n",
-		profType, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), window.Round(time.Second))
-
-	type result struct {
-		name   string
-		cores  float64
-		header string
-		err    error
-	}
-	results := make([]result, len(groups))
-
-	// A run can take minutes. With no output at all, "still merging" and
-	// "hung" look identical -- and with the default --timeout the first thing
-	// you saw could be an error after a minute of silence.
-	prog := newProgress("merging", o.by+" groups", len(groups))
-	prog.start()
-
-	sem := make(chan struct{}, max(1, o.concurrency))
-	var wg sync.WaitGroup
-	for i, g := range groups {
-		wg.Add(1)
-		go func(i int, g string) {
-			defer wg.Done()
-			defer prog.step()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			qctx, qcancel := context.WithTimeout(ctx, o.timeout)
-			defer qcancel()
-			sel := selector(profType, o.by, g, o.match)
-			raw, err := c.MergePprof(qctx, sel, start, end)
-			if err != nil {
-				results[i] = result{name: g, err: err}
-				return
+	d, gerr := gatherReport(ctx, c, o, start, end)
+	if out == outputJSON {
+		// A successful run renders as it stands; anything else still emits a
+		// document, so a consumer parses one shape whatever happened.
+		if d != nil && gerr == nil {
+			if jerr := renderJSON(d); jerr != nil {
+				return jerr
 			}
-			p, err := parsePprof(raw)
-			if err != nil || p == nil {
-				results[i] = result{name: g, err: err}
-				return
-			}
-			m, err := interpret(p, window)
-			results[i] = result{name: g, cores: m.Value, header: m.Header, err: err}
-		}(i, g)
-	}
-	wg.Wait()
-	prog.stop()
-
-	rows := make([]Row, 0, len(results))
-	var total float64
-	empty := 0
-	// The groups already know their unit. Keeping one means the fallback below
-	// does not have to guess "CORES" for what might be a byte or count profile.
-	groupHeader := ""
-	var failed []failure
-	for _, r := range results {
-		if r.err != nil {
-			// Collected, not just warned about. A warning on stderr vanishes
-			// under `2>/dev/null` and leaves a table that looks complete but
-			// whose totals and percentages silently omit whatever failed.
-			failed = append(failed, failure{group: fmt.Sprintf("%s=%s", o.by, r.name), msg: shortErr(r.err)})
-			continue
+			return nil
 		}
-		total += r.cores
-		if r.header != "" {
-			groupHeader = r.header
-		}
-		// A label value with no samples in the window says nothing, and there
-		// can be hundreds of them -- every `comm` on the box when the profile
-		// came from a scrape target, for instance. Count them, do not print
-		// them.
-		if r.cores == 0 {
-			empty++
-			continue
-		}
-		rows = append(rows, Row{Name: r.name, Cores: r.cores})
+		renderJSONError(o, d, gerr)
+		return gerr
 	}
-	if len(rows) == 0 {
-		// Nothing to show, for one of two very different reasons, and calling
-		// a broken run an idle cluster is the mistake worth ruling out.
-		//
-		// But they mix: some queries can fail while every survivor comes back
-		// genuinely empty. Saying "all N queries failed" off len(failed) then
-		// gets it backwards in both directions -- with --by=comm, one flaky
-		// query turned "199 values had no samples, 1 failed" into "all 1 comm
-		// queries failed". So state both counts.
-		if len(failed) > 0 {
-			// On stdout with a banner. The bare `!!` lines this used to print
-			// had no introduction, so the worse of the two outcomes was the
-			// one explained less well, and the summary went only to stderr --
-			// the case the banner exists to avoid.
-			if len(failed) == len(groups) {
-				fmt.Printf("!! FAILED: all %d %s queries failed, so there is nothing to report.\n"+
-					"!! This is not an empty window -- the queries did not come back.\n",
-					len(failed), o.by)
-			} else {
-				fmt.Printf("!! FAILED: %d of %d %s queries failed and the other %d had no samples,\n"+
-					"!! so there is nothing to report. Whether this window is idle is unknown:\n"+
-					"!! the failed queries were never answered.\n",
-					len(failed), len(groups), o.by, empty)
-			}
-			printFailures(failed, mergeQuery)
-			return fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by)
-		}
-		if !typeVerified {
-			// The warning about this went only to stderr, which is the case
-			// the project refuses: under 2>/dev/null a typo'd selector left an
-			// empty stdout that reads as an idle cluster.
-			fmt.Printf("!! No data, and the profile type was never verified against the\n" +
-				"!! server -- that lookup failed. A selector this server does not offer\n" +
-				"!! looks exactly like this. Check it with `parcareport types`.\n")
-			return fmt.Errorf("no data in this window, and %q was never verified", profType)
-		}
-		return errors.New("no data in this window")
+	if d != nil {
+		renderTable(d)
 	}
-	// Everything matching the selector, including series that carry no value
-	// for the group-by label at all. Those exist -- an agent deployed without
-	// the label, say -- and if we only ever summed the labelled groups they
-	// would vanish from the report while still burning CPU. Reporting the
-	// residual as "(unlabeled)" keeps the table honest and adds up to 100%.
-	overallSel := selector(profType, "", "", o.match)
-	// Bounded like every per-group merge. This one carries no label matcher at
-	// all, so it is the widest query in the run and the likeliest to be slow;
-	// on the bare process context it could stall the run for ten minutes,
-	// which is what --timeout exists to prevent.
-	octx, ocancel := context.WithTimeout(ctx, o.timeout)
-	overallRaw, overallErr := c.MergePprof(octx, overallSel, start, end)
-	ocancel()
-	var overall *profile.Profile
-	if overallErr == nil {
-		overall, overallErr = parsePprof(overallRaw)
-	}
-
-	grand := total
-	// Only reached when the unfiltered merge came back empty or failed, which
-	// the groups contradict -- but a wrong unit in the heading is worse than a
-	// vague one, and the groups already worked theirs out.
-	header := groupHeader
-	if header == "" {
-		header = "CORES"
-	}
-	// Without that merge there is no residual and no denominator. Percentages
-	// against the labelled groups alone would be the one number guaranteed to
-	// be wrong when a group is missing, so drop them rather than invent them.
-	// An empty response is as unknown as a failed one: parsePprof returns
-	// (nil, nil) for no bytes, and the groups having values contradicts it.
-	// Printing TOTAL ... 100.0 off the group sum in that state asserted a
-	// fleet-wide figure nothing had measured.
-	knowTotal := overallErr == nil && overall != nil
-	if overall != nil {
-		mt, err := interpret(overall, window)
-		if err != nil {
-			return err
-		}
-		header = mt.Header
-		grand = mt.Value
-		if residual := grand - total; residual > grand*0.001 {
-			rows = append(rows, Row{Name: "(unlabeled)", Cores: residual})
-		}
-	}
-	if knowTotal && grand > 0 {
-		for i := range rows {
-			rows[i].Pct = rows[i].Cores / grand * 100
-		}
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Cores > rows[j].Cores })
-	printGroupTable(strings.ToUpper(o.by), header, rows, grand, knowTotal)
-	if empty > 0 {
-		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", empty, o.by)
-	}
-	// One banner, however many things went wrong. Two headers, each describing
-	// the run as if it were the only problem, read as two unrelated reports --
-	// and the group-failure wording talked about "totals and percentages"
-	// that the other banner had just explained away.
-	if len(failed) > 0 || overallErr != nil {
-		// On stdout, next to the numbers it invalidates -- never only stderr.
-		fmt.Print("\n!! INCOMPLETE\n")
-		all := failed
-		if len(failed) > 0 {
-			if knowTotal {
-				fmt.Printf("!! %d of %d %s queries failed. The totals and percentages above\n"+
-					"!! EXCLUDE them and are therefore wrong.\n", len(failed), len(groups), o.by)
-			} else {
-				fmt.Printf("!! %d of %d %s queries failed. The sum above excludes them.\n",
-					len(failed), len(groups), o.by)
-			}
-		}
-		if overallErr != nil {
-			// The group breakdown is the main output of the command and is
-			// already computed by this point, so discarding it because an
-			// auxiliary query failed was the wrong trade -- but so would be
-			// printing it as though it were complete.
-			fmt.Printf("!! The unfiltered merge failed, so percentages, the (unlabeled) row\n"+
-				"!! and the hot-function table are missing, and any series carrying no\n"+
-				"!! %q label is absent from the sum above.\n", o.by)
-			all = append(append([]failure{}, failed...),
-				failure{group: "(overall)", msg: shortErr(overallErr)})
-		}
-		printFailures(all, mergeQuery)
-	}
-
-	if o.top > 0 && overall != nil {
-		fmt.Println()
-		fns, err := topFunctions(overall, window, sortBy)
-		if err != nil {
-			return err
-		}
-		// Percentages are against the same profile the functions came from,
-		// and against the sorted column: self time sums to the total across
-		// all functions, so FLAT percentages are small and spread out, while
-		// CUM for a root frame approaches 100% rather than exceeding it.
-		printFunctionTable(fns, header, o.top, grand, sortBy)
-	}
-	switch {
-	case len(failed) > 0 && overallErr != nil:
-		return fmt.Errorf("%d of %d %s queries failed and so did the unfiltered merge; "+
-			"results above are incomplete", len(failed), len(groups), o.by)
-	case len(failed) > 0:
-		return fmt.Errorf("%d of %d %s queries failed; results above are incomplete",
-			len(failed), len(groups), o.by)
-	case overallErr != nil:
-		return fmt.Errorf("the unfiltered merge failed, so the total, the percentages and "+
-			"the function table are missing: %s", shortErr(overallErr))
-	}
-	return nil
+	return gerr
 }
 
 // explainNoValues turns an empty label-values response into a specific
@@ -818,6 +594,13 @@ type failure struct {
 // for a different reason might be the one truncated away. Grouping by message
 // gives every distinct cause a line, and collapses a wholesale outage to one.
 func printFailures(failed []failure, kind failureKind) {
+	fmt.Print(formatFailures(failed, kind))
+}
+
+// formatFailures builds what printFailures prints, so a caller that must not
+// write to stdout yet can hold on to it.
+func formatFailures(failed []failure, kind failureKind) string {
+	var b strings.Builder
 	var order []string
 	byMsg := map[string][]string{}
 	for _, f := range failed {
@@ -837,26 +620,27 @@ func printFailures(failed []failure, kind failureKind) {
 			if more == 1 {
 				noun = "error"
 			}
-			fmt.Printf("!!   ... and %d more distinct %s\n", more, noun)
+			fmt.Fprintf(&b, "!!   ... and %d more distinct %s\n", more, noun)
 			shown = order[:showCauses]
 			break
 		}
 		groups := byMsg[msg]
 		if len(groups) == 1 {
-			fmt.Printf("!!   %s: %s\n", groups[0], msg)
+			fmt.Fprintf(&b, "!!   %s: %s\n", groups[0], msg)
 			continue
 		}
 		list, suffix := groups, ""
 		if len(list) > showGroups {
 			list, suffix = list[:showGroups], fmt.Sprintf(", and %d more", len(groups)-showGroups)
 		}
-		fmt.Printf("!!   %s  (%d groups: %s%s)\n", msg, len(groups), strings.Join(list, ", "), suffix)
+		fmt.Fprintf(&b, "!!   %s  (%d groups: %s%s)\n", msg, len(groups), strings.Join(list, ", "), suffix)
 	}
 	// Only the causes actually on screen, so a hint never refers to a line
 	// that was truncated away.
 	if h := hintFor(shown, kind); h != "" {
-		fmt.Print(h)
+		b.WriteString(h)
 	}
+	return b.String()
 }
 
 // hintFor suggests a next step for failures whose own text does not imply one.
