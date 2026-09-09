@@ -35,17 +35,22 @@ func main() {
 }
 
 type options struct {
-	addr        string
-	insecure    bool
-	from        string
-	to          string
-	by          string
-	profileType string
-	match       string
-	top         int
-	sortBy      string
-	concurrency int
-	timeout     time.Duration
+	addr         string
+	insecure     bool
+	from         string
+	to           string
+	by           string
+	profileType  string
+	match        string
+	top          int
+	sortBy       string
+	concurrency  int
+	timeout      time.Duration
+	bearerToken  string
+	tokenFile    string
+	username     string
+	password     string
+	passwordFile string
 }
 
 func run(args []string) error {
@@ -62,6 +67,11 @@ func run(args []string) error {
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
+	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
+	fs.StringVar(&o.tokenFile, "bearer-token-file", "", "read the bearer token from a file, keeping it out of the process list")
+	fs.StringVar(&o.username, "username", "", "basic auth username (requires --insecure=false)")
+	fs.StringVar(&o.password, "password", "", "basic auth password; prefer --password-file")
+	fs.StringVar(&o.passwordFile, "password-file", "", "read the basic auth password from a file, keeping it out of the process list")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), usage)
 		fs.PrintDefaults()
@@ -99,7 +109,12 @@ func run(args []string) error {
 		return err
 	}
 
-	c, err := Dial(o.addr, o.insecure, o.timeout)
+	auth, err := o.auth()
+	if err != nil {
+		return err
+	}
+
+	c, err := Dial(o.addr, o.insecure, o.timeout, auth)
 	if err != nil {
 		return err
 	}
@@ -136,6 +151,70 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (want: report, labels, types)", sub)
 	}
+}
+
+// auth assembles the credentials from the flags.
+//
+// A token on the command line is visible in the process list to anyone on the
+// box, so --bearer-token-file exists and wins when both are given.
+func (o options) auth() (Auth, error) {
+	a := Auth{BearerToken: o.bearerToken, Username: o.username, Password: o.password}
+	if o.tokenFile != "" {
+		v, err := readSecretFile("--bearer-token-file", o.tokenFile)
+		if err != nil {
+			return Auth{}, err
+		}
+		a.BearerToken = v
+	}
+	if o.passwordFile != "" {
+		v, err := readSecretFile("--password-file", o.passwordFile)
+		if err != nil {
+			return Auth{}, err
+		}
+		a.Password = v
+	}
+	if a.BearerToken != "" && a.Username != "" {
+		return Auth{}, errors.New("pass either a bearer token or basic auth, not both")
+	}
+	// A password with no username produces no header at all, so the request
+	// would go out unauthenticated and come back as a bare 401 that says
+	// nothing about the flag having been ignored. Fail here instead.
+	if a.Password != "" && a.Username == "" {
+		return Auth{}, errors.New("--password needs --username; on its own it is not a credential")
+	}
+	// RFC 7617 gives the colon to the first separator, so a username
+	// containing one silently shifts the split and authenticates as somebody
+	// else's name with the wrong password.
+	if strings.Contains(a.Username, ":") {
+		return Auth{}, fmt.Errorf("--username %q contains a colon, which basic auth uses as the separator", a.Username)
+	}
+	return a, nil
+}
+
+// readSecretFile reads a credential from a file and rejects what cannot be one.
+//
+// A secret on the command line is visible in the process list to anyone on the
+// box, and in shell history, so every credential this tool accepts has a file
+// form and the file wins.
+func readSecretFile(flag, path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", flag, err)
+	}
+	// Trailing newlines are near-universal in secret files, and a credential
+	// with one attached fails as an opaque 401.
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", fmt.Errorf("%s %s is empty", flag, path)
+	}
+	// Interior whitespace means the file holds something other than one
+	// credential -- two lines, or a comment. An Authorization header carrying
+	// a newline is rejected far from the flag that caused it.
+	if strings.ContainsAny(v, " \t\r\n") {
+		return "", fmt.Errorf("%s %s contains whitespace inside the value; "+
+			"it should hold one credential and nothing else", flag, path)
+	}
+	return v, nil
 }
 
 // listLabels summarizes label names, or dumps one label's values in full.

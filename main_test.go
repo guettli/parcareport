@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/google/pprof/profile"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -1022,5 +1024,179 @@ func TestMergeFailuresKeepMergeAdvice(t *testing.T) {
 	}
 	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery); strings.Contains(m, "--match") {
 		t.Errorf("metadata advice must not suggest --match, got %q", m)
+	}
+}
+
+func TestAuthHeader(t *testing.T) {
+	if got := (Auth{}).header(); got != "" {
+		t.Errorf("no credentials should mean no header, got %q", got)
+	}
+	if got := (Auth{BearerToken: "tok"}).header(); got != "Bearer tok" {
+		t.Errorf("got %q", got)
+	}
+	// "user:pw" base64-encoded.
+	if got := (Auth{Username: "user", Password: "pw"}).header(); got != "Basic dXNlcjpwdw==" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Credentials must never travel in cleartext. gRPC would refuse this too, but
+// its error does not say that the flags contradict each other.
+func TestDialRefusesCredentialsOverPlaintext(t *testing.T) {
+	_, err := Dial("localhost:7070", true, time.Minute, Auth{BearerToken: "tok"})
+	if err == nil {
+		t.Fatal("want a refusal")
+	}
+	if !strings.Contains(err.Error(), "plaintext") {
+		t.Errorf("the error should name the problem, got %v", err)
+	}
+}
+
+// grpc.NewClient connects lazily, so these two only prove the option set was
+// accepted -- no handshake, no DNS, no certificate verification happens here.
+// That is worth pinning anyway, since --insecure=false used to be a hard
+// error, but it is not evidence that the TLS config is right.
+func TestDialAcceptsBothTransports(t *testing.T) {
+	c, err := Dial("localhost:7070", true, time.Minute, Auth{})
+	if err != nil {
+		t.Fatalf("plaintext, the port-forward case: %v", err)
+	}
+	c.Close()
+
+	c, err = Dial("parca.example.com:443", false, time.Minute, Auth{BearerToken: "tok"})
+	if err != nil {
+		t.Fatalf(`TLS is no longer "not implemented": %v`, err)
+	}
+	c.Close()
+}
+
+// This is the property the design rests on, so assert the enforcement rather
+// than the one-line method that requests it: gRPC refuses per-RPC credentials
+// over an insecure transport, and it refuses eagerly, at construction.
+func TestGRPCRefusesOurCredentialsOverAnInsecureTransport(t *testing.T) {
+	_, err := grpc.NewClient("localhost:7070",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(authCreds{value: "Bearer tok"}),
+	)
+	if err == nil {
+		t.Fatal("gRPC must refuse credentials over an insecure transport")
+	}
+	if !strings.Contains(err.Error(), "transport level security") {
+		t.Errorf("unexpected refusal: %v", err)
+	}
+}
+
+func TestAuthCredsCarryTheHeader(t *testing.T) {
+	md, err := authCreds{value: "Bearer tok"}.GetRequestMetadata(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md["authorization"] != "Bearer tok" {
+		t.Errorf("got %v", md)
+	}
+}
+
+func TestAuthFromFlags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	// Token files almost always end in a newline, and a token carrying one
+	// fails as an opaque 401.
+	if err := os.WriteFile(path, []byte("  tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := options{tokenFile: path}.auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BearerToken != "tok" {
+		t.Errorf("token = %q, want it trimmed", got.BearerToken)
+	}
+
+	// The file wins over the flag, because the flag is visible in the process
+	// list to anyone on the box.
+	got, err = options{tokenFile: path, bearerToken: "fromflag"}.auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BearerToken != "tok" {
+		t.Errorf("the file should win, got %q", got.BearerToken)
+	}
+
+	if _, err := (options{tokenFile: filepath.Join(dir, "nope")}).auth(); err == nil {
+		t.Error("a missing token file must be an error")
+	}
+
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (options{tokenFile: empty}).auth(); err == nil {
+		t.Error("an empty token file must be an error, not a silent no-auth")
+	}
+
+	if _, err := (options{bearerToken: "tok", username: "u"}).auth(); err == nil {
+		t.Error("two kinds of credentials at once must be rejected")
+	}
+}
+
+// A password with no username produces no header at all, so the request would
+// go out unauthenticated and come back as a bare 401 saying nothing about the
+// flag having been ignored.
+func TestAuthRejectsAPasswordWithoutAUsername(t *testing.T) {
+	if _, err := (options{password: "pw"}).auth(); err == nil {
+		t.Error("a password alone is not a credential")
+	}
+	// And it really would have produced nothing.
+	if got := (Auth{Password: "pw"}).header(); got != "" {
+		t.Errorf("expected no header, got %q", got)
+	}
+}
+
+// RFC 7617 gives the colon to the first separator, so a username containing
+// one shifts the split silently.
+func TestAuthRejectsAColonInTheUsername(t *testing.T) {
+	if _, err := (options{username: "a:b", password: "pw"}).auth(); err == nil {
+		t.Error("want a rejection")
+	}
+}
+
+// Basic auth needs a file form too, or the only way to use it is the process
+// list -- the exact channel this change exists to avoid.
+func TestAuthReadsThePasswordFromAFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pw")
+	if err := os.WriteFile(path, []byte("hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := options{username: "svc", passwordFile: path}.auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != "hunter2" {
+		t.Errorf("password = %q, want it trimmed", got.Password)
+	}
+	if got.header() != "Basic c3ZjOmh1bnRlcjI=" {
+		t.Errorf("header = %q", got.header())
+	}
+}
+
+// A file holding two lines, or a comment, is not one credential. An
+// Authorization header carrying a newline is rejected far from the flag that
+// caused it.
+func TestSecretFileRejectsInteriorWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"twolines": "tok\nother\n",
+		"comment":  "# my token\ntok\n",
+		"spaced":   "to ken\n",
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readSecretFile("--bearer-token-file", path); err == nil {
+			t.Errorf("%s: want a rejection for %q", name, content)
+		}
 	}
 }
