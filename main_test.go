@@ -132,7 +132,7 @@ func TestTopFunctions(t *testing.T) {
 		Sample: []*profile.Sample{{Location: []*profile.Location{locA, locB}, Value: []int64{100}}},
 	}
 
-	rows, err := topFunctions(p, time.Second)
+	rows, err := topFunctions(p, time.Second, sortCum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,6 +414,94 @@ func TestGroupTableOmitsPercentagesWhenTheTotalIsUnknown(t *testing.T) {
 	}
 }
 
+// The bug this guards: the table was always ordered by cumulative value, so
+// the top rows were runtime and framework frames. A real run put
+// `runtime.goexit` first at 76.9% with 0.000 self time, while the largest self
+// time anywhere in the top 15 was 0.120 -- the code actually burning CPU was
+// below the cutoff and never printed.
+func TestTopFunctionsSortsBySelfTimeByDefault(t *testing.T) {
+	// goexit calls work: goexit is on every stack but runs no code itself.
+	goexit := &profile.Function{ID: 1, Name: "runtime.goexit"}
+	work := &profile.Function{ID: 2, Name: "app.work"}
+	locGoexit := &profile.Location{ID: 1, Line: []profile.Line{{Function: goexit}}}
+	locWork := &profile.Location{ID: 2, Line: []profile.Line{{Function: work}}}
+
+	p := &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "samples", Unit: "count"}},
+		Period:     10_000_000,
+		PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+		Function:   []*profile.Function{goexit, work},
+		Location:   []*profile.Location{locGoexit, locWork},
+		// Leaf-first: work is the leaf, goexit the caller.
+		Sample: []*profile.Sample{{Location: []*profile.Location{locWork, locGoexit}, Value: []int64{100}}},
+	}
+
+	flat, err := topFunctions(p, time.Second, sortFlat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flat[0].Name != "app.work" {
+		t.Errorf("sorted by self time, want app.work first, got %q", flat[0].Name)
+	}
+
+	cum, err := topFunctions(p, time.Second, sortCum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both have cumulative 1.0, so the tie-break decides -- and self time is
+	// the secondary key, which still puts the frame that ran the code first.
+	if cum[0].Cores != cum[1].Cores {
+		t.Fatalf("expected a cumulative tie, got %v", cum)
+	}
+	if cum[0].Name != "app.work" {
+		t.Errorf("cumulative ties should fall back to self time, got %q", cum[0].Name)
+	}
+}
+
+func TestParseSortKey(t *testing.T) {
+	for _, in := range []string{"flat", "self"} {
+		if got, err := parseSortKey(in); err != nil || got != sortFlat {
+			t.Errorf("parseSortKey(%q) = (%v, %v), want sortFlat", in, got, err)
+		}
+	}
+	for _, in := range []string{"cum", "cumulative"} {
+		if got, err := parseSortKey(in); err != nil || got != sortCum {
+			t.Errorf("parseSortKey(%q) = (%v, %v), want sortCum", in, got, err)
+		}
+	}
+	if _, err := parseSortKey("sideways"); err == nil {
+		t.Error("want an error for an unknown sort key")
+	}
+	// An unset field means the default, so a caller building options directly
+	// does not have to know this one is load-bearing.
+	if got, err := parseSortKey(""); err != nil || got != sortFlat {
+		t.Errorf(`parseSortKey("") = (%v, %v), want sortFlat`, got, err)
+	}
+}
+
+// The percentage must follow the sorted column, or the table shows rows
+// ordered by one number and a percentage derived from another.
+func TestFunctionTablePercentageFollowsTheSortedColumn(t *testing.T) {
+	rows := []Row{{Name: "app.work", Cores: 1.0, Flat: 0.25}}
+
+	flatOut := captureStdout(t, func() { printFunctionTable(rows, "CORES", 5, 1.0, sortFlat) })
+	if !strings.Contains(flatOut, "FLAT*") {
+		t.Errorf("the sorted column should be marked:\n%s", flatOut)
+	}
+	// 0.25 of a 1.0 total.
+	if !strings.Contains(flatOut, "25.0") {
+		t.Errorf("want the self-time percentage:\n%s", flatOut)
+	}
+
+	cumOut := captureStdout(t, func() { printFunctionTable(rows, "CORES", 5, 1.0, sortCum) })
+	if !strings.Contains(cumOut, "CUM*") {
+		t.Errorf("the sorted column should be marked:\n%s", cumOut)
+	}
+	if !strings.Contains(cumOut, "100.0") {
+		t.Errorf("want the cumulative percentage:\n%s", cumOut)
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -472,7 +560,8 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 const testType = "parca_agent:samples:count:cpu:nanoseconds:delta"
 
 func testOptions() options {
-	return options{by: "cluster", profileType: testType, top: 0, concurrency: 4, timeout: time.Minute}
+	return options{by: "cluster", profileType: testType, top: 0, concurrency: 4,
+		timeout: time.Minute, sortBy: "flat"}
 }
 
 func reportFixture(t *testing.T) *fakeQuery {

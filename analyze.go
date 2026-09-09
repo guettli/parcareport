@@ -154,9 +154,38 @@ func parsePprof(raw []byte) (*profile.Profile, error) {
 	return p, nil
 }
 
+// sortKey says which column orders the function table.
+type sortKey int
+
+const (
+	// sortFlat orders by self time: the code that was actually on-CPU.
+	sortFlat sortKey = iota
+	// sortCum orders by cumulative time: the work a frame was part of.
+	sortCum
+)
+
+func parseSortKey(s string) (sortKey, error) {
+	switch s {
+	// An unset value means the default rather than an error: report takes an
+	// options struct, and a caller that builds one directly should not have to
+	// know that this field is load-bearing.
+	case "", "flat", "self":
+		return sortFlat, nil
+	case "cum", "cumulative":
+		return sortCum, nil
+	}
+	return 0, fmt.Errorf("--sort must be flat or cum, got %q", s)
+}
+
 // topFunctions aggregates a profile by function, returning cumulative and flat
 // cores. Cumulative counts a function once per sample even if it recurses.
-func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
+//
+// The sort key is the whole question the table answers. Ordering by cumulative
+// value puts `runtime.goexit` on top of every Go profile at some enormous
+// percentage, which is true and useless; the frames actually burning CPU sit
+// below the cutoff and never appear. Self time asks "what code was running",
+// which is what the tool is for, so it is the default.
+func topFunctions(p *profile.Profile, window time.Duration, by sortKey) ([]Row, error) {
 	idx, unit := valueIndex(p)
 	m, err := interpret(p, window)
 	if err != nil {
@@ -209,13 +238,29 @@ func topFunctions(p *profile.Profile, window time.Duration) ([]Row, error) {
 		}
 		rows = append(rows, Row{Name: name, Cores: cores(cs, window), Flat: cores(fs, window)})
 	}
+	sortRows(rows, by)
+	return rows, nil
+}
+
+// sortRows orders by the chosen column, falling back to the other one and then
+// to the name so the output is stable. Ties are common: every frame in a stack
+// that appears once shares a cumulative value, and most frames have no self
+// time at all.
+func sortRows(rows []Row, by sortKey) {
+	primary := func(r Row) float64 { return r.Flat }
+	secondary := func(r Row) float64 { return r.Cores }
+	if by == sortCum {
+		primary, secondary = secondary, primary
+	}
 	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Cores != rows[j].Cores {
-			return rows[i].Cores > rows[j].Cores
+		if a, b := primary(rows[i]), primary(rows[j]); a != b {
+			return a > b
+		}
+		if a, b := secondary(rows[i]), secondary(rows[j]); a != b {
+			return a > b
 		}
 		return rows[i].Name < rows[j].Name
 	})
-	return rows, nil
 }
 
 func funcName(l profile.Line) string {

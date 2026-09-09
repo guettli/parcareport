@@ -38,6 +38,7 @@ type options struct {
 	profileType string
 	match       string
 	top         int
+	sortBy      string
 	concurrency int
 	timeout     time.Duration
 }
@@ -53,6 +54,7 @@ func run(args []string) error {
 	fs.StringVar(&o.profileType, "profile-type", "", "profile type selector (default: auto-detect when the server offers exactly one)")
 	fs.StringVar(&o.match, "match", "", `extra label matchers, e.g. 'cluster="tc",comm="clickhouse"'`)
 	fs.IntVar(&o.top, "top", 15, "how many functions to list (0 disables the function table)")
+	fs.StringVar(&o.sortBy, "sort", "flat", "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel merge queries")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.Usage = func() {
@@ -180,6 +182,12 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 }
 
 func report(ctx context.Context, c *Client, o options, start, end time.Time) error {
+	// Before any query: a typo here should not cost minutes of merging first.
+	sortBy, err := parseSortKey(o.sortBy)
+	if err != nil {
+		return err
+	}
+
 	profType, typeVerified, err := resolveProfileType(ctx, c, o.profileType)
 	if err != nil {
 		return err
@@ -389,13 +397,13 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 
 	if o.top > 0 && overall != nil {
 		fmt.Println()
-		fns, err := topFunctions(overall, window)
+		fns, err := topFunctions(overall, window, sortBy)
 		if err != nil {
 			return err
 		}
 		// Percentages are against the same profile the functions came from,
 		// so CUM for a root frame approaches 100% rather than exceeding it.
-		printFunctionTable(fns, header, o.top, grand)
+		printFunctionTable(fns, header, o.top, grand, sortBy)
 	}
 	switch {
 	case len(failed) > 0 && overallErr != nil:
@@ -643,6 +651,10 @@ Usage:
 
 CORES is average cores busy over the window: CPU-seconds / wall-seconds. It is
 comparable across clusters of different sizes, unlike raw sample counts.
+
+Functions are listed by self time (FLAT) by default -- the code that was
+actually on-CPU. --sort=cum orders by cumulative time instead, which shows
+what work a frame was part of, but puts runtime plumbing on top.
 
 Flags:
 `
