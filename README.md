@@ -113,10 +113,34 @@ already believe is slow, and look for waits on its critical path. Judge the
 stacks, never the totals.
 
 ```sh
-parcareport types                                        # what the server has
-parcareport --profile-type='...wallclock...' --by=cluster  # who is blocking
-parcareport --profile-type='memory:inuse_space:bytes:space:bytes' --by=instance
+parcareport types                          # what the server has
+parcareport --profile-type=wallclock --by=cluster   # who is blocking
+parcareport --profile-type=inuse_space --by=instance
 ```
+
+### Naming a profile type
+
+`--profile-type` takes either the full six-part selector or a unique substring
+of one. The full form is long, and the order inside
+`samples:count:cpu:nanoseconds` matters, so it is easy to get subtly wrong and
+it had to be retyped for every invocation.
+
+An ambiguous abbreviation is an error listing the candidates, never a guess —
+`memory` matches four types on a typical server, and quietly picking
+`inuse_space` over `alloc_space` would answer a different question than the one
+asked.
+
+With no `--profile-type` at all, the CPU delta profile is used. Auto-detect
+used to require the server to offer exactly one type, which in practice never
+happened: the server this was tested against offers eleven, so every single
+run had to spell the selector out. This is a CPU report and `CORES` is its
+headline unit, so CPU is the right default — and the type in use is echoed in
+the report heading, so the choice is visible rather than hidden.
+
+The default is matched on the *period* type being `cpu` and the profile being a
+delta, not on the string "cpu" appearing somewhere. A wallclock profile also
+mentions `samples` and `nanoseconds`, and off-CPU time is emphatically not what
+`CORES` means.
 
 Off-CPU needs `--off-cpu-threshold` on the agents (per-mille, `0` = off; note
 the dashes — `--offcpu-threshold` is rejected). Heap, goroutine and mutex
@@ -255,7 +279,7 @@ parcareport types [flags]      list profile types the server offers
 | `--to` | `now` | window end |
 | `--by` | `cluster` | label to break the report down by |
 | `--match` | | extra matchers, e.g. `comm="clickhouse"` |
-| `--profile-type` | auto | required only if the server offers more than one |
+| `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
