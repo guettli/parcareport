@@ -54,6 +54,15 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		return err
 	}
 
+	// These are chosen per section, so accepting them would silently ignore
+	// them -- and `report` and `types` both reject arguments they cannot use.
+	for _, f := range []string{"by", "profile-type"} {
+		if o.setFlags[f] {
+			return fmt.Errorf("overview picks the profile type and the --by label per section, "+
+				"so --%s cannot apply; use `parcareport report --%s=...` for one breakdown", f, f)
+		}
+	}
+
 	types, err := c.ProfileTypeNames(ctx)
 	if err != nil {
 		return fmt.Errorf("overview needs the profile type list to know what to report on: %w", err)
@@ -95,6 +104,27 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			if !have[by] {
 				continue
 			}
+			// One merge per label value, and merges are the expensive part. A
+			// label like comm can have hundreds of values, which on a real
+			// server is hours of work and would swamp the sections worth
+			// having. Count first -- that is one cheap query -- and skip the
+			// ones that are too wide, saying so.
+			vals, err := c.LabelValues(ctx, by, start, end)
+			if err != nil {
+				d.Skipped = append(d.Skipped, skippedJSON{
+					What:   "CPU by " + by,
+					Reason: shortErr(err),
+				})
+				continue
+			}
+			if o.maxGroups > 0 && len(vals) > o.maxGroups {
+				d.Skipped = append(d.Skipped, skippedJSON{
+					What: "CPU by " + by,
+					Reason: fmt.Sprintf("%d values is more than --max-group-values=%d, and each one costs a merge; "+
+						"run `parcareport --by=%s` directly if you want it", len(vals), o.maxGroups, by),
+				})
+				continue
+			}
 			plan = append(plan, struct{ profType, by string }{cpu[0], by})
 		}
 		if len(plan) == 0 {
@@ -106,12 +136,19 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 	}
 	// Live heap, if the server has it. It is not a rate and says something the
 	// CPU profile cannot.
-	if heap := findType(types, "memory:inuse_space"); heap != "" {
-		by := firstPresent(have, "instance", "job", "cluster")
+	if heap := findHeapType(types); heap != "" {
+		// instance and job only. `have` is the union of label names across
+		// every profile type, so falling back to `cluster` paired the heap
+		// with a label that only parca-agent's CPU series carry: the section
+		// then merged once per cluster, found nothing, and reported "(no data
+		// in this window)" for a heap profile that has plenty -- the same
+		// conflation of "absent label" with "no data" the tool refuses
+		// everywhere else.
+		by := firstPresent(have, "instance", "job")
 		if by == "" {
 			d.Skipped = append(d.Skipped, skippedJSON{
 				What:   "live heap",
-				Reason: "no instance, job or cluster label to group by",
+				Reason: "no instance or job label to group by; heap profiles come from scrape targets, which carry those",
 			})
 		} else {
 			plan = append(plan, struct{ profType, by string }{heap, by})
@@ -119,26 +156,22 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 	}
 
 	if len(plan) == 0 {
+		err := fmt.Errorf("nothing to report on: the server has %d profile types and %d labels "+
+			"in this window, and none of them makes a breakdown this command knows how to build",
+			len(types), len(labels))
 		if out == outputJSON {
-			return emitOverviewJSON(d)
+			_ = emitOverviewJSON(d)
+			return err
 		}
 		printOverviewHeader(d)
 		printSkipped(d.Skipped)
-		return fmt.Errorf("nothing to report on: the server has %d profile types and %d labels in this window",
-			len(types), len(labels))
+		return err
 	}
 
 	d.Complete = true
-	// The hot functions come from the unfiltered merge, so every breakdown of
-	// the same profile type produces an identical table. Show it once.
-	shownFunctions := map[string]bool{}
 	for _, p := range plan {
 		so := o
 		so.profileType, so.by = p.profType, p.by
-		if shownFunctions[p.profType] {
-			so.top = 0
-		}
-		shownFunctions[p.profType] = true
 		sd, serr := gatherReport(ctx, c, so, start, end)
 		if sd == nil {
 			// One section failing is not the whole overview failing; that is
@@ -160,11 +193,26 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		return emitOverviewJSON(d)
 	}
 	printOverviewHeader(d)
+	// The hot functions come from the unfiltered merge, so every breakdown of
+	// one profile type yields a byte-identical table. Print it once -- but
+	// only mark it shown once one has actually been printed, or a first
+	// section that failed or came back empty would suppress the table for
+	// every later section and the overview would carry none at all.
+	shown := map[string]bool{}
 	for i, s := range d.Sections {
 		if i > 0 {
 			fmt.Println()
 		}
+		if shown[s.ProfileType] {
+			quiet := *s
+			quiet.Functions = nil
+			renderTable(&quiet)
+			continue
+		}
 		renderTable(s)
+		if len(s.Functions) > 0 {
+			shown[s.ProfileType] = true
+		}
 	}
 	printSkipped(d.Skipped)
 	if !d.Complete {
@@ -207,9 +255,13 @@ func printSkipped(skipped []skippedJSON) {
 	}
 }
 
-func findType(types []string, prefix string) string {
+// findHeapType picks the live-heap profile by its parts rather than by a
+// string prefix, which would also match a sample type merely beginning with
+// the same letters.
+func findHeapType(types []string) string {
 	for _, t := range types {
-		if strings.HasPrefix(t, prefix) {
+		p := strings.Split(t, ":")
+		if len(p) >= 3 && p[0] == "memory" && p[1] == "inuse_space" && p[2] == "bytes" {
 			return t
 		}
 	}

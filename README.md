@@ -367,10 +367,29 @@ parca    2.284  76.9
 ```
 
 It breaks CPU down by whichever of `cluster`, `namespace`, `workload` and
-`comm` exist in the window, and reports live heap by `instance` (or `job`, or
-`cluster`) if the server has a heap profile. Which of those exist depends on
-how the agents were configured, and asking is one cheap query — cheaper than
-making you know in advance.
+`comm` exist in the window, and reports live heap by `instance` or `job` if the
+server has a heap profile. Which of those exist depends on how the agents were
+configured, and the label list is one cheap query — cheaper than making you
+know in advance.
+
+Heap is grouped only by `instance` or `job`, never by `cluster`. Heap profiles
+come from `scrape_configs` against Go `/debug/pprof` endpoints, whose series
+carry those labels; `cluster` comes from parca-agent's external labels. Pairing
+the heap with `cluster` merged once per cluster, found nothing, and reported
+"no data" for a heap profile with plenty in it.
+
+**It is not cheap overall.** A breakdown costs one merge per label value, and
+merges are the slow part — a single 15-minute breakdown over two clusters took
+about two minutes against a real server. So a label with more than
+`--max-group-values` (default 50) values is skipped rather than run:
+
+```
+-- not reported: CPU by comm (203 values is more than --max-group-values=50,
+   and each one costs a merge; run `parcareport --by=comm` directly if you want it)
+```
+
+`--concurrency` bounds the queries within one section, not across sections;
+sections run one after another. Start with a narrow `--from`.
 
 The hot functions come from the unfiltered merge, so every breakdown of one
 profile type would produce the same table. It is shown once per type.
@@ -387,7 +406,13 @@ banner, and the command exits non-zero. One breakdown failing is not a reason
 to discard the others — that is the point of running several.
 
 `--output=json` gives the whole thing as one document, with each section
-carrying its own `unit`, `total` and `failed`.
+carrying its own `unit`, `total`, `functions` and `failed`. The function table
+is deduplicated only in the table output, where a repeat would be
+byte-identical; in JSON every section keeps its own, since an empty array
+would read as "nothing was hot".
+
+`--by` and `--profile-type` are refused rather than ignored: `overview` picks
+both per section, so accepting them would silently do something else.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -399,6 +424,7 @@ carrying its own `unit`, `total` and `failed`.
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--output` | `table` | `json` for a machine-readable report |
+| `--max-group-values` | `50` | overview: skip a breakdown with more values than this |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
