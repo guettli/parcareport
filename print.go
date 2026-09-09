@@ -10,13 +10,30 @@ func newTab() *tabwriter.Writer {
 	return tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 }
 
-func printGroupTable(groupHeader, unitHeader string, rows []Row, total float64) {
+// printGroupTable renders the breakdown. knowTotal says whether the grand
+// total is trustworthy: when the unfiltered merge failed there is no
+// denominator, so the %TOTAL column is dropped rather than filled with
+// percentages of a subtotal that silently omits whatever is missing.
+func printGroupTable(groupHeader, unitHeader string, rows []Row, total float64, knowTotal bool) {
 	w := newTab()
-	fmt.Fprintf(w, "%s\t%s\t%%TOTAL\n", groupHeader, unitHeader)
-	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%.1f\n", r.Name, formatValue(r.Cores, unitHeader), r.Pct)
+	if knowTotal {
+		fmt.Fprintf(w, "%s\t%s\t%%TOTAL\n", groupHeader, unitHeader)
+	} else {
+		fmt.Fprintf(w, "%s\t%s\n", groupHeader, unitHeader)
 	}
-	fmt.Fprintf(w, "TOTAL\t%s\t100.0\n", formatValue(total, unitHeader))
+	for _, r := range rows {
+		if knowTotal {
+			fmt.Fprintf(w, "%s\t%s\t%.1f\n", r.Name, formatValue(r.Cores, unitHeader), r.Pct)
+			continue
+		}
+		fmt.Fprintf(w, "%s\t%s\n", r.Name, formatValue(r.Cores, unitHeader))
+	}
+	if knowTotal {
+		fmt.Fprintf(w, "TOTAL\t%s\t100.0\n", formatValue(total, unitHeader))
+	} else {
+		// Named so it cannot be mistaken for the fleet-wide figure.
+		fmt.Fprintf(w, "SUM OF LISTED\t%s\n", formatValue(total, unitHeader))
+	}
 	w.Flush()
 }
 
