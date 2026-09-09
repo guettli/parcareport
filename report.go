@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ type reportData struct {
 	// TypeVerified is false when the ProfileTypes lookup failed and the
 	// selector was taken on trust. An unverified type is the likeliest
 	// explanation for an empty result, so a consumer needs to see it.
-	TypeVerified bool      `json:"profile_type_verified"`
+	TypeVerified *bool     `json:"profile_type_verified"`
 	Start        time.Time `json:"start"`
 	End          time.Time `json:"end"`
 	WindowSecs   float64   `json:"window_seconds"`
@@ -64,6 +65,13 @@ type reportData struct {
 	sortKey    sortKey
 	noRows     bool
 	banner     string
+	// groupsSum is the sum of the labelled groups. It is what the fallback
+	// row shows when there is no measured total, and it is NOT the total:
+	// it omits every series carrying no group-by label.
+	groupsSum float64
+	// window is kept as a Duration so the heading can use Round rather than a
+	// reimplementation that truncated.
+	window time.Duration
 }
 
 type groupJSON struct {
@@ -132,13 +140,14 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	window := end.Sub(start)
 	d := &reportData{
 		ProfileType:  profType,
-		TypeVerified: typeVerified,
+		TypeVerified: &typeVerified,
 		Start:        start.UTC(),
 		End:          end.UTC(),
-		WindowSecs:   window.Seconds(),
+		WindowSecs:   math.Round(window.Seconds()*1000) / 1000,
 		GroupBy:      o.by,
 		Match:        o.match,
 		SortedBy:     sortBy.String(),
+		window:       window,
 		Groups:       []groupJSON{},
 		Functions:    []funcJSON{},
 		Failed:       []failJSON{},
@@ -148,6 +157,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		name   string
 		value  float64
 		header string
+		rate   bool
 		err    error
 	}
 	results := make([]result, len(groups))
@@ -181,7 +191,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 				return
 			}
 			m, err := interpret(p, window)
-			results[i] = result{name: g, value: m.Value, header: m.Header, err: err}
+			results[i] = result{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
 		}(i, g)
 	}
 	wg.Wait()
@@ -192,6 +202,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// The groups already know their unit. Keeping one means the fallback below
 	// does not have to guess "CORES" for what might be a byte or count profile.
 	groupHeader := ""
+	groupRate := false
 	var failed []failure
 	for _, r := range results {
 		if r.err != nil {
@@ -203,7 +214,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		}
 		total += r.value
 		if r.header != "" {
-			groupHeader = r.header
+			groupHeader, groupRate = r.header, r.rate
 		}
 		// A label value with no samples in the window says nothing, and there
 		// can be hundreds of them. Count them, do not list them.
@@ -218,6 +229,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	}
 
 	if len(rows) == 0 {
+		d.Unit, d.Rate = unitName(groupHeader), groupRate
 		banner, err := noRows(o, groups, failed, d.EmptyGroups, profType, typeVerified)
 		d.noRows, d.banner = true, banner
 		d.Error = err.Error()
@@ -239,8 +251,10 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		overall, overallErr = parsePprof(overallRaw)
 	}
 
+	d.groupsSum = total
 	grand := total
 	header := groupHeader
+	d.Rate = groupRate
 	if header == "" {
 		header = "CORES"
 	}

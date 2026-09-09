@@ -1495,7 +1495,7 @@ func TestJSONReportCarriesTheNumbersAndTheirUnit(t *testing.T) {
 	if unlabeled == nil {
 		t.Error("the residual should be marked as such, not just named")
 	}
-	if d.ProfileType != testType || !d.TypeVerified {
+	if d.ProfileType != testType || d.TypeVerified == nil || !*d.TypeVerified {
 		t.Errorf("profile type = %q verified = %v", d.ProfileType, d.TypeVerified)
 	}
 	if d.SortedBy != "flat" {
@@ -1676,5 +1676,135 @@ func TestTableOutputStillLooksTheSame(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q from the table:\n%s", want, out)
 		}
+	}
+}
+
+// The bug this guards: the fallback row is labelled SUM OF LISTED, so it has
+// to be the sum of the listed rows. The refactor passed the total instead,
+// which is null in exactly the case that row prints, so it always read 0.000
+// -- correct rows above an obviously wrong subtotal.
+func TestSumOfListedShowsTheActualSum(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.mergeErrs[testType] = errors.New("boom")
+
+	// A ten-second window, so the value is visible at three decimals rather
+	// than rounding to 0.000 and making the assertion vacuous.
+	end := time.Now()
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), testOptions(),
+			end.Add(-10*time.Second), end)
+	})
+	// (100 + 50) samples x 10ms = 1.5 CPU-seconds over 10s.
+	want := 150 * 0.01 / 10
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "SUM OF LISTED") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no subtotal row:\n%s", out)
+	}
+	if strings.Contains(line, "0.000") {
+		t.Errorf("the subtotal must be the sum of the rows, not zero: %q", line)
+	}
+	if !strings.Contains(line, fmt.Sprintf("%.3f", want)) {
+		t.Errorf("subtotal = %q, want %.3f", line, want)
+	}
+}
+
+// The bug this guards: gathering before rendering moved the heading behind an
+// early return, so an idle window produced a completely empty stdout -- no
+// record of what was even asked.
+func TestTheHeadingPrintsEvenWithNothingToTabulate(t *testing.T) {
+	t.Run("empty window", func(t *testing.T) {
+		f := reportFixture(t)
+		out := captureStdout(t, func() {
+			_ = report(context.Background(), testClient(f, time.Minute), testOptions(),
+				time.Now().Add(-time.Hour), time.Now())
+		})
+		if !strings.Contains(out, testType) {
+			t.Errorf("stdout should still say what was queried:\n%q", out)
+		}
+	})
+	t.Run("every query failed", func(t *testing.T) {
+		f := reportFixture(t)
+		f.mergeErrs[testType+`{cluster="tc"}`] = errors.New("boom")
+		f.mergeErrs[testType+`{cluster="vps"}`] = errors.New("boom")
+		out := captureStdout(t, func() {
+			_ = report(context.Background(), testClient(f, time.Minute), testOptions(),
+				time.Now().Add(-time.Hour), time.Now())
+		})
+		if !strings.Contains(out, testType) {
+			t.Errorf("stdout should still say what was queried:\n%q", out)
+		}
+		if !strings.Contains(out, "!! FAILED") {
+			t.Errorf("and still carry the banner:\n%q", out)
+		}
+	})
+}
+
+// unit and rate describe the same numbers, so they must not contradict: a CPU
+// report that says "cores" cannot also say it is not a rate.
+func TestUnitAndRateAgreeWithoutTheUnfilteredMerge(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.mergeErrs[testType] = errors.New("boom")
+
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+			time.Now().Add(-time.Hour), time.Now())
+	})
+	d := decodeReport(t, out)
+	if d.Unit != "cores" {
+		t.Errorf("unit = %q", d.Unit)
+	}
+	if !d.Rate {
+		t.Error("cores is a rate; unit and rate must not contradict")
+	}
+}
+
+// A document for a run that produced nothing should still say what it asked
+// about, and must not assert a verification that never happened.
+func TestJSONErrorSkeletonDoesNotAssertWhatItDoesNotKnow(t *testing.T) {
+	// An unknown --by: gatherReport returns nil before anything is measured.
+	f := reportFixture(t)
+	o := jsonOptions()
+	o.by = "nosuchlabel"
+	start := time.Now().Add(-time.Hour)
+	end := time.Now()
+
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), o, start, end)
+	})
+	d := decodeReport(t, out)
+	if d.TypeVerified != nil {
+		t.Errorf("verification never happened, so it must be null, got %v", *d.TypeVerified)
+	}
+	if d.Start.IsZero() || d.End.IsZero() {
+		t.Errorf("the window was known and should be reported: %v .. %v", d.Start, d.End)
+	}
+	if d.WindowSecs == 0 {
+		t.Error("window_seconds should be set")
+	}
+	if d.Error == "" {
+		t.Error("the reason should be stated")
+	}
+}
+
+// window_seconds should be a clean number, not float noise from time.Now().
+func TestWindowSecondsIsRounded(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	start := time.Now().Add(-time.Hour)
+
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), jsonOptions(), start, time.Now())
+	})
+	if strings.Contains(out, "3600.0000") {
+		t.Errorf("window_seconds carries float noise:\n%s", out)
 	}
 }

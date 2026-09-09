@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
+	"time"
 )
 
 const (
@@ -24,14 +26,18 @@ func parseOutput(s string) (string, error) {
 
 // renderTable prints the report for a person to read.
 func renderTable(d *reportData) {
+	// Printed on every path, including the ones with nothing to tabulate.
+	// Otherwise an idle window produced a completely empty stdout, which is
+	// the shape this codebase refuses everywhere else: no record of what was
+	// even asked.
+	fmt.Printf("%s  %s .. %s  (%s)\n\n",
+		d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
+		d.window.Round(time.Second))
 	if d.noRows {
-		// Nothing to tabulate. The banner says which of the two reasons it is.
+		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)
 		return
 	}
-	fmt.Printf("%s  %s .. %s  (%s)\n\n",
-		d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
-		windowLabel(d.WindowSecs))
 
 	rows := make([]Row, 0, len(d.Groups))
 	for _, g := range d.Groups {
@@ -41,7 +47,10 @@ func renderTable(d *reportData) {
 		}
 		rows = append(rows, r)
 	}
-	total := 0.0
+	// When the total is unknown, printGroupTable labels this row
+	// "SUM OF LISTED" -- so it has to be the sum of the listed rows, not a
+	// total that by definition does not exist.
+	total := d.groupsSum
 	if d.Total != nil {
 		total = *d.Total
 	}
@@ -104,12 +113,20 @@ func renderJSON(d *reportData) error {
 // failure would make "the window was empty" and "the command broke"
 // indistinguishable to a script -- the same conflation the tool refuses
 // everywhere else.
-func renderJSONError(o options, d *reportData, err error) {
+func renderJSONError(o options, d *reportData, start, end time.Time, err error) {
 	if d == nil {
+		// Nothing was gathered, so only what was asked for is known. In
+		// particular profile_type_verified is left null rather than false:
+		// its documented meaning is "the check failed", and asserting that
+		// about a run which never got as far as the check would point a
+		// reader at the wrong thing.
 		d = &reportData{
 			ProfileType: o.profileType,
 			GroupBy:     o.by,
 			Match:       o.match,
+			Start:       start.UTC(),
+			End:         end.UTC(),
+			WindowSecs:  math.Round(end.Sub(start).Seconds()*1000) / 1000,
 			Groups:      []groupJSON{},
 			Functions:   []funcJSON{},
 			Failed:      []failJSON{},
@@ -120,18 +137,4 @@ func renderJSONError(o options, d *reportData, err error) {
 		d.Error = err.Error()
 	}
 	_ = renderJSON(d)
-}
-
-// windowLabel formats the window the way time.Duration.Round(time.Second) did.
-func windowLabel(secs float64) string {
-	h := int(secs) / 3600
-	m := (int(secs) % 3600) / 60
-	s := int(secs) % 60
-	if h > 0 {
-		return fmt.Sprintf("%dh%dm%ds", h, m, s)
-	}
-	if m > 0 {
-		return fmt.Sprintf("%dm%ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
 }

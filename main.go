@@ -327,7 +327,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 			}
 			return nil
 		}
-		renderJSONError(o, d, gerr)
+		renderJSONError(o, d, start, end, gerr)
 		return gerr
 	}
 	if d != nil {
