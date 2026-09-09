@@ -223,8 +223,15 @@ each describing the run as though it were the only problem, read as two
 unrelated reports — and the group-failure wording talked about percentages
 that the other banner had just explained were absent.
 
-An explicit `--profile-type` is checked against the server's list, but the
-check can no longer fail the run on its own. The selector is already complete
+An abbreviation can only be resolved against the server's list, so if that
+lookup fails the run stops there rather than sending the abbreviation as
+though it were a selector. Parca rejects anything that is not the full
+five- or six-part form, so doing otherwise produced a run that could only
+fail — and failed with a complaint about selector syntax, pointing nowhere
+near the lookup that had actually gone wrong.
+
+An explicit *full* `--profile-type` is checked against the server's list, but
+the check can no longer fail the run on its own. The selector is already complete
 and the merges do not need the lookup; a slow server used to kill
 fully-specified runs here.
 

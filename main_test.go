@@ -1382,3 +1382,60 @@ func TestMatchProfileTypeRefusesTheEmptySelector(t *testing.T) {
 		t.Error("an empty selector matches every type; it must not resolve")
 	}
 }
+
+func TestLooksLikeSelector(t *testing.T) {
+	full := []string{
+		"parca_agent:samples:count:cpu:nanoseconds:delta",
+		"memory:inuse_space:bytes:space:bytes",
+		"goroutine:goroutine:count:goroutine:count",
+	}
+	for _, s := range full {
+		if !looksLikeSelector(s) {
+			t.Errorf("%q is a complete selector", s)
+		}
+	}
+	partial := []string{
+		"cpu", "memory", "inuse_space", "",
+		"a:b:c:d",                   // too few
+		"a:b:c:d:e:f:g",             // too many
+		"a:b:c:d:e:notdelta",        // a sixth field can only be delta
+		"parca_agent::count:cpu:ns", // an empty field is not a name
+	}
+	for _, s := range partial {
+		if looksLikeSelector(s) {
+			t.Errorf("%q is not a complete selector", s)
+		}
+	}
+}
+
+// The bug this guards, seen against a real server: with the type lookup
+// failing, an abbreviation was passed through as though it were a selector.
+// Parca rejects it outright, so every merge failed -- after minutes of
+// waiting, and with an error about selector syntax that pointed nowhere near
+// the lookup that had actually gone wrong.
+func TestAbbreviationIsNotUsedWhenTheLookupFails(t *testing.T) {
+	c := testClient(&fakeQuery{typesErr: errors.New("stream terminated by RST_STREAM")}, 0)
+	_, _, err := resolveProfileType(context.Background(), c, "cpu")
+	if err == nil {
+		t.Fatal("an abbreviation cannot be expanded without the type list")
+	}
+	for _, want := range []string{"abbreviation", "RST_STREAM", "full selector"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error should mention %q: %v", want, err)
+		}
+	}
+}
+
+// A full selector still survives a failed lookup: it needs nothing from the
+// server, which is the whole point of not letting that lookup fail a run.
+func TestFullSelectorStillSurvivesAFailedLookup(t *testing.T) {
+	const full = "parca_agent:samples:count:cpu:nanoseconds:delta"
+	c := testClient(&fakeQuery{typesErr: errors.New("boom")}, 0)
+	got, verified, err := resolveProfileType(context.Background(), c, full)
+	if err != nil {
+		t.Fatalf("a complete selector should be taken on trust: %v", err)
+	}
+	if got != full || verified {
+		t.Errorf("got (%q, %v)", got, verified)
+	}
+}
