@@ -21,6 +21,7 @@ import (
 	"github.com/google/pprof/profile"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -1051,31 +1052,41 @@ func TestDialRefusesCredentialsOverPlaintext(t *testing.T) {
 	}
 }
 
-// The plaintext default still works, which is how most people first reach for
-// the tool (a port-forward).
-func TestDialPlaintextWithoutCredentials(t *testing.T) {
+// grpc.NewClient connects lazily, so these two only prove the option set was
+// accepted -- no handshake, no DNS, no certificate verification happens here.
+// That is worth pinning anyway, since --insecure=false used to be a hard
+// error, but it is not evidence that the TLS config is right.
+func TestDialAcceptsBothTransports(t *testing.T) {
 	c, err := Dial("localhost:7070", true, time.Minute, Auth{})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("plaintext, the port-forward case: %v", err)
 	}
 	c.Close()
-}
 
-// TLS is no longer "not implemented".
-func TestDialTLS(t *testing.T) {
-	c, err := Dial("parca.example.com:443", false, time.Minute, Auth{BearerToken: "tok"})
+	c, err = Dial("parca.example.com:443", false, time.Minute, Auth{BearerToken: "tok"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(`TLS is no longer "not implemented": %v`, err)
 	}
 	c.Close()
 }
 
-// RequireTransportSecurity is what makes gRPC itself enforce the rule, so it
-// must stay true.
-func TestAuthCredsRequireTransportSecurity(t *testing.T) {
-	if !(authCreds{}).RequireTransportSecurity() {
-		t.Error("credentials must require a secure transport")
+// This is the property the design rests on, so assert the enforcement rather
+// than the one-line method that requests it: gRPC refuses per-RPC credentials
+// over an insecure transport, and it refuses eagerly, at construction.
+func TestGRPCRefusesOurCredentialsOverAnInsecureTransport(t *testing.T) {
+	_, err := grpc.NewClient("localhost:7070",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(authCreds{value: "Bearer tok"}),
+	)
+	if err == nil {
+		t.Fatal("gRPC must refuse credentials over an insecure transport")
 	}
+	if !strings.Contains(err.Error(), "transport level security") {
+		t.Errorf("unexpected refusal: %v", err)
+	}
+}
+
+func TestAuthCredsCarryTheHeader(t *testing.T) {
 	md, err := authCreds{value: "Bearer tok"}.GetRequestMetadata(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1126,5 +1137,66 @@ func TestAuthFromFlags(t *testing.T) {
 
 	if _, err := (options{bearerToken: "tok", username: "u"}).auth(); err == nil {
 		t.Error("two kinds of credentials at once must be rejected")
+	}
+}
+
+// A password with no username produces no header at all, so the request would
+// go out unauthenticated and come back as a bare 401 saying nothing about the
+// flag having been ignored.
+func TestAuthRejectsAPasswordWithoutAUsername(t *testing.T) {
+	if _, err := (options{password: "pw"}).auth(); err == nil {
+		t.Error("a password alone is not a credential")
+	}
+	// And it really would have produced nothing.
+	if got := (Auth{Password: "pw"}).header(); got != "" {
+		t.Errorf("expected no header, got %q", got)
+	}
+}
+
+// RFC 7617 gives the colon to the first separator, so a username containing
+// one shifts the split silently.
+func TestAuthRejectsAColonInTheUsername(t *testing.T) {
+	if _, err := (options{username: "a:b", password: "pw"}).auth(); err == nil {
+		t.Error("want a rejection")
+	}
+}
+
+// Basic auth needs a file form too, or the only way to use it is the process
+// list -- the exact channel this change exists to avoid.
+func TestAuthReadsThePasswordFromAFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pw")
+	if err := os.WriteFile(path, []byte("hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := options{username: "svc", passwordFile: path}.auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != "hunter2" {
+		t.Errorf("password = %q, want it trimmed", got.Password)
+	}
+	if got.header() != "Basic c3ZjOmh1bnRlcjI=" {
+		t.Errorf("header = %q", got.header())
+	}
+}
+
+// A file holding two lines, or a comment, is not one credential. An
+// Authorization header carrying a newline is rejected far from the flag that
+// caused it.
+func TestSecretFileRejectsInteriorWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"twolines": "tok\nother\n",
+		"comment":  "# my token\ntok\n",
+		"spaced":   "to ken\n",
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readSecretFile("--bearer-token-file", path); err == nil {
+			t.Errorf("%s: want a rejection for %q", name, content)
+		}
 	}
 }

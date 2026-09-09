@@ -260,6 +260,7 @@ parcareport types [flags]      list profile types the server offers
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum` |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
+| `--username` / `--password-file` | | basic auth (needs `--insecure=false`) |
 
 Break down by anything the agents label:
 
@@ -336,10 +337,34 @@ per-RPC credentials rather than by an interceptor, so gRPC itself enforces
 that they never travel over a plaintext connection: combining them with
 `--insecure` is refused rather than quietly leaking the token.
 
-Prefer `--bearer-token-file` over `--bearer-token`. A token on the command
-line is visible in the process list to anyone on the box. The file's contents
-are trimmed, because token files almost always end in a newline and a token
-carrying one fails as an opaque 401.
+Basic auth works the same way:
+
+```sh
+parcareport --url parca.example.com:443 --insecure=false \
+            --username svc --password-file ~/.parca-password
+```
+
+| Flag | |
+|---|---|
+| `--bearer-token-file` | read a bearer token from a file |
+| `--bearer-token` | bearer token as an argument |
+| `--username` + `--password-file` | basic auth, password from a file |
+| `--username` + `--password` | basic auth, password as an argument |
+
+**Prefer the file forms.** A secret passed as a flag is visible in the process
+list to anyone on the box, and it lands in shell history. Where both are given
+the file wins.
+
+A secret file's contents are trimmed, because such files almost always end in
+a newline and a credential carrying one fails as an opaque 401. Whitespace
+*inside* the value is rejected instead of sent: it means the file holds
+something other than a single credential — two lines, or a comment — and an
+`Authorization` header containing a newline is refused far away from the flag
+that caused it.
+
+`--password` without `--username` is refused rather than ignored. On its own
+it produces no header at all, so the request would go out unauthenticated and
+come back as a bare 401 that says nothing about the flag having been dropped.
 
 ## Notes
 
