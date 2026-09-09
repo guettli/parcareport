@@ -194,12 +194,13 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 
 	window := end.Sub(start)
 	fmt.Printf("%s  %s .. %s  (%s)\n\n",
-		profType, start.Format(time.RFC3339), end.Format(time.RFC3339), window.Round(time.Second))
+		profType, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), window.Round(time.Second))
 
 	type result struct {
-		name  string
-		cores float64
-		err   error
+		name   string
+		cores  float64
+		header string
+		err    error
 	}
 	results := make([]result, len(groups))
 
@@ -226,7 +227,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 				return
 			}
 			m, err := interpret(p, window)
-			results[i] = result{name: g, cores: m.Value, err: err}
+			results[i] = result{name: g, cores: m.Value, header: m.Header, err: err}
 		}(i, g)
 	}
 	wg.Wait()
@@ -234,6 +235,9 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	rows := make([]Row, 0, len(results))
 	var total float64
 	empty := 0
+	// The groups already know their unit. Keeping one means the fallback below
+	// does not have to guess "CORES" for what might be a byte or count profile.
+	groupHeader := ""
 	var failed []string
 	for _, r := range results {
 		if r.err != nil {
@@ -244,6 +248,9 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 			continue
 		}
 		total += r.cores
+		if r.header != "" {
+			groupHeader = r.header
+		}
 		// A label value with no samples in the window says nothing, and there
 		// can be hundreds of them -- every `comm` on the box when the profile
 		// came from a scrape target, for instance. Count them, do not print
@@ -279,7 +286,12 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		return err
 	}
 	grand := total
-	header := "CORES"
+	// Only reached when the unfiltered merge came back empty, which the groups
+	// contradict -- but a wrong unit in the heading is worse than a vague one.
+	header := groupHeader
+	if header == "" {
+		header = "CORES"
+	}
 	if overall != nil {
 		m, err := interpret(overall, window)
 		if err != nil {
@@ -339,7 +351,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 // The cross-check is one cheap query, and it only runs on a path that is
 // already about to fail.
 func explainNoValues(ctx context.Context, c *Client, label string, start, end time.Time) error {
-	window := fmt.Sprintf("%s .. %s", start.Format(time.RFC3339), end.Format(time.RFC3339))
+	window := fmt.Sprintf("%s .. %s", start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
 
 	names, err := c.LabelNames(ctx, start, end)
 	if err != nil {
@@ -463,13 +475,6 @@ func shortErr(err error) string {
 		return msg[i+2:]
 	}
 	return msg
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 const usage = `parcareport - cross-cluster CPU bottleneck report from a Parca server

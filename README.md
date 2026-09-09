@@ -52,6 +52,8 @@ reports each in its own unit — dividing bytes by wall-time would be nonsense:
 |---|---|---|
 | `…:cpu:nanoseconds:delta` | `CORES` | average cores busy |
 | `…:wallclock:nanoseconds:…` | `BLOCKED` | average threads waiting (off-CPU) |
+| `memory:inuse_space:…` | `BYTES` | live heap |
+| `goroutine:…` / `mutex:contentions:…` | `COUNT` | totals |
 
 ### Reading `BLOCKED` (off-CPU) honestly
 
@@ -72,8 +74,6 @@ many idle threads they keep, which is not interesting.
 Off-CPU earns its keep **targeted**, not swept: profile one operation you
 already believe is slow, and look for waits on its critical path. Judge the
 stacks, never the totals.
-| `memory:inuse_space:…` | `BYTES` | live heap |
-| `goroutine:…` / `mutex:contentions:…` | `COUNT` | totals |
 
 ```sh
 parcareport types                                        # what the server has
