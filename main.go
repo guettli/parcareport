@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/pprof/profile"
 )
 
 const defaultAddr = "localhost:7070"
@@ -238,13 +240,13 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	// The groups already know their unit. Keeping one means the fallback below
 	// does not have to guess "CORES" for what might be a byte or count profile.
 	groupHeader := ""
-	var failed []string
+	var failed []failure
 	for _, r := range results {
 		if r.err != nil {
 			// Collected, not just warned about. A warning on stderr vanishes
 			// under `2>/dev/null` and leaves a table that looks complete but
 			// whose totals and percentages silently omit whatever failed.
-			failed = append(failed, fmt.Sprintf("%s=%s: %s", o.by, r.name, shortErr(r.err)))
+			failed = append(failed, failure{group: fmt.Sprintf("%s=%s", o.by, r.name), msg: shortErr(r.err)})
 			continue
 		}
 		total += r.cores
@@ -266,6 +268,12 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		// failed". Reporting the second as the first is how a broken run gets
 		// mistaken for an idle cluster.
 		if len(failed) > 0 {
+			// The total-failure case used to print bare `!!` lines with no
+			// banner, so the worse of the two outcomes was the one explained
+			// less well. And the summary went only to stderr, which is the
+			// case the banner exists to avoid.
+			fmt.Printf("!! FAILED: all %d %s queries failed, so there is nothing to report.\n"+
+				"!! This is not an empty window -- the queries did not come back.\n", len(failed), o.by)
 			printFailures(failed)
 			return fmt.Errorf("all %d %s queries failed; no results", len(failed), o.by)
 		}
@@ -277,39 +285,58 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	// would vanish from the report while still burning CPU. Reporting the
 	// residual as "(unlabeled)" keeps the table honest and adds up to 100%.
 	overallSel := selector(profType, "", "", o.match)
-	overallRaw, err := c.MergePprof(ctx, overallSel, start, end)
-	if err != nil {
-		return err
+	// Bounded like every per-group merge. This one carries no label matcher at
+	// all, so it is the widest query in the run and the likeliest to be slow;
+	// on the bare process context it could stall the run for ten minutes,
+	// which is what --timeout exists to prevent.
+	octx, ocancel := context.WithTimeout(ctx, o.timeout)
+	overallRaw, overallErr := c.MergePprof(octx, overallSel, start, end)
+	ocancel()
+	var overall *profile.Profile
+	if overallErr == nil {
+		overall, overallErr = parsePprof(overallRaw)
 	}
-	overall, err := parsePprof(overallRaw)
-	if err != nil {
-		return err
-	}
+
 	grand := total
-	// Only reached when the unfiltered merge came back empty, which the groups
-	// contradict -- but a wrong unit in the heading is worse than a vague one.
+	// Only reached when the unfiltered merge came back empty or failed, which
+	// the groups contradict -- but a wrong unit in the heading is worse than a
+	// vague one, and the groups already worked theirs out.
 	header := groupHeader
 	if header == "" {
 		header = "CORES"
 	}
+	// Without that merge there is no residual and no denominator. Percentages
+	// against the labelled groups alone would be the one number guaranteed to
+	// be wrong when a group is missing, so drop them rather than invent them.
+	knowTotal := overallErr == nil
 	if overall != nil {
-		m, err := interpret(overall, window)
+		mt, err := interpret(overall, window)
 		if err != nil {
 			return err
 		}
-		header = m.Header
-		grand = m.Value
+		header = mt.Header
+		grand = mt.Value
 		if residual := grand - total; residual > grand*0.001 {
 			rows = append(rows, Row{Name: "(unlabeled)", Cores: residual})
 		}
 	}
-	if grand > 0 {
+	if knowTotal && grand > 0 {
 		for i := range rows {
 			rows[i].Pct = rows[i].Cores / grand * 100
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Cores > rows[j].Cores })
-	printGroupTable(strings.ToUpper(o.by), header, rows, grand)
+	printGroupTable(strings.ToUpper(o.by), header, rows, grand, knowTotal)
+	if overallErr != nil {
+		// The group breakdown is the main output of the command, and by this
+		// point it is already computed. Discarding it because an auxiliary
+		// query failed was the wrong trade -- but so would be printing it as
+		// though it were complete.
+		fmt.Printf("\n!! INCOMPLETE: the unfiltered merge failed, so percentages and the\n"+
+			"!! (unlabeled) row are missing, and any series carrying no %q label\n"+
+			"!! is absent from the total above.\n", o.by)
+		printFailures([]failure{{group: "(overall)", msg: shortErr(overallErr)}})
+	}
 	if empty > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", empty, o.by)
 	}
@@ -334,6 +361,10 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	if len(failed) > 0 {
 		return fmt.Errorf("%d of %d %s queries failed; results above are incomplete",
 			len(failed), len(groups), o.by)
+	}
+	if overallErr != nil {
+		return fmt.Errorf("the unfiltered merge failed, so the total and percentages "+
+			"above are incomplete: %s", shortErr(overallErr))
 	}
 	return nil
 }
@@ -378,17 +409,29 @@ func explainNoValues(ctx context.Context, c *Client, label string, start, end ti
 }
 
 func resolveProfileType(ctx context.Context, c *Client, want string) (string, error) {
-	names, err := c.ProfileTypeNames(ctx)
-	if err != nil {
-		return "", err
-	}
+	// An explicit selector needs nothing from the server. The lookup is only
+	// here to catch a typo, which otherwise comes back as an empty merge that
+	// reads like an idle window -- so it is worth attempting, but it must not
+	// be able to fail a run on its own. It used to: against a loaded server
+	// this deadline killed fully-specified runs that would have worked.
 	if want != "" {
+		names, err := c.ProfileTypeNames(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "parcareport: could not check --profile-type against the server "+
+				"(%s); using %q as given\n", shortErr(err), want)
+			return want, nil
+		}
 		for _, n := range names {
 			if n == want {
 				return n, nil
 			}
 		}
 		return "", fmt.Errorf("profile type %q not offered by this server; available:\n  %s", want, strings.Join(names, "\n  "))
+	}
+
+	names, err := c.ProfileTypeNames(ctx)
+	if err != nil {
+		return "", err
 	}
 	switch len(names) {
 	case 0:
@@ -453,17 +496,74 @@ func parseTime(s string, now time.Time) (time.Time, error) {
 	return now.Add(d), nil
 }
 
-// printFailures lists what broke, capped so a wholesale outage does not bury
-// the numbers under hundreds of identical lines.
-func printFailures(failed []string) {
-	const show = 5
-	for i, f := range failed {
-		if i == show {
-			fmt.Printf("!!   ... and %d more\n", len(failed)-show)
+// failure is one group's query that did not come back.
+type failure struct {
+	group string // e.g. `cluster=tc`
+	msg   string
+}
+
+// printFailures lists what broke, grouped by cause.
+//
+// Capping a flat list could hide a whole cause: eight instances failing the
+// same way showed five lines and "and 3 more", while a single group failing
+// for a different reason might be the one truncated away. Grouping by message
+// gives every distinct cause a line, and collapses a wholesale outage to one.
+func printFailures(failed []failure) {
+	var order []string
+	byMsg := map[string][]string{}
+	for _, f := range failed {
+		if _, seen := byMsg[f.msg]; !seen {
+			order = append(order, f.msg)
+		}
+		byMsg[f.msg] = append(byMsg[f.msg], f.group)
+	}
+
+	const showCauses, showGroups = 5, 3
+	for i, msg := range order {
+		if i == showCauses {
+			fmt.Printf("!!   ... and %d more distinct errors\n", len(order)-showCauses)
 			break
 		}
-		fmt.Printf("!!   %s\n", f)
+		groups := byMsg[msg]
+		if len(groups) == 1 {
+			fmt.Printf("!!   %s: %s\n", groups[0], msg)
+			continue
+		}
+		list, suffix := groups, ""
+		if len(list) > showGroups {
+			list, suffix = list[:showGroups], fmt.Sprintf(", and %d more", len(groups)-showGroups)
+		}
+		fmt.Printf("!!   %s  (%d groups: %s%s)\n", msg, len(groups), strings.Join(list, ", "), suffix)
 	}
+	if h := hintFor(order); h != "" {
+		fmt.Print(h)
+	}
+}
+
+// hintFor suggests a next step for failures whose own text does not imply one.
+//
+// "stream terminated by RST_STREAM with error code: INTERNAL_ERROR" is the
+// motivating case: there is no gRPC boilerplate for shortErr to strip and
+// nothing in it says what to do, yet it can take minutes to arrive.
+func hintFor(msgs []string) string {
+	var reset, deadline bool
+	for _, m := range msgs {
+		switch {
+		case strings.Contains(m, "RST_STREAM"), strings.Contains(m, "INTERNAL_ERROR"):
+			reset = true
+		case strings.Contains(m, "deadline exceeded"), strings.Contains(m, "timed out"):
+			deadline = true
+		}
+	}
+	switch {
+	case reset:
+		return "!! The server closed the stream mid-merge, which usually means the merge hit a\n" +
+			"!! server limit or the server errored on it. Try a narrower --from window, or\n" +
+			"!! fewer series with --match.\n"
+	case deadline:
+		return "!! Raise --timeout, or narrow the window with --from so each merge is smaller.\n"
+	}
+	return ""
 }
 
 // shortErr trims the gRPC boilerplate so the reason is readable at a glance.

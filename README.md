@@ -108,13 +108,50 @@ and the command exits non-zero:
 
 Deliberately not stderr alone: `2>/dev/null` is common in scripts, and hiding
 this is exactly how a broken run gets mistaken for a real measurement. For the
-same reason, a run where *every* query fails says so rather than reporting
-"no data in this window", which would read as an idle cluster.
+same reason, a run where *every* query fails gets the same banner rather than
+reporting "no data in this window", which would read as an idle cluster.
+
+Failures are grouped by cause, so a wholesale outage collapses to one line and
+a rare cause is never the one truncated away:
+
+```
+!!   stream terminated by RST_STREAM  (7 groups: instance=a, instance=b, instance=c, and 4 more)
+!!   instance=z: context deadline exceeded
+!! The server closed the stream mid-merge, which usually means the merge hit a
+!! server limit or the server errored on it. Try a narrower --from window, or
+!! fewer series with --match.
+```
+
+That last hint matters more than it looks. A stream reset carries no gRPC
+boilerplate to strip and says nothing about what to do, yet it can take
+minutes to arrive.
 
 `--timeout` (default 60s) bounds each query so one slow group fails visibly
-instead of stalling the run. That includes the label and profile-type lookups,
-which used to have no deadline at all and would hold a run for minutes against
-an unwell server before failing as something else.
+instead of stalling the run. That includes the label lookups, and the
+unfiltered merge behind the `(unlabeled)` row — which, carrying no matcher at
+all, is the widest query in the run and was the one query with no bound of its
+own.
+
+If that unfiltered merge is the thing that fails, the group breakdown is
+already computed and is still printed. What goes away is the total: there is no
+denominator, so the `%TOTAL` column is dropped rather than filled with
+percentages of a subtotal that silently omits whatever is missing.
+
+```
+CLUSTER        CORES
+tc             2.316
+vps            0.655
+SUM OF LISTED  2.971
+
+!! INCOMPLETE: the unfiltered merge failed, so percentages and the
+!! (unlabeled) row are missing, and any series carrying no "cluster" label
+!! is absent from the total above.
+```
+
+An explicit `--profile-type` is checked against the server's list, but the
+check can no longer fail the run on its own. The selector is already complete
+and the merges do not need the lookup; a slow server used to kill
+fully-specified runs here.
 
 An **empty** answer gets the same scepticism as a failed one. Parca reports
 "no values" for a label that does not exist, for a window that holds nothing,

@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -202,7 +204,16 @@ type fakeQuery struct {
 	values    map[string][]string
 	namesErr  error
 	valuesErr error
+	types     []*qv1.ProfileType
+	typesErr  error
 	block     time.Duration // make Values hang, to exercise the deadline
+}
+
+func (f *fakeQuery) ProfileTypes(ctx context.Context, _ *qv1.ProfileTypesRequest, _ ...grpc.CallOption) (*qv1.ProfileTypesResponse, error) {
+	if f.typesErr != nil {
+		return nil, f.typesErr
+	}
+	return &qv1.ProfileTypesResponse{Types: f.types}, nil
 }
 
 func (f *fakeQuery) Labels(ctx context.Context, _ *qv1.LabelsRequest, _ ...grpc.CallOption) (*qv1.LabelsResponse, error) {
@@ -300,4 +311,117 @@ func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unknown label must not look like an empty success")
 	}
+}
+
+// The bug this guards: an explicit --profile-type still went through the
+// ProfileTypes lookup, so a slow server killed a run that needed nothing
+// discovered. A real run died exactly here with the full selector supplied.
+func TestExplicitProfileTypeSurvivesAFailedLookup(t *testing.T) {
+	const want = "parca_agent:samples:count:cpu:nanoseconds:delta"
+	c := testClient(&fakeQuery{typesErr: errors.New("boom")}, 0)
+	got, err := resolveProfileType(context.Background(), c, want)
+	if err != nil {
+		t.Fatalf("explicit type should survive a failed lookup, got %v", err)
+	}
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A typo must still be caught when the lookup does work, since an unknown
+// selector otherwise comes back as an empty merge that reads like idleness.
+func TestExplicitProfileTypeStillRejectsATypo(t *testing.T) {
+	c := testClient(&fakeQuery{types: []*qv1.ProfileType{{
+		Name: "parca_agent", SampleType: "samples", SampleUnit: "count",
+		PeriodType: "cpu", PeriodUnit: "nanoseconds", Delta: true,
+	}}}, 0)
+	if _, err := resolveProfileType(context.Background(), c, "nope:x:y:z:w"); err == nil {
+		t.Fatal("want an error for a selector the server does not offer")
+	}
+}
+
+// Auto-detect keeps failing loudly: with no type asked for, there is nothing
+// to fall back to.
+func TestAutoDetectStillFailsWhenTheLookupFails(t *testing.T) {
+	c := testClient(&fakeQuery{typesErr: errors.New("boom")}, 0)
+	if _, err := resolveProfileType(context.Background(), c, ""); err == nil {
+		t.Fatal("want an error when the lookup fails and no type was given")
+	}
+}
+
+func TestPrintFailuresGroupsByCause(t *testing.T) {
+	// Eight groups, two causes. A flat list capped at five would have shown
+	// only the common one and hidden the other behind "and 3 more".
+	var failed []failure
+	for _, g := range []string{"a", "b", "c", "d", "e", "f", "g"} {
+		failed = append(failed, failure{group: "instance=" + g, msg: "stream terminated by RST_STREAM"})
+	}
+	failed = append(failed, failure{group: "instance=z", msg: "something else entirely"})
+
+	out := captureStdout(t, func() { printFailures(failed) })
+
+	if !strings.Contains(out, "something else entirely") {
+		t.Errorf("the rare cause was hidden:\n%s", out)
+	}
+	if !strings.Contains(out, "(7 groups:") {
+		t.Errorf("the common cause was not collapsed:\n%s", out)
+	}
+	// RST_STREAM says nothing actionable on its own, so a hint is added.
+	if !strings.Contains(out, "narrower --from window") {
+		t.Errorf("missing hint for a stream reset:\n%s", out)
+	}
+}
+
+func TestHintForOnlyFiresWhenItHasSomethingToSay(t *testing.T) {
+	if h := hintFor([]string{"no such label"}); h != "" {
+		t.Errorf("want no hint, got %q", h)
+	}
+	if h := hintFor([]string{"context deadline exceeded"}); !strings.Contains(h, "--timeout") {
+		t.Errorf("want a timeout hint, got %q", h)
+	}
+}
+
+// Without the unfiltered merge there is no denominator, so the %TOTAL column
+// must be absent rather than showing percentages of a subtotal that omits
+// whatever is missing.
+func TestGroupTableOmitsPercentagesWhenTheTotalIsUnknown(t *testing.T) {
+	rows := []Row{{Name: "tc", Cores: 2}, {Name: "vps", Cores: 1}}
+
+	known := captureStdout(t, func() { printGroupTable("CLUSTER", "CORES", rows, 3, true) })
+	if !strings.Contains(known, "%TOTAL") || !strings.Contains(known, "TOTAL") {
+		t.Errorf("want percentages when the total is known:\n%s", known)
+	}
+
+	unknown := captureStdout(t, func() { printGroupTable("CLUSTER", "CORES", rows, 3, false) })
+	if strings.Contains(unknown, "%TOTAL") {
+		t.Errorf("percentages must be dropped when the total is unknown:\n%s", unknown)
+	}
+	if !strings.Contains(unknown, "SUM OF LISTED") {
+		t.Errorf("the subtotal must be labelled as such:\n%s", unknown)
+	}
+	if !strings.Contains(unknown, "2.000") {
+		t.Errorf("group values should still be reported:\n%s", unknown)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		io.Copy(&b, r)
+		done <- b.String()
+	}()
+	fn()
+	w.Close()
+	os.Stdout = saved
+	out := <-done
+	r.Close()
+	return out
 }
