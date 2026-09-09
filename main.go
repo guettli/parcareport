@@ -120,7 +120,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end)
+		return listLabels(ctx, c, subArg, start, end, o.concurrency)
 	case "types":
 		if subArg != "" {
 			return fmt.Errorf("types takes no argument, got %q", subArg)
@@ -141,7 +141,7 @@ func run(args []string) error {
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time) error {
+func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int) error {
 	if name != "" {
 		vals, err := c.LabelValues(ctx, name, start, end)
 		if err != nil {
@@ -164,25 +164,68 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 	if err != nil {
 		return err
 	}
+	// One Values query per label name, fanned out. Sequentially this was the
+	// slowest thing in the tool and the first thing anyone runs: against a
+	// loaded server it never finished, printing not even the header. `report`
+	// already had --concurrency for exactly this shape of work.
+	type row struct {
+		name string
+		vals []string
+		err  error
+	}
+	rows := make([]row, len(names))
+	prog := newProgress("querying", "labels", len(names))
+	prog.start()
+	sem := make(chan struct{}, max(1, concurrency))
+	var wg sync.WaitGroup
+	for i, n := range names {
+		wg.Add(1)
+		go func(i int, n string) {
+			defer wg.Done()
+			defer prog.step()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// The deadline is taken inside LabelValues, after the semaphore,
+			// so a goroutine parked waiting for a slot does not burn it.
+			vals, err := c.LabelValues(ctx, n, start, end)
+			rows[i] = row{name: n, vals: vals, err: err}
+		}(i, n)
+	}
+	wg.Wait()
+	prog.stop()
+
 	w := newTab()
 	fmt.Fprintf(w, "LABEL\tVALUES\tSAMPLE\n")
-	for _, n := range names {
-		vals, err := c.LabelValues(ctx, n, start, end)
-		if err != nil {
-			return err
+	var failedMsgs []string
+	for _, r := range rows {
+		// One label's failure used to abort the whole summary, losing every
+		// label that did work. Name the missing row and keep going.
+		if r.err != nil {
+			failedMsgs = append(failedMsgs, shortErr(r.err))
+			fmt.Fprintf(w, "%s\t?\t!! %s\n", r.name, shortErr(r.err))
+			continue
 		}
-		sort.Strings(vals)
-		sample := vals
-		suffix := ""
+		sort.Strings(r.vals)
+		sample, suffix := r.vals, ""
 		if len(sample) > 6 {
 			sample, suffix = sample[:6], " …"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s%s\n", n, len(vals), strings.Join(sample, " "), suffix)
+		fmt.Fprintf(w, "%s\t%d\t%s%s\n", r.name, len(r.vals), strings.Join(sample, " "), suffix)
 	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
 	fmt.Println("\nRun `parcareport labels <name>` to list one label's values in full.")
+	if len(failedMsgs) > 0 {
+		// shortErr keeps only the gRPC tail, which for a deadline is the least
+		// useful half: the advice metaErr attached sits in front of it. This
+		// is the same hint report prints for the same causes.
+		if h := hintFor(failedMsgs); h != "" {
+			fmt.Print(h)
+		}
+		return fmt.Errorf("%d of %d label queries failed; the rows marked !! are missing",
+			len(failedMsgs), len(names))
+	}
 	return nil
 }
 
@@ -219,12 +262,19 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	}
 	results := make([]result, len(groups))
 
+	// A run can take minutes. With no output at all, "still merging" and
+	// "hung" look identical -- and with the default --timeout the first thing
+	// you saw could be an error after a minute of silence.
+	prog := newProgress("merging", o.by+" groups", len(groups))
+	prog.start()
+
 	sem := make(chan struct{}, max(1, o.concurrency))
 	var wg sync.WaitGroup
 	for i, g := range groups {
 		wg.Add(1)
 		go func(i int, g string) {
 			defer wg.Done()
+			defer prog.step()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -246,6 +296,7 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 		}(i, g)
 	}
 	wg.Wait()
+	prog.stop()
 
 	rows := make([]Row, 0, len(results))
 	var total float64
