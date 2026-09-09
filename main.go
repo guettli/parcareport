@@ -639,11 +639,19 @@ func resolveProfileType(ctx context.Context, c *Client, want string) (string, bo
 	// CORES is its headline unit, so a CPU delta profile is the right default;
 	// the chosen type is echoed in the report heading, so it is visible rather
 	// than hidden.
-	if cpu := cpuDeltaTypes(names); len(cpu) == 1 {
+	cpu := cpuDeltaTypes(names)
+	switch {
+	case len(cpu) == 1:
 		return cpu[0], true, nil
+	case len(cpu) > 1:
+		// Two agents writing CPU profiles under different names. Picking one
+		// would silently report a fraction of the fleet as though it were all
+		// of it, so list exactly the candidates rather than every type.
+		return "", false, fmt.Errorf("server offers %d CPU profiles and nothing to choose between them; "+
+			"pick one with --profile-type:\n  %s", len(cpu), strings.Join(cpu, "\n  "))
 	}
-	return "", false, fmt.Errorf("server offers %d profile types and none is an obvious CPU default; "+
-		"pick one with --profile-type:\n  %s", len(names), strings.Join(names, "\n  "))
+	return "", false, fmt.Errorf("server offers %d profile types and none of them is a CPU profile "+
+		"to default to; pick one with --profile-type:\n  %s", len(names), strings.Join(names, "\n  "))
 }
 
 // matchProfileType resolves --profile-type against what the server offers.

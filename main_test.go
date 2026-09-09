@@ -1335,3 +1335,50 @@ func profileTypesFrom(selectors []string) []*qv1.ProfileType {
 	}
 	return out
 }
+
+// Two agents writing CPU profiles under different names must not be guessed
+// between: picking one would report a fraction of the fleet as though it were
+// all of it. The error lists exactly the candidates, not every type.
+func TestAutoDetectRefusesBetweenTwoCPUProfiles(t *testing.T) {
+	two := []string{
+		"parca_agent:samples:count:cpu:nanoseconds:delta",
+		"otheragent:samples:count:cpu:nanoseconds:delta",
+		"memory:inuse_space:bytes:space:bytes",
+	}
+	c := testClient(&fakeQuery{types: profileTypesFrom(two)}, 0)
+	_, _, err := resolveProfileType(context.Background(), c, "")
+	if err == nil {
+		t.Fatal("want a refusal")
+	}
+	for _, want := range []string{"2 CPU profiles", "otheragent", "parca_agent"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q: %v", want, err)
+		}
+	}
+	// The heap profile is not a candidate and should not be offered as one.
+	if strings.Contains(err.Error(), "inuse_space") {
+		t.Errorf("only CPU candidates should be listed: %v", err)
+	}
+}
+
+// The field order the CPU default depends on. If index 3 were not the PERIOD
+// type, the tool would silently default to the wrong profile and every CORES
+// number would be meaningless.
+func TestCPUDefaultMatchesOnThePeriodType(t *testing.T) {
+	// client.go builds name:sampleType:sampleUnit:periodType:periodUnit[:delta].
+	if got := cpuDeltaTypes([]string{"parca_agent:samples:count:cpu:nanoseconds:delta"}); len(got) != 1 {
+		t.Errorf("the real CPU selector must be recognised, got %v", got)
+	}
+	// "cpu" in the sample-type position must not count.
+	if got := cpuDeltaTypes([]string{"x:cpu:nanoseconds:wall:count:delta"}); len(got) != 0 {
+		t.Errorf("index 3 must be the period type, got %v", got)
+	}
+}
+
+// An empty selector is a substring of everything, so it must not resolve to a
+// profile even though nothing routes it here today.
+func TestMatchProfileTypeRefusesTheEmptySelector(t *testing.T) {
+	if _, err := matchProfileType("", realServerTypes); err == nil {
+		t.Error("an empty selector matches every type; it must not resolve")
+	}
+}
