@@ -30,9 +30,18 @@ func renderTable(d *reportData) {
 	// Otherwise an idle window produced a completely empty stdout, which is
 	// the shape this codebase refuses everywhere else: no record of what was
 	// even asked.
-	fmt.Printf("%s  %s .. %s  (%s)\n\n",
-		d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
-		d.window.Round(time.Second))
+	// A snapshot's numbers describe one instant, not the window. Saying only
+	// the window would imply they cover it -- which is exactly the reading
+	// that made a 20-minute heap query look like 20x the live heap.
+	if d.SnapshotAt != nil {
+		fmt.Printf("%s  snapshot at %s  (newest in %s .. %s)\n\n",
+			d.ProfileType, d.SnapshotAt.Format("2006-01-02T15:04:05Z"),
+			d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"))
+	} else {
+		fmt.Printf("%s  %s .. %s  (%s)\n\n",
+			d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
+			d.window.Round(time.Second))
+	}
 	if d.noRows {
 		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)

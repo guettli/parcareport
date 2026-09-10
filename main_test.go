@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestParseTime(t *testing.T) {
@@ -565,8 +566,48 @@ func cpuProfile(t *testing.T, samples int64) *profile.Profile {
 	}
 }
 
+// snapshotTime is when the fake pretends its non-delta profiles were written.
+var snapshotTime = time.Date(2026, 9, 10, 2, 19, 0, 0, time.UTC)
+
+// QueryRange answers "when were there profiles for this selector". The real
+// server returns one sample per profile; the fake returns one sample for any
+// selector it has a profile for, so the snapshot path has a timestamp to fetch.
+func (f *fakeQuery) QueryRange(ctx context.Context, in *qv1.QueryRangeRequest, _ ...grpc.CallOption) (*qv1.QueryRangeResponse, error) {
+	sel := in.GetQuery()
+	if err := f.mergeErrs[sel]; err != nil {
+		return nil, err
+	}
+	if f.merges[sel] == nil {
+		// The real Parca answers NotFound here, not an empty response --
+		// unlike Merge, which answers OK with an empty pprof. Mirrored so the
+		// tests exercise the asymmetry the client has to absorb.
+		return nil, status.Error(codes.NotFound,
+			"No data found for the query, try a different query or time range or no data has been written to be queried yet.")
+	}
+	return &qv1.QueryRangeResponse{Series: []*qv1.MetricsSeries{{
+		Samples: []*qv1.MetricsSample{{Timestamp: timestamppb.New(snapshotTime)}},
+	}}}, nil
+}
+
+// fakeScrapeInterval is how often the fake pretends profiles were written, so
+// a merge over a window can sum the right number of them.
+const fakeScrapeInterval = time.Minute
+
 func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.CallOption) (*qv1.QueryResponse, error) {
-	sel := in.GetMerge().GetQuery()
+	// A merge and a single-profile fetch name their selector in different
+	// places; scrapes says how many profiles the server folded together.
+	sel := in.GetSingle().GetQuery()
+	scrapes := 1
+	if m := in.GetMerge(); m.GetQuery() != "" {
+		sel = m.GetQuery()
+		// Parca's merge SUMS every profile in the window. For a delta that is
+		// the point; for a snapshot it multiplies a level by the scrape count,
+		// which is the bug this models so the tests can catch it.
+		window := m.GetEnd().AsTime().Sub(m.GetStart().AsTime())
+		if n := int(window / fakeScrapeInterval); n > 1 {
+			scrapes = n
+		}
+	}
 	if err := f.mergeErrs[sel]; err != nil {
 		return nil, err
 	}
@@ -574,11 +615,26 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 	if p == nil {
 		return &qv1.QueryResponse{}, nil // no samples in this window
 	}
+	if scrapes > 1 {
+		p = scaleProfile(p, int64(scrapes))
+	}
 	var buf bytes.Buffer
 	if err := p.Write(&buf); err != nil {
 		return nil, err
 	}
 	return &qv1.QueryResponse{Report: &qv1.QueryResponse_Pprof{Pprof: buf.Bytes()}}, nil
+}
+
+// scaleProfile multiplies every sample value, the way summing N profiles of
+// the same shape would.
+func scaleProfile(p *profile.Profile, n int64) *profile.Profile {
+	out := p.Copy()
+	for _, s := range out.Sample {
+		for i := range s.Value {
+			s.Value[i] *= n
+		}
+	}
+	return out
 }
 
 const testType = "parca_agent:samples:count:cpu:nanoseconds:delta"
@@ -2216,5 +2272,193 @@ func TestFindHeapTypeMatchesOnParts(t *testing.T) {
 	}
 	if got := findHeapType([]string{"memory:alloc_space:bytes:space:bytes"}); got != "" {
 		t.Errorf("alloc_space is not the live heap: %q", got)
+	}
+}
+
+func TestIsDeltaType(t *testing.T) {
+	for _, s := range []string{
+		"parca_agent:samples:count:cpu:nanoseconds:delta",
+		"parca_agent:wallclock:nanoseconds:samples:count:delta",
+	} {
+		if !isDeltaType(s) {
+			t.Errorf("%q is a delta", s)
+		}
+	}
+	// Every non-delta type this server offers. Each is a level, not an
+	// accumulation, so none may be merged across scrapes.
+	for _, s := range []string{
+		"memory:inuse_space:bytes:space:bytes",
+		"memory:inuse_objects:count:space:bytes",
+		"memory:alloc_space:bytes:space:bytes",
+		"memory:alloc_objects:count:space:bytes",
+		"goroutine:goroutine:count:goroutine:count",
+		"mutex:contentions:count:contentions:count",
+		"block:contentions:count:contentions:count",
+	} {
+		if isDeltaType(s) {
+			t.Errorf("%q is not a delta", s)
+		}
+	}
+}
+
+// The bug this guards, measured against a real server: inuse_space read
+// 20.8 MiB over a 1-minute window and 386.9 MiB over 20 minutes, because the
+// merge summed ~19 scrapes of a level. A snapshot must not depend on how wide
+// the window is.
+func TestSnapshotProfileDoesNotScaleWithWindow(t *testing.T) {
+	newFixture := func() *fakeQuery {
+		f := reportFixture(t)
+		f.types = profileTypesFrom([]string{heapType})
+		f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 20<<20)
+		f.merges[heapType] = heapProfile(t, 20<<20)
+		return f
+	}
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+
+	end := snapshotTime.Add(time.Minute)
+	var oneMin, twentyMin string
+	oneMin = captureStdout(t, func() {
+		if err := report(context.Background(), testClient(newFixture(), time.Minute), o,
+			end.Add(-1*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	twentyMin = captureStdout(t, func() {
+		if err := report(context.Background(), testClient(newFixture(), time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	get := func(out string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(l, "tc") {
+				return strings.Join(strings.Fields(l)[1:], " ")
+			}
+		}
+		return ""
+	}
+	if get(oneMin) == "" {
+		t.Fatalf("no tc row:\n%s", oneMin)
+	}
+	if get(oneMin) != get(twentyMin) {
+		t.Errorf("a snapshot must not depend on window width:\n 1m: %s\n20m: %s",
+			get(oneMin), get(twentyMin))
+	}
+	// And it must be the real value, not a multiple of it.
+	if !strings.Contains(get(oneMin), "20.0 MiB") {
+		t.Errorf("want the profile's own value, got %s", get(oneMin))
+	}
+}
+
+// A delta still merges the window -- that is what makes CORES over an hour
+// mean anything, and the fix must not break it.
+func TestDeltaProfileStillMergesTheWindow(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	o := testOptions()
+	o.top = 0
+
+	// 100 samples x 10ms = 1 CPU-second. Over 10s that is 0.100 cores.
+	out := captureStdout(t, func() {
+		end := time.Now()
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-10*time.Second), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "0.100") {
+		t.Errorf("delta should still be a rate over the window:\n%s", out)
+	}
+}
+
+// The report has to say which moment a snapshot describes, or the heading's
+// window implies the numbers cover it.
+func TestSnapshotReportsItsOwnTimestamp(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 20<<20)
+	f.merges[heapType] = heapProfile(t, 20<<20)
+	o := testOptions()
+	o.profileType, o.top, o.output = heapType, 0, outputJSON
+
+	end := snapshotTime.Add(5 * time.Minute)
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	d := decodeReport(t, out)
+	if d.Delta {
+		t.Error("a heap profile is not a delta")
+	}
+	if d.SnapshotAt == nil {
+		t.Fatal("a snapshot must name the profile it came from")
+	}
+	if !d.SnapshotAt.Equal(snapshotTime) {
+		t.Errorf("snapshot_at = %v, want %v", d.SnapshotAt, snapshotTime)
+	}
+}
+
+// A delta has no single moment, so the field stays null rather than inventing
+// one.
+func TestDeltaHasNoSnapshotTimestamp(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	o := testOptions()
+	o.top, o.output = 0, outputJSON
+
+	out := captureStdout(t, func() {
+		end := time.Now()
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-10*time.Second), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	d := decodeReport(t, out)
+	if !d.Delta {
+		t.Error("the CPU profile is a delta")
+	}
+	if d.SnapshotAt != nil {
+		t.Errorf("a merged window has no single timestamp, got %v", d.SnapshotAt)
+	}
+}
+
+// The bug this guards: routing snapshots through QueryRange made every group
+// without a profile look like a failed query, because QueryRange answers
+// NotFound where Merge answers OK-with-nothing. In the run that caught it, 7
+// of 8 instances were reported as failures when they simply had no heap
+// profile -- the exact empty-vs-failed confusion this tool exists to prevent.
+func TestSnapshotGroupsWithNoDataAreEmptyNotFailed(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.values["cluster"] = []string{"tc", "vps"}
+	// Only tc has a heap profile; vps has none at all.
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 20<<20)
+	f.merges[heapType] = heapProfile(t, 20<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+
+	var err error
+	end := snapshotTime.Add(time.Minute)
+	out := captureStdout(t, func() {
+		err = report(context.Background(), testClient(f, time.Minute), o, end.Add(-time.Minute), end)
+	})
+	if err != nil {
+		t.Fatalf("a group with no profile is not a failure: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "INCOMPLETE") || strings.Contains(out, "FAILED") {
+		t.Errorf("no query failed, so no banner:\n%s", out)
+	}
+	if !strings.Contains(out, "no samples in this window") {
+		t.Errorf("the empty group should be counted and omitted:\n%s", out)
+	}
+	if !strings.Contains(out, "20.0 MiB") {
+		t.Errorf("the group that has data should still be reported:\n%s", out)
 	}
 }

@@ -172,6 +172,75 @@ func (c *Client) ProfileTypeNames(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// LatestProfileTime finds when the most recent profile matching the selector
+// was written inside [start,end].
+//
+// Needed for snapshot profiles, where merging the window is meaningless: a
+// heap profile is a level, not a delta, so adding twenty scrapes together
+// reports twenty times the live heap. The window has to pick ONE profile
+// instead, and this is how the tool learns which.
+//
+// QueryRange returns a sample per profile, so the newest timestamp across all
+// series is the newest profile. Cheap: it reads the series index, not the
+// profile bodies.
+func (c *Client) LatestProfileTime(ctx context.Context, selector string, start, end time.Time) (time.Time, error) {
+	qctx, cancel := c.meta(ctx)
+	defer cancel()
+	resp, err := c.q.QueryRange(qctx, &qv1.QueryRangeRequest{
+		Query: selector,
+		Start: timestamppb.New(start),
+		End:   timestamppb.New(end),
+	})
+	if err != nil {
+		// The two RPCs disagree about how to say "nothing here", and the
+		// difference matters: this tool's whole stance is that an empty
+		// window and a failed query must not be confused.
+		//
+		//   Merge      -> OK, empty pprof
+		//   QueryRange -> NotFound, "No data found for the query..."
+		//
+		// Verified against a real server. Reporting NotFound as a failure
+		// turned every group without a heap profile into "the query failed"
+		// -- 7 of 8 in the run that caught this -- so normalise it to the
+		// same "no data" the merge path produces.
+		if status.Code(err) == codes.NotFound {
+			return time.Time{}, nil
+		}
+		return time.Time{}, c.metaErr(fmt.Sprintf("query range %q", selector), err)
+	}
+	var latest time.Time
+	for _, s := range resp.GetSeries() {
+		for _, sample := range s.GetSamples() {
+			if t := sample.GetTimestamp().AsTime(); t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	if latest.IsZero() {
+		return time.Time{}, nil // no profile in the window; caller reports empty
+	}
+	return latest, nil
+}
+
+// SingleProfilePprof fetches the one profile written at `at`, rather than a
+// merge over a range. See LatestProfileTime for why snapshot profiles need it.
+func (c *Client) SingleProfilePprof(ctx context.Context, selector string, at time.Time) ([]byte, error) {
+	resp, err := c.q.Query(ctx, &qv1.QueryRequest{
+		Mode:       qv1.QueryRequest_MODE_SINGLE_UNSPECIFIED,
+		ReportType: qv1.QueryRequest_REPORT_TYPE_PPROF,
+		Options: &qv1.QueryRequest_Single{
+			Single: &qv1.SingleProfile{
+				Query: selector,
+				Time:  timestamppb.New(at),
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("single profile %q at %s: %w", selector, at.Format(time.RFC3339), err)
+	}
+	return resp.GetPprof(), nil
+}
+
 // MergePprof asks the server to merge every profile matching the selector over
 // [start,end] and hand back a standard pprof. Doing the merge server-side is
 // the whole reason this tool stays small: all local analysis is plain pprof.

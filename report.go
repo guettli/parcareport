@@ -37,6 +37,13 @@ type reportData struct {
 	// wall-time would be nonsense.
 	Unit string `json:"unit"`
 	Rate bool   `json:"rate"`
+	// Delta says whether the profile type accumulates. When false the numbers
+	// come from ONE profile, named by SnapshotAt, not from the whole window --
+	// summing snapshots would multiply a level by the number of scrapes.
+	Delta bool `json:"delta"`
+	// SnapshotAt is the timestamp of the profile the numbers came from, and is
+	// null for a delta, where the whole window was merged.
+	SnapshotAt *time.Time `json:"snapshot_at"`
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
@@ -114,6 +121,32 @@ func unitName(header string) string {
 	return strings.ToLower(header)
 }
 
+// profileFor fetches one selector's profile the way its type actually means.
+//
+// A delta is merged over the window: the values accumulate, which is what
+// makes a rate over that window meaningful. A snapshot is not merged at all --
+// the window instead selects WHICH snapshot, and the newest one in it is used.
+// Merging snapshots sums levels, so a 20-minute window over a 60s scrape
+// interval reported twenty times the live heap (parcareport#26).
+//
+// snapshotAt reports the profile's own timestamp, so the caller can say which
+// moment the numbers describe rather than implying the whole window.
+func profileFor(ctx context.Context, c *Client, selector string, delta bool, start, end time.Time) (raw []byte, snapshotAt time.Time, err error) {
+	if delta {
+		raw, err = c.MergePprof(ctx, selector, start, end)
+		return raw, time.Time{}, err
+	}
+	at, err := c.LatestProfileTime(ctx, selector, start, end)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if at.IsZero() {
+		return nil, time.Time{}, nil // nothing in the window
+	}
+	raw, err = c.SingleProfilePprof(ctx, selector, at)
+	return raw, at, err
+}
+
 // gatherReport runs the queries and assembles the result.
 //
 // It returns data even when something failed, because the group breakdown is
@@ -138,8 +171,10 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	sort.Strings(groups)
 
 	window := end.Sub(start)
+	delta := isDeltaType(profType)
 	d := &reportData{
 		ProfileType:  profType,
+		Delta:        delta,
 		TypeVerified: &typeVerified,
 		Start:        start.UTC(),
 		End:          end.UTC(),
@@ -180,7 +215,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 
 			qctx, qcancel := context.WithTimeout(ctx, o.timeout)
 			defer qcancel()
-			raw, err := c.MergePprof(qctx, selector(profType, o.by, g, o.match), start, end)
+			raw, _, err := profileFor(qctx, c, selector(profType, o.by, g, o.match), delta, start, end)
 			if err != nil {
 				results[i] = result{name: g, err: err}
 				return
@@ -244,8 +279,13 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// Bounded like every per-group merge: carrying no matcher at all, this is
 	// the widest query in the run and the likeliest to be slow.
 	octx, ocancel := context.WithTimeout(ctx, o.timeout)
-	overallRaw, overallErr := c.MergePprof(octx, selector(profType, "", "", o.match), start, end)
+	overallRaw, snapAt, overallErr := profileFor(octx, c, selector(profType, "", "", o.match), delta, start, end)
 	ocancel()
+	d.SnapshotAt = nil
+	if !snapAt.IsZero() {
+		at := snapAt.UTC()
+		d.SnapshotAt = &at
+	}
 	var overall *profile.Profile
 	if overallErr == nil {
 		overall, overallErr = parsePprof(overallRaw)

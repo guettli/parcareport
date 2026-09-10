@@ -265,13 +265,51 @@ label "cluster" exists in <window> but returned no values, which is contradictor
 The third one is real: a retry once produced values for the very label the
 previous run had just declared empty.
 
+### Snapshot profiles are not merged
+
+A CPU profile is a **delta**: the values accumulate, so merging every profile
+in the window is exactly what makes `CORES` over an hour mean something.
+
+The other profile types are **levels** — live heap, a goroutine count,
+allocations since process start. Merging those sums the level once per scrape,
+so the answer grows with the window rather than describing anything:
+
+```
+$ parcareport --profile-type=inuse_space --by=instance --from=-1m
+10.0.0.1:6060   20.8 MiB      # 1 scrape
+$ parcareport --profile-type=inuse_space --by=instance --from=-20m
+10.0.0.1:6060  386.9 MiB      # ~19 scrapes of the same 20 MiB
+```
+
+That process's entire RSS was 117 MiB, so the second number was impossible.
+The nasty part is that it does not look wrong — it looks like a service with a
+big heap.
+
+So for a non-delta type the window does not select *how much to add up*, it
+selects **which profile to read**, and the newest one in the window is used.
+The heading says which instant the numbers describe:
+
+```
+memory:inuse_space:bytes:space:bytes  snapshot at 2026-09-10T02:19:00Z  (newest in 2026-09-10T02:00:00Z .. 2026-09-10T02:20:00Z)
+```
+
+In `--output=json`, `delta` says which kind of profile it was and
+`snapshot_at` names the instant — `null` for a delta, where the window really
+was merged.
+
+Widening the window on a snapshot profile therefore reaches further back for a
+profile to read; it does not accumulate more. If nothing was scraped in the
+window at all, that is reported as no data, the same as for a delta.
+
 ### Measuring before and after a change
 
 Use the **CPU** profile. It is a delta, so a merge over a window is a genuine
 rate. Memory profiles are **cumulative since process start** (`delta=false`),
 so comparing `alloc_space` between two processes of different ages measures
 their ages, not their allocation rates — which will make a change look
-dramatically better or worse than it was.
+dramatically better or worse than it was. That is a property of the profile
+itself, and separate from the merging problem above: reading one snapshot
+honestly still gives you a counter whose zero was process start.
 
 Sanity-check absolute numbers against `kubectl top` at least once.
 
@@ -434,6 +472,7 @@ both per section, so accepting them would silently do something else.
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--output` | `table` | `json` for a machine-readable report |
+| | | non-delta profiles read the newest snapshot in the window, not a merge |
 | `--max-group-values` | `50` | overview: skip a breakdown with more values than this; `0` disables the skip |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
 | `--concurrency` | `4` | parallel queries, within one breakdown |
