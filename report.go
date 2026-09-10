@@ -140,11 +140,6 @@ func unitName(header string) string {
 	return strings.ToLower(header)
 }
 
-// gatherReport runs the queries and assembles the result.
-//
-// It returns data even when something failed, because the group breakdown is
-// the point of the command and is usually still worth having. The error says
-// what is missing; data == nil means nothing could be assembled at all.
 // snapshotWindow picks the window a non-delta profile should be merged over.
 //
 // A merge sums across BOTH time and series. Only the first is wrong for a
