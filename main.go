@@ -46,9 +46,13 @@ type options struct {
 	maxGroups   int
 	// setFlags records which flags were given, so a subcommand can refuse one
 	// it would otherwise ignore.
-	setFlags     map[string]bool
-	concurrency  int
-	timeout      time.Duration
+	setFlags    map[string]bool
+	concurrency int
+	timeout     time.Duration
+	deadline    time.Duration
+	// resolvedType lets a caller that already knows the profile type skip the
+	// lookup. Not a flag: only overview sets it.
+	resolvedType string
 	bearerToken  string
 	tokenFile    string
 	username     string
@@ -72,6 +76,7 @@ func run(args []string) error {
 	fs.IntVar(&o.maxGroups, "max-group-values", 50, "overview: skip a breakdown whose label has more values than this")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
+	fs.DurationVar(&o.deadline, "deadline", 10*time.Minute, "budget for the whole run; 0 removes it and relies on --timeout alone")
 	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
 	fs.StringVar(&o.tokenFile, "bearer-token-file", "", "read the bearer token from a file, keeping it out of the process list")
 	fs.StringVar(&o.username, "username", "", "basic auth username (requires --insecure=false)")
@@ -130,7 +135,23 @@ func run(args []string) error {
 	}
 	defer c.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// A per-query --timeout at or above the whole run's budget can never fire:
+	// the run's own clock reaches every outstanding query first, and they all
+	// report their own deadline at once. That reads as N slow queries when it
+	// was one clock, and the hint it prints ("raise --timeout") cannot work
+	// because --timeout is already past the ceiling. Refuse the combination
+	// rather than let it mislead.
+	if o.deadline > 0 && o.timeout >= o.deadline {
+		return fmt.Errorf("--timeout (%s) must be below --deadline (%s), or it can never fire: "+
+			"the run's budget would expire first and every outstanding query would report its own "+
+			"deadline at the same moment. Lower --timeout, or raise --deadline", o.timeout, o.deadline)
+	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if o.deadline > 0 {
+		ctx, cancel = context.WithTimeout(ctx, o.deadline)
+	}
 	defer cancel()
 
 	switch sub {

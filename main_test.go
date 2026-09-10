@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -221,6 +222,7 @@ type fakeQuery struct {
 	valuesDelay time.Duration
 	types       []*qv1.ProfileType
 	typesErr    error
+	typeCalls   atomic.Int64
 	// merges answers MergePprof by selector. A selector with no entry gets an
 	// empty pprof, which is what Parca returns for a window with no samples.
 	merges    map[string]*profile.Profile
@@ -229,6 +231,7 @@ type fakeQuery struct {
 }
 
 func (f *fakeQuery) ProfileTypes(ctx context.Context, _ *qv1.ProfileTypesRequest, _ ...grpc.CallOption) (*qv1.ProfileTypesResponse, error) {
+	f.typeCalls.Add(1)
 	if f.typesErr != nil {
 		return nil, f.typesErr
 	}
@@ -2216,5 +2219,105 @@ func TestFindHeapTypeMatchesOnParts(t *testing.T) {
 	}
 	if got := findHeapType([]string{"memory:alloc_space:bytes:space:bytes"}); got != "" {
 		t.Errorf("alloc_space is not the live heap: %q", got)
+	}
+}
+
+// The bug this guards: a hidden ten-minute budget capped every run, so
+// --timeout=600s was accepted while being exactly the ceiling. It could then
+// never fire -- the run's own clock reached every outstanding query first, and
+// 26 groups reported "context deadline exceeded" simultaneously. That reads as
+// 26 slow queries; it was one clock. Worse, the hint printed alongside said to
+// raise --timeout, which could not help.
+func TestTimeoutAtOrAboveTheDeadlineIsRejected(t *testing.T) {
+	for _, args := range [][]string{
+		{"--url=localhost:1", "--timeout=10m", "--deadline=10m"}, // equal
+		{"--url=localhost:1", "--timeout=20m", "--deadline=10m"}, // above
+		{"--url=localhost:1", "--timeout=600s"},                  // equal to the default
+	} {
+		err := run(args)
+		if err == nil {
+			t.Errorf("%v should be refused", args)
+			continue
+		}
+		for _, want := range []string{"--timeout", "--deadline", "never fire"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%v: error should mention %q, got: %v", args, want, err)
+			}
+		}
+	}
+}
+
+// A sane pairing must still be accepted -- the check has to reject the
+// impossible combination, not a smaller timeout.
+func TestTimeoutBelowTheDeadlineIsAccepted(t *testing.T) {
+	// Reaches the dial and then fails on the unreachable server, which is
+	// past the validation this test is about.
+	err := run([]string{"--url=127.0.0.1:1", "--timeout=30s", "--deadline=10m"})
+	if err == nil {
+		t.Skip("unexpectedly reached a server")
+	}
+	if strings.Contains(err.Error(), "never fire") {
+		t.Errorf("a timeout below the deadline must be accepted, got: %v", err)
+	}
+}
+
+// --deadline=0 removes the budget for a deliberately long run, and then there
+// is no ceiling for --timeout to exceed.
+func TestDeadlineZeroDisablesTheBudget(t *testing.T) {
+	err := run([]string{"--url=127.0.0.1:1", "--timeout=30m", "--deadline=0"})
+	if err == nil {
+		t.Skip("unexpectedly reached a server")
+	}
+	if strings.Contains(err.Error(), "never fire") {
+		t.Errorf("with no budget there is nothing to exceed, got: %v", err)
+	}
+}
+
+// The bug this guards: overview reads the profile type list once, then picks
+// each section's type from it -- but gatherReport re-fetched and re-validated
+// the whole list for every section. Four sections meant four redundant
+// ProfileTypes calls, and when the lookup failed, four copies of the same
+// warning for a value that came from the server's own list.
+func TestOverviewResolvesTheProfileTypeOnce(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := overviewOptions()
+	o.top = 0
+	if _, err := runOverview(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	// One call for overview's own list. Anything more is a section re-asking
+	// for a list it was handed.
+	if n := f.typeCalls.Load(); n != 1 {
+		t.Errorf("ProfileTypes called %d times, want 1", n)
+	}
+}
+
+// A plain report still resolves the type itself -- the shortcut is only for a
+// caller that already knows it.
+func TestReportStillResolvesItsOwnType(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	o := testOptions()
+	o.top = 0
+	out := captureStdout(t, func() {
+		end := time.Now()
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-10*time.Second), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if f.typeCalls.Load() == 0 {
+		t.Error("report must still check the type it was given")
+	}
+	if !strings.Contains(out, testType) {
+		t.Errorf("missing the heading:\n%s", out)
 	}
 }

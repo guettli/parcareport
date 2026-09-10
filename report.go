@@ -124,9 +124,19 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	if err != nil {
 		return nil, err
 	}
-	profType, typeVerified, err := resolveProfileType(ctx, c, o.profileType)
-	if err != nil {
-		return nil, err
+	// A caller that already resolved the type passes it in. overview does:
+	// it reads the type list once, picks per section from that list, and used
+	// to make gatherReport re-fetch and re-validate the list for every
+	// section -- four redundant ProfileTypes calls, four copies of the same
+	// warning when the lookup failed, and profile_type_verified reported
+	// false for a value taken from the server's own list.
+	profType, typeVerified := o.resolvedType, true
+	if profType == "" {
+		var err error
+		profType, typeVerified, err = resolveProfileType(ctx, c, o.profileType)
+		if err != nil {
+			return nil, err
+		}
 	}
 	groups, err := c.LabelValues(ctx, o.by, start, end)
 	if err != nil {
