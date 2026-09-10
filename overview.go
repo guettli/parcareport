@@ -116,13 +116,10 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			// server is hours of work and would swamp the sections worth
 			// having. Count first -- that is one cheap query -- and skip the
 			// ones that are too wide, saying so.
-			vals, err := c.LabelValues(ctx, by, start, end)
 			// The same dropped stream that costs a merge costs a label
 			// lookup, and losing one here costs the whole section rather
-			// than one group. One more try, for that signature only.
-			if err != nil && looksTransient(err) && budgetLeftFor(ctx, o.timeout) {
-				vals, err = c.LabelValues(ctx, by, start, end)
-			}
+			// than one group, so labelValues asks again once.
+			vals, err := labelValues(ctx, c, o, by, start, end)
 			if err != nil {
 				lookupFailed = true
 				d.Skipped = append(d.Skipped, skippedJSON{

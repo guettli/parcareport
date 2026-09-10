@@ -430,9 +430,14 @@ Two things follow:
 - A query that failed that way is **asked once more** — and only that query,
   one at a time. Re-running the whole breakdown would send the server the same
   load that just defeated it. A query the server *rejected*, rather than
-  dropped, is not retried: that would just repeat a wrong query. The retry is
-  skipped when little of the `--deadline` is left, so recovering one group
-  cannot starve every later section.
+  dropped, is not retried: that would just repeat a wrong query. The budget is
+  checked again before each retry, so recovering a few groups cannot eat the
+  `--deadline` and leave every later section failing. Label lookups get the
+  same single retry — losing one of those costs a whole breakdown rather than
+  one group.
+
+  This part is not specific to `overview`: a plain `parcareport` run retries
+  its own dropped queries the same way.
 
 When it happens you are told, because a run that quietly takes twice as long
 is worth knowing about:

@@ -242,6 +242,10 @@ type fakeQuery struct {
 	// valuesFailFirst drops that many Values calls per label before
 	// answering, guarded by mergeMu.
 	valuesFailFirst map[string]int
+	// peakAfter starts recording maxParallel only once this many merges have
+	// been made, so a test can measure the retry pass on its own rather than
+	// the peak of the first fan-out that preceded it.
+	peakAfter int64
 	// mergeCalls counts every merge by selector, including the ones that
 	// fail. failCount only counts the failFirstN path, so it cannot answer
 	// "how many times was this group asked".
@@ -618,10 +622,18 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
 	}
 	n := f.inFlight.Add(1)
-	for {
-		peak := f.maxParallel.Load()
-		if n <= peak || f.maxParallel.CompareAndSwap(peak, n) {
-			break
+	f.mergeMu.Lock()
+	total := int64(0)
+	for _, c := range f.mergeCalls {
+		total += int64(c)
+	}
+	f.mergeMu.Unlock()
+	if total > f.peakAfter {
+		for {
+			peak := f.maxParallel.Load()
+			if n <= peak || f.maxParallel.CompareAndSwap(peak, n) {
+				break
+			}
 		}
 	}
 	defer f.inFlight.Add(-1)
@@ -2635,6 +2647,93 @@ func TestADroppedLabelLookupIsRetried(t *testing.T) {
 	}
 	if !strings.Contains(out, "CLUSTER") {
 		t.Errorf("the section should have been planned after the retry:\n%s", out)
+	}
+}
+
+// The retry exists because the server was out of room. Sending the retries
+// in parallel would be a smaller version of the same mistake.
+func TestTheRetryGoesOneAtATime(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"a", "b", "c", "d"}
+	for _, g := range f.values["cluster"] {
+		f.merges[testType+`{cluster="`+g+`"}`] = cpuProfile(t, 10)
+	}
+	f.merges[testType] = cpuProfile(t, 40)
+	// Every group drops its first attempt, so the retry pass has four
+	// queries in it -- enough to run in parallel if it were allowed to.
+	f.failFirstN = 4
+	f.mergeDelay = 20 * time.Millisecond
+	// Ignore the first fan-out's peak; this test is about the retry.
+	f.peakAfter = 4
+
+	o := overviewOptions()
+	o.top, o.concurrency = 0, 4
+	if _, err := runOverview(t, f, o); err != nil {
+		t.Fatalf("every group recovered on retry, so the run should succeed: %v", err)
+	}
+	if peak := f.maxParallel.Load(); peak > 1 {
+		t.Errorf("the retry ran %d queries at once, want 1 at a time", peak)
+	}
+}
+
+// The lookup inside the report is the one that costs the whole report: with
+// no label values there is nothing to break anything down by.
+func TestTheReportsOwnLabelLookupIsRetried(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	f.valuesFailFirst = map[string]int{"cluster": 1}
+
+	o := testOptions()
+	o.top = 0
+	out, err := runReport(t, f, o)
+	if err != nil {
+		t.Fatalf("a dropped label lookup should be retried, not lost: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "CLUSTER") {
+		t.Errorf("the report should have been built after the retry:\n%s", out)
+	}
+}
+
+// Checking the budget once, before the retry pass, is not enough: a section
+// with many dropped groups would start a retry that ate the whole --deadline
+// and left every later section failing. The retry would then have made the
+// run worse than no retry at all.
+func TestTheRetryStopsWhenTheBudgetRunsOut(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"a", "b", "c", "d", "e", "f"}
+	for _, g := range f.values["cluster"] {
+		f.merges[testType+`{cluster="`+g+`"}`] = cpuProfile(t, 10)
+	}
+	f.merges[testType] = cpuProfile(t, 60)
+	// Every group drops its first attempt. Failures are instant, so the
+	// first pass costs nothing; each retry then succeeds and costs
+	// mergeDelay, which is what eats the budget.
+	f.failFirstN = 6
+	f.mergeDelay = 100 * time.Millisecond
+
+	o := testOptions()
+	o.top, o.timeout = 0, 40*time.Millisecond
+	// Room for a few retries, not for all six.
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+
+	var out string
+	func() {
+		out = captureStdout(t, func() {
+			start := time.Now().Add(-time.Hour)
+			_ = report(ctx, testClient(f, time.Minute), o, start, time.Now())
+		})
+	}()
+	// Six retries at 100ms each cannot fit in 350ms. If the budget is only
+	// checked once, all six are attempted anyway.
+	if strings.Contains(out, "6 cluster queries were asked again") {
+		t.Errorf("every group was retried despite the budget running out:\n%s", out)
+	}
+	if !strings.Contains(out, "asked again") {
+		t.Errorf("some groups should still have been retried:\n%s", out)
 	}
 }
 

@@ -145,7 +145,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			return nil, err
 		}
 	}
-	groups, err := c.LabelValues(ctx, o.by, start, end)
+	groups, err := labelValues(ctx, c, o, o.by, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -179,22 +179,22 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// would double the load on a server that has just said it has none to
 	// spare, which is what caused the failure in the first place.
 	//
-	// Once. A second failure keeps the first error rather than replacing it
-	// with a less informative one, and there is no third attempt: past that,
-	// retrying is just the same load again.
-	if again := transientGroups(results); len(again) > 0 && budgetLeftFor(ctx, o.timeout) {
-		sub := make([]string, len(again))
-		for i, idx := range again {
-			sub[i] = groups[idx]
+	// Once each. A second failure keeps the first error rather than replacing
+	// it with a less informative one, and there is no third attempt: past
+	// that, retrying is just the same load again.
+	//
+	// The budget is re-checked before every one of them. Checking once would
+	// let a section with fifteen dropped groups start a retry that eats the
+	// whole --deadline and leaves every later section failing -- the retry
+	// would then have made the run worse than no retry at all.
+	for _, idx := range transientGroups(results) {
+		if !budgetLeftFor(ctx, o.timeout) {
+			break
 		}
-		retried := mergeGroups(ctx, c, o, profType, sub, start, end, window,
-			1, "retrying", o.by+" groups")
-		for i, idx := range again {
-			if retried[i].err == nil {
-				results[idx] = retried[i]
-			}
+		if again := mergeOne(ctx, c, o, profType, groups[idx], start, end, window); again.err == nil {
+			results[idx] = again
 		}
-		d.Retried = len(again)
+		d.Retried++
 	}
 
 	// Checked once, after every attempt: if the run's budget went while those
@@ -425,25 +425,28 @@ func mergeGroups(ctx context.Context, c *Client, o options, profType string, gro
 			defer prog.step()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-
-			qctx, qcancel := context.WithTimeout(ctx, o.timeout)
-			defer qcancel()
-			raw, err := c.MergePprof(qctx, selector(profType, o.by, g, o.match), start, end)
-			if err != nil {
-				results[i] = groupResult{name: g, err: err}
-				return
-			}
-			p, err := parsePprof(raw)
-			if err != nil || p == nil {
-				results[i] = groupResult{name: g, err: err}
-				return
-			}
-			m, err := interpret(p, window)
-			results[i] = groupResult{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
+			results[i] = mergeOne(ctx, c, o, profType, g, start, end, window)
 		}(i, g)
 	}
 	wg.Wait()
 	return results
+}
+
+// mergeOne merges a single group, bounded by --timeout.
+func mergeOne(ctx context.Context, c *Client, o options, profType, g string,
+	start, end time.Time, window time.Duration) groupResult {
+	qctx, qcancel := context.WithTimeout(ctx, o.timeout)
+	defer qcancel()
+	raw, err := c.MergePprof(qctx, selector(profType, o.by, g, o.match), start, end)
+	if err != nil {
+		return groupResult{name: g, err: err}
+	}
+	p, err := parsePprof(raw)
+	if err != nil || p == nil {
+		return groupResult{name: g, err: err}
+	}
+	m, err := interpret(p, window)
+	return groupResult{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
 }
 
 // transientGroups returns the indexes of groups that failed in a way worth one
@@ -472,4 +475,15 @@ func budgetLeftFor(ctx context.Context, timeout time.Duration) bool {
 		return true
 	}
 	return time.Until(dl) > 2*timeout
+}
+
+// labelValues lists a label's values, asking again once if the server dropped
+// the answer. Losing this one costs the whole report rather than one group:
+// there is nothing left to break anything down by.
+func labelValues(ctx context.Context, c *Client, o options, by string, start, end time.Time) ([]string, error) {
+	vals, err := c.LabelValues(ctx, by, start, end)
+	if err != nil && looksTransient(err) && budgetLeftFor(ctx, o.timeout) {
+		return c.LabelValues(ctx, by, start, end)
+	}
+	return vals, err
 }
