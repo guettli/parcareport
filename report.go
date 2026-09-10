@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -37,9 +38,27 @@ type reportData struct {
 	// wall-time would be nonsense.
 	Unit string `json:"unit"`
 	Rate bool   `json:"rate"`
+	// Delta says whether the profile type accumulates. When false the numbers
+	// come from ONE profile, named by SnapshotAt, not from the whole window --
+	// summing snapshots would multiply a level by the number of scrapes.
+	Delta bool `json:"delta"`
+	// SnapshotAt is the timestamp of the profile the numbers came from, and is
+	// null for a delta, where the whole window was merged.
+	SnapshotAt *time.Time `json:"snapshot_at"`
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
+	// StaleSeries counts series with no scrape inside the snapshot window --
+	// usually because they are scraped less often than the fastest series in
+	// the selector, though the code only knows the window missed them. They
+	// contribute nothing to these numbers, and a series vanishing from a
+	// total without saying so is exactly what this tool exists to point out.
+	StaleSeries int `json:"stale_series,omitempty"`
+	// DoubledSeries counts series with MORE than one scrape inside the
+	// window, which are therefore counted twice. The interval estimate is a
+	// median, so a series that genuinely scraped twice in one median gap can
+	// land here. Rare, and said out loud rather than left in the number.
+	DoubledSeries int `json:"doubled_series,omitempty"`
 	// Retried is how many groups were asked a second time because the server
 	// dropped the first attempt. A run that quietly takes twice as long is
 	// the kind of thing this tool says out loud.
@@ -121,6 +140,133 @@ func unitName(header string) string {
 	return strings.ToLower(header)
 }
 
+// snapshotWindow picks the window a non-delta profile should be merged over.
+//
+// A merge sums across BOTH time and series. Only the first is wrong for a
+// snapshot -- the second is what makes a group total a total. Fetching one
+// profile fixes the first and breaks the second: a selector usually matches
+// several series, each written at its own instant, so one instant returns one
+// series. Measured: `--by=job` over all eight scrape targets reported 3.0 MiB
+// while a single instance in the same period was 18 MiB. A total cannot be
+// smaller than one of its parts.
+//
+// So merge, but over a window narrow enough to hold at most one profile per
+// series: one scrape interval, inferred from the spacing between timestamps,
+// ending at the newest profile.
+//
+// The window is (latest-interval, latest], not latest +/- interval/2. latest
+// is the newest timestamp anywhere in the selector, so nothing exists after
+// it: centring on it would spend half the width on empty space and drop every
+// series whose own newest scrape is more than half an interval older. Parca
+// staggers scrape targets across the interval, so that is about half of them.
+//
+// Two counts come back with it, because the interval is an estimate and an
+// estimate can miss in either direction:
+//
+//   - stale: series with NO scrape inside the window. They contribute nothing.
+//     Usually they are scraped less often than the rest, though all the code
+//     knows is that the window missed them.
+//   - doubled: series with MORE than one scrape inside it, and so counted more
+//     than once.
+//
+// Either way the number is wrong, and a series vanishing from a total -- or
+// arriving in it twice -- without a word is what this tool exists to prevent.
+func snapshotWindow(ctx context.Context, c *Client, selector string, start, end time.Time) (
+	from, to, latest time.Time, stale, doubled int, err error) {
+	times, err := c.ProfileTimes(ctx, selector, start, end)
+	if err != nil {
+		return start, end, time.Time{}, 0, 0, err
+	}
+	if len(times) == 0 {
+		return start, end, time.Time{}, 0, 0, nil // nothing in the window
+	}
+	latest, interval := latestAndInterval(times)
+	if interval <= 0 {
+		// One profile per series and no spacing to infer -- the window
+		// already holds a single scrape, so merging it whole is safe.
+		return start, end, latest, 0, 0, nil
+	}
+	from = latest.Add(-interval).Add(time.Nanosecond)
+	to = latest
+	if from.Before(start) {
+		from = start
+	}
+	for _, series := range times {
+		inWindow := 0
+		for _, t := range series {
+			if !t.Before(from) && !t.After(to) {
+				inWindow++
+			}
+		}
+		switch {
+		case inWindow == 0:
+			stale++
+		case inWindow > 1:
+			doubled++
+		}
+	}
+	return from, to, latest, stale, doubled, nil
+}
+
+// latestAndInterval finds the newest timestamp in the selector and estimates
+// the scrape interval from the spacing between timestamps.
+//
+// The estimate is the median of the per-series median gaps, taking the lower
+// median where a count is even, so an even split errs toward the narrower
+// window rather than one wide enough to hold two scrapes.
+//
+// Two medians, not one, and neither of them the smallest gap. The smallest gap
+// outright is safer against double-counting but far too easy to break: one
+// close-together pair anywhere -- an agent restart, a backfill, a scrape that
+// ran early -- collapsed the window for the entire fleet, and then almost
+// nothing fell inside it. Measured, a single 5-second gap among 60-second
+// scrapes cut a three-target total to one target.
+//
+// A median within each series handles that when the series is long. It does
+// not help when the series is SHORT, which is exactly what a restart or a
+// newly-appeared target produces: two timestamps five seconds apart have one
+// gap, so their median is five seconds. Taking the smallest of the per-series
+// medians let that one new target collapse the window again. The median across
+// series ignores it, because most targets agree with each other.
+//
+// What that costs: a series really scraped faster than the fleet median has
+// more than one scrape inside the window and is counted more than once. The
+// caller counts those and says so, rather than letting the number be quietly
+// wrong.
+func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Duration) {
+	var medians []time.Duration
+	for _, series := range times {
+		var gaps []time.Duration
+		for i, t := range series {
+			if t.After(latest) {
+				latest = t
+			}
+			if i == 0 {
+				continue
+			}
+			if gap := t.Sub(series[i-1]); gap > 0 {
+				gaps = append(gaps, gap)
+			}
+		}
+		if len(gaps) == 0 {
+			continue
+		}
+		medians = append(medians, lowerMedian(gaps))
+	}
+	if len(medians) == 0 {
+		return latest, 0
+	}
+	return latest, lowerMedian(medians)
+}
+
+// lowerMedian sorts a copy and returns the middle value, the lower of the two
+// on an even count.
+func lowerMedian(d []time.Duration) time.Duration {
+	s := slices.Clone(d)
+	slices.Sort(s)
+	return s[(len(s)-1)/2]
+}
+
 // gatherReport runs the queries and assembles the result.
 //
 // It returns data even when something failed, because the group breakdown is
@@ -155,6 +301,27 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	sort.Strings(groups)
 
 	window := end.Sub(start)
+	delta := isDeltaType(profType)
+
+	// For a snapshot type, pick the window ONCE, from the unfiltered
+	// selector, and merge every group over that same window. Letting each
+	// group infer its own would give the rows and the total different
+	// instants: an instance that stopped scraping ten minutes ago would
+	// report its last heap at full value against a total that correctly
+	// excludes it, and the rows would sum to more than 100%.
+	qstart, qend := start, end
+	var snapAt time.Time
+	staleSeries, doubledSeries := 0, 0
+	if !delta {
+		wctx, wcancel := context.WithTimeout(ctx, o.timeout)
+		f, t, latest, stale, doubled, err := snapshotWindow(wctx, c, selector(profType, "", "", o.match), start, end)
+		wcancel()
+		if err != nil {
+			return nil, err
+		}
+		qstart, qend, snapAt = f, t, latest
+		staleSeries, doubledSeries = stale, doubled
+	}
 	d := &reportData{
 		ProfileType:  profType,
 		TypeVerified: &typeVerified,
@@ -168,9 +335,20 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		Groups:       []groupJSON{},
 		Functions:    []funcJSON{},
 		Failed:       []failJSON{},
+		// Set here rather than after the fan-out: a collapsed window can
+		// leave every group empty, and that is exactly the run where the
+		// reader most needs to know scrapes existed and the window missed
+		// them.
+		Delta:         delta,
+		StaleSeries:   staleSeries,
+		DoubledSeries: doubledSeries,
+	}
+	if !snapAt.IsZero() {
+		at := snapAt.UTC()
+		d.SnapshotAt = &at
 	}
 
-	results := mergeGroups(ctx, c, o, profType, groups, start, end, window)
+	results := mergeGroups(ctx, c, o, profType, groups, qstart, qend, window)
 
 	// A dropped stream is the server going away mid-answer, not the query
 	// being wrong, and it is transient. Ask again -- but only for the groups
@@ -207,7 +385,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			if !until.IsZero() && time.Now().After(until) {
 				break
 			}
-			if r := mergeOne(ctx, c, o, profType, groups[idx], start, end, window); r.err == nil {
+			if r := mergeOne(ctx, c, o, profType, groups[idx], qstart, qend, window); r.err == nil {
 				results[idx] = r
 			}
 			d.Retried++
@@ -268,7 +446,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// Bounded like every per-group merge: carrying no matcher at all, this is
 	// the widest query in the run and the likeliest to be slow.
 	octx, ocancel := context.WithTimeout(ctx, o.timeout)
-	overallRaw, overallErr := c.MergePprof(octx, selector(profType, "", "", o.match), start, end)
+	overallRaw, overallErr := c.MergePprof(octx, selector(profType, "", "", o.match), qstart, qend)
 	ocancel()
 	var overall *profile.Profile
 	if overallErr == nil {

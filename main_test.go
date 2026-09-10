@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestParseTime(t *testing.T) {
@@ -223,6 +224,20 @@ type fakeQuery struct {
 	types       []*qv1.ProfileType
 	typesErr    error
 	typeCalls   atomic.Int64
+	// mergeWindows records the window every merge asked for, so a test can
+	// check that the rows and the total describe the same moment.
+	mergeWindows [][2]time.Time
+	// extraScrape gives that many series one additional scrape a few seconds
+	// after their newest, the way a restart or a backfill does. Their median
+	// gap is unchanged, so the window still spans an interval -- and holds
+	// both of those samples.
+	extraScrape int
+	// laggingSeries makes that many of the series stop scraping a couple of
+	// intervals before the rest, the way a target that went away does.
+	laggingSeries int
+	// multiSeries makes one selector look like N scrape targets, each written
+	// at its own instant -- the shape that broke the single-profile approach.
+	multiSeries int
 	// merges answers MergePprof by selector. A selector with no entry gets an
 	// empty pprof, which is what Parca returns for a window with no samples.
 	merges    map[string]*profile.Profile
@@ -607,7 +622,30 @@ func cpuProfile(t *testing.T, samples int64) *profile.Profile {
 }
 
 func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.CallOption) (*qv1.QueryResponse, error) {
-	sel := in.GetMerge().GetQuery()
+	// A merge and a single-profile fetch name their selector in different
+	// places, and they fold together different things:
+	//
+	//   MODE_SINGLE at t -> the ONE series written at t. Not a group total.
+	//   MODE_MERGE       -> every series x every profile in the window.
+	//
+	// A fake that scaled both the same way made the tests unable to tell the
+	// approaches apart, which is how a vacuous test slipped through twice.
+	sel := in.GetSingle().GetQuery()
+	factor := 1
+	if m := in.GetMerge(); m.GetQuery() != "" {
+		sel = m.GetQuery()
+		// Count the profiles that actually fall inside the requested window,
+		// per series. Multiplying a per-series count by the number of series
+		// assumed every series is always in the window, so a window that
+		// excluded one could not be detected.
+		factor = 0
+		for s := 0; s < f.seriesCount(); s++ {
+			factor += len(f.scrapeTimes(s, m.GetStart().AsTime(), m.GetEnd().AsTime()))
+		}
+		f.mergeMu.Lock()
+		f.mergeWindows = append(f.mergeWindows, [2]time.Time{m.GetStart().AsTime(), m.GetEnd().AsTime()})
+		f.mergeMu.Unlock()
+	}
 	f.mergeMu.Lock()
 	if f.mergeCalls == nil {
 		f.mergeCalls = map[string]int{}
@@ -647,6 +685,12 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 	p := f.merges[sel]
 	if p == nil {
 		return &qv1.QueryResponse{}, nil // no samples in this window
+	}
+	if factor == 0 {
+		return &qv1.QueryResponse{}, nil // window holds no profile for this series
+	}
+	if factor > 1 {
+		p = scaleProfile(p, int64(factor))
 	}
 	var buf bytes.Buffer
 	if err := p.Write(&buf); err != nil {
@@ -2883,5 +2927,513 @@ func TestLooksTransient(t *testing.T) {
 	}
 	if looksTransient(nil) {
 		t.Error("nil is not a failure")
+	}
+}
+
+// snapshotTime is when the fake pretends its non-delta profiles were written.
+// A date safely in the past, so a window built from it can never overlap the
+// time.Now() windows the other tests use and the two cannot interfere.
+var snapshotTime = time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+
+// QueryRange answers "when were there profiles for this selector". The real
+// server returns one sample per profile; the fake returns one sample for any
+// selector it has a profile for, so the snapshot path has a timestamp to fetch.
+func (f *fakeQuery) QueryRange(ctx context.Context, in *qv1.QueryRangeRequest, _ ...grpc.CallOption) (*qv1.QueryRangeResponse, error) {
+	sel := in.GetQuery()
+	if err := f.mergeErrs[sel]; err != nil {
+		return nil, err
+	}
+	if f.merges[sel] == nil {
+		// The real Parca answers NotFound here, not an empty response --
+		// unlike Merge, which answers OK with an empty pprof. Mirrored so the
+		// tests exercise the asymmetry the client has to absorb.
+		return nil, status.Error(codes.NotFound,
+			"No data found for the query, try a different query or time range or no data has been written to be queried yet.")
+	}
+	// Timestamps come from the same helper the merge counts, so the two
+	// cannot contradict each other. An earlier version reported a single
+	// timestamp regardless, which let the client infer "no interval" while
+	// the merge still multiplied by the scrape count: the fake contradicted
+	// itself and the test that mattered could not fail.
+	var series []*qv1.MetricsSeries
+	for s := 0; s < f.seriesCount(); s++ {
+		times := f.scrapeTimes(s, in.GetStart().AsTime(), in.GetEnd().AsTime())
+		if len(times) == 0 {
+			continue
+		}
+		samples := make([]*qv1.MetricsSample, 0, len(times))
+		for _, at := range times {
+			samples = append(samples, &qv1.MetricsSample{Timestamp: timestamppb.New(at)})
+		}
+		series = append(series, &qv1.MetricsSeries{Samples: samples})
+	}
+	if len(series) == 0 {
+		return nil, status.Error(codes.NotFound,
+			"No data found for the query, try a different query or time range or no data has been written to be queried yet.")
+	}
+	return &qv1.QueryRangeResponse{Series: series}, nil
+}
+
+func (f *fakeQuery) seriesCount() int {
+	if f.multiSeries < 1 {
+		return 1
+	}
+	return f.multiSeries
+}
+
+// fakeScrapeTimes lists when series s was scraped inside [start, end], oldest
+// first.
+//
+// Targets are staggered ACROSS the interval, the way Parca spreads scrape
+// targets by a hash of the target. A fake that put every series within a
+// second of the others could not show a merge window dropping half of them,
+// which is exactly the bug that hid behind the old one.
+func (f *fakeQuery) scrapeTimes(s int, start, end time.Time) []time.Time {
+	// Scrapes run up to the end of whatever window is asked for -- what a
+	// live server looks like -- except in the snapshot fixtures, whose newest
+	// profile is snapshotTime.
+	anchor := end
+	if !snapshotTime.Before(start) && !snapshotTime.After(end) {
+		anchor = snapshotTime
+	}
+	seriesCount := f.seriesCount()
+	offset := time.Duration(s) * fakeScrapeInterval / time.Duration(seriesCount)
+	// A target that stopped scraping a while back: its newest sample is
+	// several intervals old, so a one-interval window cannot reach it.
+	if s >= seriesCount-f.laggingSeries {
+		offset += 3 * fakeScrapeInterval
+	}
+	var out []time.Time
+	for at := anchor.Add(-offset); !at.Before(start); at = at.Add(-fakeScrapeInterval) {
+		if at.After(end) {
+			continue
+		}
+		out = append(out, at)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	if s < f.extraScrape && len(out) > 0 {
+		extra := out[len(out)-1].Add(-5 * time.Second)
+		if !extra.Before(start) {
+			out = append(out[:len(out)-1], extra, out[len(out)-1])
+		}
+	}
+	return out
+}
+
+// fakeScrapeInterval is how often the fake pretends profiles were written, so
+// a merge over a window can sum the right number of them.
+const fakeScrapeInterval = time.Minute
+
+// scaleProfile multiplies every sample value, the way summing N profiles of
+// the same shape would.
+func scaleProfile(p *profile.Profile, n int64) *profile.Profile {
+	out := p.Copy()
+	for _, s := range out.Sample {
+		for i := range s.Value {
+			s.Value[i] *= n
+		}
+	}
+	return out
+}
+
+func TestIsDeltaType(t *testing.T) {
+	for _, s := range []string{
+		"parca_agent:samples:count:cpu:nanoseconds:delta",
+		"parca_agent:wallclock:nanoseconds:samples:count:delta",
+	} {
+		if !isDeltaType(s) {
+			t.Errorf("%q is a delta", s)
+		}
+	}
+	// Every non-delta type this server offers. Each is a level, not an
+	// accumulation, so none may be merged across scrapes.
+	for _, s := range []string{
+		"memory:inuse_space:bytes:space:bytes",
+		"memory:inuse_objects:count:space:bytes",
+		"memory:alloc_space:bytes:space:bytes",
+		"memory:alloc_objects:count:space:bytes",
+		"goroutine:goroutine:count:goroutine:count",
+		"mutex:contentions:count:contentions:count",
+		"block:contentions:count:contentions:count",
+	} {
+		if isDeltaType(s) {
+			t.Errorf("%q is not a delta", s)
+		}
+	}
+}
+
+// The bug this guards, measured against a real server: inuse_space read
+// 20.8 MiB over a 1-minute window and 386.9 MiB over 20 minutes, because the
+// merge summed ~19 scrapes of a level. A snapshot must not depend on how wide
+// the window is.
+func TestSnapshotProfileDoesNotScaleWithWindow(t *testing.T) {
+	newFixture := func() *fakeQuery {
+		f := reportFixture(t)
+		f.types = profileTypesFrom([]string{heapType})
+		f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 20<<20)
+		f.merges[heapType] = heapProfile(t, 20<<20)
+		return f
+	}
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+
+	end := snapshotTime.Add(time.Minute)
+	var oneMin, twentyMin string
+	oneMin = captureStdout(t, func() {
+		if err := report(context.Background(), testClient(newFixture(), time.Minute), o,
+			end.Add(-1*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	twentyMin = captureStdout(t, func() {
+		if err := report(context.Background(), testClient(newFixture(), time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	get := func(out string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(l, "tc") {
+				return strings.Join(strings.Fields(l)[1:], " ")
+			}
+		}
+		return ""
+	}
+	if get(oneMin) == "" {
+		t.Fatalf("no tc row:\n%s", oneMin)
+	}
+	if get(oneMin) != get(twentyMin) {
+		t.Errorf("a snapshot must not depend on window width:\n 1m: %s\n20m: %s",
+			get(oneMin), get(twentyMin))
+	}
+	// And it must be the real value, not a multiple of it.
+	if !strings.Contains(get(oneMin), "20.0 MiB") {
+		t.Errorf("want the profile's own value, got %s", get(oneMin))
+	}
+}
+
+// A delta still merges the window -- that is what makes CORES over an hour
+// mean anything, and the fix must not break it.
+func TestDeltaProfileStillMergesTheWindow(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	o := testOptions()
+	o.top = 0
+
+	// 100 samples x 10ms = 1 CPU-second. Over 10s that is 0.100 cores.
+	out := captureStdout(t, func() {
+		end := time.Now()
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-10*time.Second), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "0.100") {
+		t.Errorf("delta should still be a rate over the window:\n%s", out)
+	}
+}
+
+// The report has to say which moment a snapshot describes, or the heading's
+// window implies the numbers cover it.
+func TestSnapshotReportsItsOwnTimestamp(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 20<<20)
+	f.merges[heapType] = heapProfile(t, 20<<20)
+	o := testOptions()
+	o.profileType, o.top, o.output = heapType, 0, outputJSON
+
+	end := snapshotTime.Add(5 * time.Minute)
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	d := decodeReport(t, out)
+	if d.Delta {
+		t.Error("a heap profile is not a delta")
+	}
+	if d.SnapshotAt == nil {
+		t.Fatal("a snapshot must name the profile it came from")
+	}
+	if !d.SnapshotAt.Equal(snapshotTime) {
+		t.Errorf("snapshot_at = %v, want %v", d.SnapshotAt, snapshotTime)
+	}
+}
+
+// A delta has no single moment, so the field stays null rather than inventing
+// one.
+func TestDeltaHasNoSnapshotTimestamp(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	o := testOptions()
+	o.top, o.output = 0, outputJSON
+
+	out := captureStdout(t, func() {
+		end := time.Now()
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-10*time.Second), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	d := decodeReport(t, out)
+	if !d.Delta {
+		t.Error("the CPU profile is a delta")
+	}
+	if d.SnapshotAt != nil {
+		t.Errorf("a merged window has no single timestamp, got %v", d.SnapshotAt)
+	}
+}
+
+// The bug this guards: routing snapshots through QueryRange made every group
+// without a profile look like a failed query, because QueryRange answers
+// NotFound where Merge answers OK-with-nothing. In the run that caught it, 7
+// of 8 instances were reported as failures when they simply had no heap
+// profile -- the exact empty-vs-failed confusion this tool exists to prevent.
+func TestSnapshotGroupsWithNoDataAreEmptyNotFailed(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.values["cluster"] = []string{"tc", "vps"}
+	// Only tc has a heap profile; vps has none at all.
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 20<<20)
+	f.merges[heapType] = heapProfile(t, 20<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+
+	var err error
+	end := snapshotTime.Add(time.Minute)
+	out := captureStdout(t, func() {
+		err = report(context.Background(), testClient(f, time.Minute), o, end.Add(-time.Minute), end)
+	})
+	if err != nil {
+		t.Fatalf("a group with no profile is not a failure: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "INCOMPLETE") || strings.Contains(out, "FAILED") {
+		t.Errorf("no query failed, so no banner:\n%s", out)
+	}
+	if !strings.Contains(out, "no samples in this window") {
+		t.Errorf("the empty group should be counted and omitted:\n%s", out)
+	}
+	if !strings.Contains(out, "20.0 MiB") {
+		t.Errorf("the group that has data should still be reported:\n%s", out)
+	}
+}
+
+// The bug this guards: a merge sums across BOTH time and series, and fetching
+// one profile fixes the first while breaking the second. A selector usually
+// matches several series, each written at its own instant, so one instant
+// returns one series. Measured: --by=job over eight scrape targets reported
+// 3.0 MiB while a single instance in the same period was 18 MiB -- a total
+// smaller than one of its parts.
+func TestSnapshotSumsAcrossSeriesNotAcrossTime(t *testing.T) {
+	// Three series, each scraped once a minute, each holding 10 MiB. The
+	// group total must be 30 MiB whatever the window -- never 10 (one
+	// series) and never 30 x scrapes.
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.multiSeries = 3
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 10<<20)
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+
+	// The three targets are staggered across the scrape interval, as Parca
+	// spreads them, so the window has to reach back past the oldest of the
+	// three newest scrapes for all of them to be in it at all.
+	for _, window := range []time.Duration{2 * time.Minute, 20 * time.Minute} {
+		end := snapshotTime.Add(10 * time.Second)
+		out := captureStdout(t, func() {
+			if err := report(context.Background(), testClient(f, time.Minute), o,
+				end.Add(-window), end); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if !strings.Contains(out, "30.0 MiB") {
+			t.Errorf("window %s: want 30.0 MiB (3 series x 10 MiB), got:\n%s", window, out)
+		}
+	}
+}
+
+// Every group and the total have to describe the same moment. Letting each
+// derive its own window gave rows summing to 150% of a total smaller than its
+// own parts: an instance that stopped scraping was reported at its last known
+// heap while the total, correctly, left it out.
+func TestSnapshotGroupsAndTotalShareOneWindow(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.multiSeries = 3
+	for _, g := range []string{"tc", "vps"} {
+		f.merges[heapType+`{cluster="`+g+`"}`] = heapProfile(t, 10<<20)
+	}
+	f.merges[heapType] = heapProfile(t, 20<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	if err := report(context.Background(), testClient(f, time.Minute), o,
+		end.Add(-20*time.Minute), end); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mergeMu.Lock()
+	defer f.mergeMu.Unlock()
+	if len(f.mergeWindows) < 3 {
+		t.Fatalf("expected a merge per group plus the unfiltered one, got %d", len(f.mergeWindows))
+	}
+	first := f.mergeWindows[0]
+	for _, w := range f.mergeWindows[1:] {
+		if !w[0].Equal(first[0]) || !w[1].Equal(first[1]) {
+			t.Fatalf("merges used different windows: %v and %v -- rows and total would describe different moments",
+				first, w)
+		}
+	}
+}
+
+// A series the window missed contributes nothing to the total. Letting it
+// vanish silently is the failure this whole change is about, one level down.
+func TestSeriesTheWindowMissedAreCounted(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	// Five targets staggered across a 60s interval, but the window is only
+	// one interval wide, and the fixture's oldest targets sit outside it.
+	f.multiSeries = 5
+	// Two of them stopped scraping a few intervals ago, so a one-interval
+	// window cannot reach them.
+	f.laggingSeries = 2
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 10<<20)
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "2 of the series matched had no scrape inside") {
+		t.Errorf("the two stopped series should be counted, not dropped silently:\n%s", out)
+	}
+}
+
+// The interval is a median, so a series that really did scrape twice inside
+// one median gap gets counted twice. Rare, but the number is then wrong, and
+// a wrong number that looks right is the thing this tool refuses.
+func TestSeriesCountedTwiceAreSaidOutLoud(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.multiSeries = 3
+	// One of them scraped again five seconds after its newest.
+	f.extraScrape = 1
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 10<<20)
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "1 of the series matched had more than one scrape") {
+		t.Errorf("the doubled series should be named, not folded into the total:\n%s", out)
+	}
+	// Three series at 10 MiB with one of them folded twice: 40 MiB, not 30.
+	// Without this the note could be printed over a total that was never
+	// doubled, which is what the fake used to do.
+	if !strings.Contains(out, "40.0 MiB") {
+		t.Errorf("the doubled series should actually be in the total twice:\n%s", out)
+	}
+}
+
+// A window that reached none of the series is not an idle cluster, and the
+// two have to look different. This is the run the counting exists for.
+func TestACollapsedWindowStillNamesTheMissedSeries(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.multiSeries = 3
+	// Two of the three stopped scraping a few intervals ago, so the window
+	// cannot reach them. No group has anything, which is the page this test
+	// is about -- and the two missed series are why.
+	f.laggingSeries = 2
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end)
+	})
+	if !strings.Contains(out, "no scrape inside") {
+		t.Errorf("an empty report must still say the window missed the series:\n%s", out)
+	}
+	if !strings.Contains(out, "newest scrape per series") {
+		t.Errorf("the heading should still say what was being asked for:\n%s", out)
+	}
+}
+
+func TestLatestAndInterval(t *testing.T) {
+	base := time.Date(2026, 9, 10, 2, 0, 0, 0, time.UTC)
+	// Two series, 60s apart within each, offset from one another -- which is
+	// what different scrape targets look like.
+	times := [][]time.Time{
+		{base, base.Add(60 * time.Second), base.Add(120 * time.Second)},
+		{base.Add(7 * time.Second), base.Add(67 * time.Second)},
+	}
+	latest, interval := latestAndInterval(times)
+	if want := base.Add(120 * time.Second); !latest.Equal(want) {
+		t.Errorf("latest = %v, want %v", latest, want)
+	}
+	if interval != 60*time.Second {
+		t.Errorf("interval = %v, want 60s", interval)
+	}
+
+	// A gap in the middle must not widen the estimate, or the window would
+	// pull in two scrapes per series.
+	gappy := [][]time.Time{{base, base.Add(60 * time.Second), base.Add(600 * time.Second)}}
+	if _, iv := latestAndInterval(gappy); iv != 60*time.Second {
+		t.Errorf("interval = %v, want 60s: one long gap must not widen the estimate", iv)
+	}
+
+	// One close-together pair -- a restart, a backfill, a scrape that ran
+	// early -- must not collapse the window for the whole fleet. Taking the
+	// smallest gap outright cut a three-target total to one target.
+	outlier := [][]time.Time{
+		{base, base.Add(5 * time.Second), base.Add(65 * time.Second), base.Add(125 * time.Second)},
+	}
+	if _, iv := latestAndInterval(outlier); iv != 60*time.Second {
+		t.Errorf("interval = %v, want 60s: one short gap should not set the window", iv)
+	}
+
+	// A newly-started target, or one that just restarted, has two timestamps
+	// close together: one gap, so its own median IS that gap. Taking the
+	// smallest of the per-series medians let it collapse the window for
+	// everyone else.
+	newTarget := [][]time.Time{
+		{base, base.Add(60 * time.Second), base.Add(120 * time.Second)},
+		{base.Add(3 * time.Second), base.Add(63 * time.Second), base.Add(123 * time.Second)},
+		{base.Add(115 * time.Second), base.Add(120 * time.Second)},
+	}
+	if _, iv := latestAndInterval(newTarget); iv != 60*time.Second {
+		t.Errorf("interval = %v, want 60s: one short series should not set the fleet's window", iv)
+	}
+
+	// One profile per series: nothing to infer, and the caller then merges
+	// the window, which already holds at most one profile per series.
+	single := [][]time.Time{{base}, {base.Add(3 * time.Second)}}
+	if _, iv := latestAndInterval(single); iv != 0 {
+		t.Errorf("interval = %v, want 0 with nothing to measure", iv)
 	}
 }

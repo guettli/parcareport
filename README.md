@@ -280,13 +280,97 @@ label "cluster" exists in <window> but returned no values, which is contradictor
 The third one is real: a retry once produced values for the very label the
 previous run had just declared empty.
 
+### Snapshot profiles are not merged
+
+A CPU profile is a **delta**: the values accumulate, so merging every profile
+in the window is exactly what makes `CORES` over an hour mean something.
+
+The other profile types are **levels** — live heap, a goroutine count,
+allocations since process start. Merging those sums the level once per scrape,
+so the answer grows with the window rather than describing anything:
+
+```
+$ parcareport --profile-type=inuse_space --by=instance --from=-1m
+10.0.0.1:6060   20.8 MiB      # 1 scrape
+$ parcareport --profile-type=inuse_space --by=instance --from=-20m
+10.0.0.1:6060  386.9 MiB      # ~19 scrapes of the same 20 MiB
+```
+
+That process's entire RSS was 117 MiB, so the second number was impossible.
+The nasty part is that it does not look wrong — it looks like a service with a
+big heap.
+
+A merge sums across **two** axes, though, and only one of them is wrong here.
+Summing across *time* multiplies a level by the scrape count. Summing across
+*series* is what makes a group total a total — a selector usually matches
+several scrape targets, and you want all of them.
+
+Reading a single profile fixes the first and breaks the second, because each
+target is written at its own instant, so one instant returns one target. That
+under-reported `--by=job` across eight targets as 3.0 MiB when one instance
+alone was 18 MiB — a total smaller than one of its parts.
+
+So a non-delta type is merged over **one scrape interval**, ending at the
+newest profile. The interval is inferred from the spacing of the timestamps
+the tool already fetches. That sums every series while summing at most one
+profile from each:
+
+```
+--by=job, 1-minute window   2.0 GiB   (newest scrape ending 02:00:52Z)
+--by=job, 20-minute window  1.6 GiB   (newest scrape ending 02:19:52Z)
+```
+
+Same magnitude across a twentyfold change in window, and the difference is
+real: the second reading is twenty minutes later, and the heap had shrunk.
+
+The window is `(newest - interval, newest]`, not the newest instant plus and
+minus half an interval. `newest` is the most recent timestamp anywhere in the
+selector, so nothing exists after it: centring on it would spend half the
+width on empty space and drop every series whose own newest scrape is more
+than half an interval older than the newest of all. Parca staggers scrape
+targets across the interval, so that can be about half of them.
+
+The heading says what the numbers describe, and it is not one instant — each
+series contributes its own newest scrape:
+
+```
+memory:inuse_space:bytes:space:bytes  newest scrape per series, ending 2026-09-10T02:19:52Z  (looked in 2026-09-10T02:00:00Z .. 2026-09-10T02:20:00Z)
+```
+
+The interval is each series' median gap, then the smallest of those medians.
+Not the smallest gap outright: one close-together pair anywhere — an agent
+restart, a backfill, a scrape that ran early — would collapse the window for
+the whole fleet, and almost nothing would fall inside it. A median ignores one
+outlier.
+
+That leaves two ways a series can be misrepresented, and both are counted
+rather than folded silently into the number:
+
+```
+(2 of the series matched had no scrape inside the one-interval window, so they are missing from these numbers)
+(1 of the series matched had more than one scrape inside the window, so they are counted more than once)
+```
+
+In `--output=json` those are `stale_series` and `doubled_series`, both omitted
+when zero.
+
+In `--output=json`, `delta` says which kind of profile it was and
+`snapshot_at` names the newest scrape it reached — `null` for a delta, where the window really
+was merged.
+
+Widening the window on a snapshot profile therefore reaches further back for a
+profile to read; it does not accumulate more. If nothing was scraped in the
+window at all, that is reported as no data, the same as for a delta.
+
 ### Measuring before and after a change
 
 Use the **CPU** profile. It is a delta, so a merge over a window is a genuine
 rate. Memory profiles are **cumulative since process start** (`delta=false`),
 so comparing `alloc_space` between two processes of different ages measures
 their ages, not their allocation rates — which will make a change look
-dramatically better or worse than it was.
+dramatically better or worse than it was. That is a property of the profile
+itself, and separate from the merging problem above: reading one snapshot
+honestly still gives you a counter whose zero was process start.
 
 Sanity-check absolute numbers against `kubectl top` at least once.
 
@@ -488,6 +572,7 @@ both per section, so accepting them would silently do something else.
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--output` | `table` | `json` for a machine-readable report |
+| | | non-delta profiles are merged over one scrape interval, not the whole window |
 | `--max-group-values` | `50` | overview: skip a breakdown with more values than this; `0` disables the skip |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
 | `--concurrency` | `4` | parallel queries, within one breakdown (`overview` uses 2 unless you set it) |

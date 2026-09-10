@@ -566,6 +566,23 @@ func matchProfileType(want string, names []string) (string, error) {
 	}
 }
 
+// isDeltaType reports whether a profile type selector describes a delta.
+//
+// This is the line between "merge the window" and "pick one profile from it".
+// A delta accumulates, so summing every scrape in the window is exactly what
+// makes CORES over an hour meaningful. A non-delta is a level -- live heap, a
+// goroutine count, allocations since process start -- and summing N scrapes of
+// a level reports N times the level. Measured against a real server:
+// agentloop's inuse_space read 20.8 MiB over a 1-minute window and 386.9 MiB
+// over 20 minutes, for a process whose entire RSS was 117 MiB.
+//
+// Parca encodes it in the selector's last field, which is how
+// ProfileTypeNames builds the string.
+func isDeltaType(selector string) bool {
+	parts := strings.Split(selector, ":")
+	return len(parts) == 6 && parts[5] == "delta"
+}
+
 // cpuDeltaTypes finds the on-CPU delta profiles among the server's types.
 //
 // The period type carries the meaning: parca-agent's CPU profile is

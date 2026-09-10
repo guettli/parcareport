@@ -30,12 +30,25 @@ func renderTable(d *reportData) {
 	// Otherwise an idle window produced a completely empty stdout, which is
 	// the shape this codebase refuses everywhere else: no record of what was
 	// even asked.
-	fmt.Printf("%s  %s .. %s  (%s)\n\n",
-		d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
-		d.window.Round(time.Second))
+	// A snapshot's numbers describe the newest scrape of each series, not the
+	// window. Saying only the window would imply they cover it -- which is
+	// exactly the reading that made a 20-minute heap query look like 20x the
+	// live heap. Nor is it one instant: the series are scraped at their own
+	// times, so this is the newest of each, ending at the newest of all.
+	if d.SnapshotAt != nil {
+		fmt.Printf("%s  newest scrape per series, ending %s  (looked in %s .. %s)\n\n",
+			d.ProfileType, d.SnapshotAt.Format("2006-01-02T15:04:05Z"),
+			d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"))
+	} else {
+		fmt.Printf("%s  %s .. %s  (%s)\n\n",
+			d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
+			d.window.Round(time.Second))
+	}
 	if d.noRows {
-		// Worth saying here most of all: this is the run where everything was
-		// asked twice and still came back with nothing.
+		// Both belong here most of all. A window that reached none of the
+		// series produces exactly this page, and so does a run where
+		// everything was asked twice and still came back with nothing.
+		printSeriesNotes(d)
 		printRetried(d)
 		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)
@@ -58,6 +71,7 @@ func renderTable(d *reportData) {
 		total = *d.Total
 	}
 	printGroupTable(strings.ToUpper(d.GroupBy), d.header, rows, total, d.knowTotal)
+	printSeriesNotes(d)
 	if d.EmptyGroups > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", d.EmptyGroups, d.GroupBy)
 	}
@@ -141,6 +155,20 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 		d.Error = err.Error()
 	}
 	_ = renderJSON(d)
+}
+
+// printSeriesNotes says which series the snapshot window did not describe
+// properly. It reports what was measured -- how many scrapes of each series
+// landed inside the window -- not a guess at why.
+func printSeriesNotes(d *reportData) {
+	if d.StaleSeries > 0 {
+		fmt.Printf("(%d of the series matched had no scrape inside the one-interval window, so they are missing from these numbers)\n",
+			d.StaleSeries)
+	}
+	if d.DoubledSeries > 0 {
+		fmt.Printf("(%d of the series matched had more than one scrape inside the window, so they are counted more than once)\n",
+			d.DoubledSeries)
+	}
 }
 
 // plural picks the wording for a count, so messages do not say "1 queries".
