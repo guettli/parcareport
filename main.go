@@ -153,7 +153,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end, o.concurrency)
+		return listLabels(ctx, c, subArg, start, end, o.concurrency, o.timeout)
 	case "overview":
 		if subArg != "" {
 			return fmt.Errorf("overview takes no argument, got %q", subArg)
@@ -283,9 +283,11 @@ func runContext(o options) (context.Context, context.CancelFunc, error) {
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int) error {
+func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int, timeout time.Duration) error {
 	if name != "" {
-		vals, err := c.LabelValues(ctx, name, start, end)
+		// One dropped stream kills this whole command, so it gets the same
+		// single retry as a group merge.
+		vals, err := labelValues(ctx, c, timeout, name, start, end)
 		if err != nil {
 			return err
 		}

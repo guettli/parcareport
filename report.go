@@ -145,7 +145,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			return nil, err
 		}
 	}
-	groups, err := labelValues(ctx, c, o, o.by, start, end)
+	groups, err := labelValues(ctx, c, o.timeout, o.by, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +170,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		Failed:       []failJSON{},
 	}
 
-	results := mergeGroups(ctx, c, o, profType, groups, start, end, window,
-		max(1, o.concurrency), "merging", o.by+" groups")
+	results := mergeGroups(ctx, c, o, profType, groups, start, end, window)
 
 	// A dropped stream is the server going away mid-answer, not the query
 	// being wrong, and it is transient. Ask again -- but only for the groups
@@ -182,19 +181,36 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// Once each. A second failure keeps the first error rather than replacing
 	// it with a less informative one, and there is no third attempt: past
 	// that, retrying is just the same load again.
-	//
-	// The budget is re-checked before every one of them. Checking once would
-	// let a section with fifteen dropped groups start a retry that eats the
-	// whole --deadline and leaves every later section failing -- the retry
-	// would then have made the run worse than no retry at all.
-	for _, idx := range transientGroups(results) {
-		if !budgetLeftFor(ctx, o.timeout) {
-			break
+	if again := transientGroups(results); len(again) > 0 {
+		// Half of what is left, at most. Checking only "is there room for one
+		// more" let a section with fifteen dropped groups keep passing the
+		// check until the budget was nearly gone, and every later section
+		// then failed on the deadline -- the retry made the run worse than no
+		// retry. Sections share one --deadline, so this one has to leave
+		// something behind for the rest.
+		var until time.Time
+		if dl, ok := ctx.Deadline(); ok {
+			until = time.Now().Add(time.Until(dl) / 2)
 		}
-		if again := mergeOne(ctx, c, o, profType, groups[idx], start, end, window); again.err == nil {
-			results[idx] = again
+		// Up to --timeout each, one after another: without a line on stderr
+		// this is minutes of silence after the merging bar has cleared, and
+		// "still retrying" and "hung" look identical.
+		prog := newProgress("retrying", o.by+" groups", len(again))
+		prog.start()
+		for _, idx := range again {
+			if !budgetLeftFor(ctx, o.timeout) {
+				break
+			}
+			if !until.IsZero() && time.Now().After(until) {
+				break
+			}
+			if r := mergeOne(ctx, c, o, profType, groups[idx], start, end, window); r.err == nil {
+				results[idx] = r
+			}
+			d.Retried++
+			prog.step()
 		}
-		d.Retried++
+		prog.stop()
 	}
 
 	// Checked once, after every attempt: if the run's budget went while those
@@ -406,17 +422,17 @@ type groupResult struct {
 // mergeGroups merges one profile per label value, up to concurrency at a time,
 // and returns a result per group in the order given.
 func mergeGroups(ctx context.Context, c *Client, o options, profType string, groups []string,
-	start, end time.Time, window time.Duration, concurrency int, verb, label string) []groupResult {
+	start, end time.Time, window time.Duration) []groupResult {
 	results := make([]groupResult, len(groups))
 
 	// A run can take minutes. With no output at all, "still merging" and
 	// "hung" look identical -- and with the default --timeout the first thing
 	// you saw could be an error after a minute of silence.
-	prog := newProgress(verb, label, len(groups))
+	prog := newProgress("merging", o.by+" groups", len(groups))
 	prog.start()
 	defer prog.stop()
 
-	sem := make(chan struct{}, max(1, concurrency))
+	sem := make(chan struct{}, max(1, o.concurrency))
 	var wg sync.WaitGroup
 	for i, g := range groups {
 		wg.Add(1)
@@ -480,10 +496,17 @@ func budgetLeftFor(ctx context.Context, timeout time.Duration) bool {
 // labelValues lists a label's values, asking again once if the server dropped
 // the answer. Losing this one costs the whole report rather than one group:
 // there is nothing left to break anything down by.
-func labelValues(ctx context.Context, c *Client, o options, by string, start, end time.Time) ([]string, error) {
+func labelValues(ctx context.Context, c *Client, timeout time.Duration, by string, start, end time.Time) ([]string, error) {
 	vals, err := c.LabelValues(ctx, by, start, end)
-	if err != nil && looksTransient(err) && budgetLeftFor(ctx, o.timeout) {
-		return c.LabelValues(ctx, by, start, end)
+	if err == nil || !looksTransient(err) || !budgetLeftFor(ctx, timeout) {
+		return vals, err
 	}
-	return vals, err
+	// Keep the first error if the second attempt fails too. A deadline that
+	// expired during the retry would otherwise replace the RST_STREAM that
+	// explains the failure with a "context deadline exceeded" that does not.
+	again, againErr := c.LabelValues(ctx, by, start, end)
+	if againErr != nil {
+		return vals, err
+	}
+	return again, nil
 }

@@ -284,19 +284,23 @@ func (f *fakeQuery) Values(ctx context.Context, in *qv1.ValuesRequest, _ ...grpc
 		case <-time.After(f.valuesDelay):
 		}
 	}
-	if err := f.valuesErrFor[in.GetLabelName()]; err != nil {
-		return nil, err
-	}
-	// A label whose first lookups drop the stream, then works: the shape of a
-	// server that is briefly out of room, not one that is broken.
+	// A label whose first lookups drop the stream: the shape of a server
+	// briefly out of room, not one that is broken. Checked before
+	// valuesErrFor, so a test can make the first attempt transient and the
+	// second fail some other way.
 	f.mergeMu.Lock()
-	if n := f.valuesFailFirst[in.GetLabelName()]; n > 0 {
-		f.valuesFailFirst[in.GetLabelName()] = n - 1
-		f.mergeMu.Unlock()
+	dropped := f.valuesFailFirst[in.GetLabelName()] > 0
+	if dropped {
+		f.valuesFailFirst[in.GetLabelName()]--
+	}
+	f.mergeMu.Unlock()
+	if dropped {
 		return nil, status.Error(codes.Internal,
 			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
 	}
-	f.mergeMu.Unlock()
+	if err := f.valuesErrFor[in.GetLabelName()]; err != nil {
+		return nil, err
+	}
 	if f.valuesErr != nil {
 		return nil, f.valuesErr
 	}
@@ -373,7 +377,7 @@ func TestExplainNoValuesDistinguishesTheReasons(t *testing.T) {
 // `parcareport labels typo` used to print nothing and exit 0.
 func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
 	c := testClient(&fakeQuery{names: []string{"node"}}, 0)
-	err := listLabels(context.Background(), c, "cluster", time.Now().Add(-time.Hour), time.Now(), 4)
+	err := listLabels(context.Background(), c, "cluster", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
 	if err == nil {
 		t.Fatal("an unknown label must not look like an empty success")
 	}
@@ -904,7 +908,7 @@ func TestListLabelsSurvivesOneFailingLabel(t *testing.T) {
 
 	var err error
 	out := captureStdout(t, func() {
-		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4)
+		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
 	})
 
 	if err == nil {
@@ -932,7 +936,7 @@ func TestListLabelsKeepsRowsWithTheirLabelsUnderContention(t *testing.T) {
 		valuesDelay: 2 * time.Millisecond,
 	}
 	out := captureStdout(t, func() {
-		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 1); err != nil {
+		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 1, time.Minute); err != nil {
 			t.Error(err)
 		}
 	})
@@ -1000,7 +1004,7 @@ func TestMatchProfileTypeRefusesToGuess(t *testing.T) {
 func TestListLabelsToleratesZeroConcurrency(t *testing.T) {
 	f := &fakeQuery{names: []string{"a", "b"}, values: map[string][]string{"a": {"av"}, "b": {"bv"}}}
 	out := captureStdout(t, func() {
-		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 0); err != nil {
+		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 0, time.Minute); err != nil {
 			t.Error(err)
 		}
 	})
@@ -1113,7 +1117,7 @@ func TestLabelFailuresGetMetadataAdviceNotMergeAdvice(t *testing.T) {
 	}
 	var err error
 	out := captureStdout(t, func() {
-		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4)
+		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
 	})
 	if err == nil {
 		t.Fatal("want a non-zero exit")
@@ -2731,6 +2735,74 @@ func TestTheRetryStopsWhenTheBudgetRunsOut(t *testing.T) {
 	// checked once, all six are attempted anyway.
 	if strings.Contains(out, "6 cluster queries were asked again") {
 		t.Errorf("every group was retried despite the budget running out:\n%s", out)
+	}
+	if !strings.Contains(out, "asked again") {
+		t.Errorf("some groups should still have been retried:\n%s", out)
+	}
+}
+
+// `parcareport labels <name>` is one query. Losing it kills the whole command,
+// so it is the last place that should go without the retry.
+func TestListingOneLabelsValuesIsRetried(t *testing.T) {
+	f := reportFixture(t)
+	f.valuesFailFirst = map[string]int{"cluster": 1}
+
+	out := captureStdout(t, func() {
+		if err := listLabels(context.Background(), testClient(f, time.Minute), "cluster",
+			time.Now().Add(-time.Hour), time.Now(), 4, time.Minute); err != nil {
+			t.Fatalf("a dropped lookup should be retried, not fatal: %v", err)
+		}
+	})
+	if !strings.Contains(out, "tc") {
+		t.Errorf("the values should have been listed after the retry:\n%s", out)
+	}
+}
+
+// The retry exists to surface the dropped stream. Replacing that error with
+// whatever the second attempt hit throws away the diagnostic.
+func TestAFailedRetryKeepsTheFirstError(t *testing.T) {
+	f := reportFixture(t)
+	// Both attempts drop the stream; the second one is what a run whose
+	// deadline expired mid-retry would report instead.
+	f.valuesFailFirst = map[string]int{"cluster": 1}
+	f.valuesErrFor = map[string]error{"cluster": context.DeadlineExceeded}
+
+	_, err := labelValues(context.Background(), testClient(f, time.Minute), time.Minute,
+		"cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("both attempts failed, so this should be an error")
+	}
+	if !strings.Contains(err.Error(), "RST_STREAM") {
+		t.Errorf("want the first error (the dropped stream), got: %v", err)
+	}
+}
+
+// Sections share one --deadline. A section with many dropped groups that
+// retried until the budget was nearly gone left the later sections nothing,
+// so the retry made the run worse than no retry at all.
+func TestTheRetryPassLeavesBudgetForWhatComesNext(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	for _, g := range f.values["cluster"] {
+		f.merges[testType+`{cluster="`+g+`"}`] = cpuProfile(t, 10)
+	}
+	f.merges[testType] = cpuProfile(t, 80)
+	f.failFirstN = 8
+	f.mergeDelay = 100 * time.Millisecond
+
+	o := testOptions()
+	o.top, o.timeout = 0, 40*time.Millisecond
+	// A full second: every single retry passes "is there room for one more",
+	// so only the cap on the pass as a whole can stop it.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	out := captureStdout(t, func() {
+		start := time.Now().Add(-time.Hour)
+		_ = report(ctx, testClient(f, time.Minute), o, start, time.Now())
+	})
+	if strings.Contains(out, "8 cluster queries were asked again") {
+		t.Errorf("the retry pass spent the whole budget:\n%s", out)
 	}
 	if !strings.Contains(out, "asked again") {
 		t.Errorf("some groups should still have been retried:\n%s", out)

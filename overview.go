@@ -119,7 +119,7 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			// The same dropped stream that costs a merge costs a label
 			// lookup, and losing one here costs the whole section rather
 			// than one group, so labelValues asks again once.
-			vals, err := labelValues(ctx, c, o, by, start, end)
+			vals, err := labelValues(ctx, c, o.timeout, by, start, end)
 			if err != nil {
 				lookupFailed = true
 				d.Skipped = append(d.Skipped, skippedJSON{
