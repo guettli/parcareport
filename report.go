@@ -65,6 +65,9 @@ type reportData struct {
 	sortKey    sortKey
 	noRows     bool
 	banner     string
+	// runExpired says the run's --deadline is what cut the queries short, so
+	// the advice names --deadline instead of --timeout.
+	runExpired bool
 	// groupsSum is the sum of the labelled groups. It is what the fallback
 	// row shows when there is no measured total, and it is NOT the total:
 	// it omits every series carrying no group-by label.
@@ -124,9 +127,19 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	if err != nil {
 		return nil, err
 	}
-	profType, typeVerified, err := resolveProfileType(ctx, c, o.profileType)
-	if err != nil {
-		return nil, err
+	// A caller that already resolved the type passes it in. overview does:
+	// it reads the type list once, picks per section from that list, and used
+	// to make gatherReport re-fetch and re-validate the list for every
+	// section -- four redundant ProfileTypes calls, four copies of the same
+	// warning when the lookup failed, and profile_type_verified reported
+	// false for a value taken from the server's own list.
+	profType, typeVerified := o.resolvedType, true
+	if profType == "" {
+		var err error
+		profType, typeVerified, err = resolveProfileType(ctx, c, o.profileType)
+		if err != nil {
+			return nil, err
+		}
 	}
 	groups, err := c.LabelValues(ctx, o.by, start, end)
 	if err != nil {
@@ -196,6 +209,10 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	}
 	wg.Wait()
 	prog.stop()
+	// Checked once, right after the fan-out: if the run's budget went while
+	// those queries were in flight, every one of them was cut short by it.
+	runExpired := ctx.Err() != nil
+	d.runExpired = runExpired
 
 	rows := make([]Row, 0, len(results))
 	var total float64
@@ -230,7 +247,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 
 	if len(rows) == 0 {
 		d.Unit, d.Rate = unitName(groupHeader), groupRate
-		banner, err := noRows(o, groups, failed, d.EmptyGroups, profType, typeVerified)
+		banner, err := noRows(o, groups, failed, d.EmptyGroups, profType, typeVerified, ctx.Err() != nil)
 		d.noRows, d.banner = true, banner
 		d.Error = err.Error()
 		return d, err
@@ -339,7 +356,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 // It returns the banner rather than printing it. Gathering must not write to
 // stdout: in JSON mode a banner beside the document makes the whole output
 // unparseable, which is a worse failure than the one it describes.
-func noRows(o options, groups []string, failed []failure, empty int, profType string, typeVerified bool) (string, error) {
+func noRows(o options, groups []string, failed []failure, empty int, profType string, typeVerified bool, runExpired bool) (string, error) {
 	if len(failed) > 0 {
 		// They mix: some queries can fail while every survivor comes back
 		// genuinely empty. Reporting that as "all N failed" off len(failed)
@@ -355,7 +372,7 @@ func noRows(o options, groups []string, failed []failure, empty int, profType st
 				"!! the failed queries were never answered.\n",
 				len(failed), len(groups), o.by, empty)
 		}
-		b.WriteString(formatFailures(failed, mergeQuery))
+		b.WriteString(formatFailures(failed, mergeQuery, runExpired))
 		return b.String(), fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by)
 	}
 	if !typeVerified {

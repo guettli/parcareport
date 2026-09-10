@@ -203,8 +203,23 @@ That last hint matters more than it looks. A stream reset carries no gRPC
 boilerplate to strip and says nothing about what to do, yet it can take
 minutes to arrive.
 
-`--timeout` (default 60s) bounds each query so one slow group fails visibly
-instead of stalling the run. That includes the label and profile-type lookups,
+There are two clocks, and they have to be told apart. `--deadline` (default
+10m) is the budget for the whole run; `--timeout` (default 60s) bounds one
+query. Every query's clock derives from the run's, so:
+
+- **`--timeout` at or above `--deadline` is refused.** It could never fire —
+  the run's budget expires first, every outstanding query reports its own
+  deadline at the same moment, and the advice to raise `--timeout` cannot
+  work. `--deadline=0` removes the budget for a deliberately long run.
+- **`--timeout` must be positive.** Zero is not "unbounded" here: it is a
+  deadline that has already passed, so every query would fail before being
+  sent.
+- **When the run's budget is what expired**, the failure says so and points at
+  `--deadline`, rather than blaming `--timeout` for a query that may have had
+  milliseconds rather than its full allowance. One clock fired, not N.
+
+It bounds each query so one slow group fails visibly instead of stalling the
+run — including the label and profile-type lookups,
 and the unfiltered merge behind the `(unlabeled)` row — which, carrying no
 matcher at all, is the widest query in the run and was the one query with no
 bound of its own.
@@ -438,6 +453,7 @@ both per section, so accepting them would silently do something else.
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
 | `--concurrency` | `4` | parallel queries, within one breakdown |
 | `--timeout` | `60s` | per-query deadline |
+| `--deadline` | `10m` | budget for the whole run; `0` removes it |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
 | `--username` / `--password-file` | | basic auth (needs `--insecure=false`) |

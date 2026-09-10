@@ -171,7 +171,10 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 	d.Complete = true
 	for _, p := range plan {
 		so := o
-		so.profileType, so.by = p.profType, p.by
+		// The type came from the list read above, so it needs no lookup and
+		// no validation -- passing it as resolvedType skips both.
+		so.resolvedType, so.by = p.profType, p.by
+		so.profileType = p.profType
 		sd, serr := gatherReport(ctx, c, so, start, end)
 		if sd == nil {
 			// One section failing is not the whole overview failing; that is

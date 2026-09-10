@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -221,6 +222,7 @@ type fakeQuery struct {
 	valuesDelay time.Duration
 	types       []*qv1.ProfileType
 	typesErr    error
+	typeCalls   atomic.Int64
 	// merges answers MergePprof by selector. A selector with no entry gets an
 	// empty pprof, which is what Parca returns for a window with no samples.
 	merges    map[string]*profile.Profile
@@ -229,6 +231,7 @@ type fakeQuery struct {
 }
 
 func (f *fakeQuery) ProfileTypes(ctx context.Context, _ *qv1.ProfileTypesRequest, _ ...grpc.CallOption) (*qv1.ProfileTypesResponse, error) {
+	f.typeCalls.Add(1)
 	if f.typesErr != nil {
 		return nil, f.typesErr
 	}
@@ -392,7 +395,7 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 	}
 	failed = append(failed, failure{group: "instance=z", msg: "something else entirely"})
 
-	out := captureStdout(t, func() { printFailures(failed, mergeQuery) })
+	out := captureStdout(t, func() { printFailures(failed, mergeQuery, false) })
 
 	if !strings.Contains(out, "something else entirely") {
 		t.Errorf("the rare cause was hidden:\n%s", out)
@@ -407,10 +410,10 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 }
 
 func TestHintForOnlyFiresWhenItHasSomethingToSay(t *testing.T) {
-	if h := hintFor([]string{"no such label"}, mergeQuery); h != "" {
+	if h := hintFor([]string{"no such label"}, mergeQuery, false); h != "" {
 		t.Errorf("want no hint, got %q", h)
 	}
-	if h := hintFor([]string{"context deadline exceeded"}, mergeQuery); !strings.Contains(h, "--timeout") {
+	if h := hintFor([]string{"context deadline exceeded"}, mergeQuery, false); !strings.Contains(h, "--timeout") {
 		t.Errorf("want a timeout hint, got %q", h)
 	}
 }
@@ -1069,11 +1072,11 @@ func TestLabelFailuresGetMetadataAdviceNotMergeAdvice(t *testing.T) {
 // A merge failure keeps the merge advice, which is the half that can be acted
 // on by changing the query.
 func TestMergeFailuresKeepMergeAdvice(t *testing.T) {
-	h := hintFor([]string{"stream terminated by RST_STREAM"}, mergeQuery)
+	h := hintFor([]string{"stream terminated by RST_STREAM"}, mergeQuery, false)
 	if !strings.Contains(h, "--match") {
 		t.Errorf("want merge advice, got %q", h)
 	}
-	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery); strings.Contains(m, "--match") {
+	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery, false); strings.Contains(m, "--match") {
 		t.Errorf("metadata advice must not suggest --match, got %q", m)
 	}
 }
@@ -2216,5 +2219,180 @@ func TestFindHeapTypeMatchesOnParts(t *testing.T) {
 	}
 	if got := findHeapType([]string{"memory:alloc_space:bytes:space:bytes"}); got != "" {
 		t.Errorf("alloc_space is not the live heap: %q", got)
+	}
+}
+
+// The bug this guards: a hidden ten-minute budget capped every run, so
+// --timeout=600s was accepted while being exactly the ceiling. It could then
+// never fire -- the run's own clock reached every outstanding query first, and
+// 26 groups reported "context deadline exceeded" simultaneously. That reads as
+// 26 slow queries; it was one clock. Worse, the hint printed alongside said to
+// raise --timeout, which could not help.
+func TestTimeoutAtOrAboveTheDeadlineIsRejected(t *testing.T) {
+	for _, args := range [][]string{
+		{"--url=localhost:1", "--timeout=10m", "--deadline=10m"}, // equal
+		{"--url=localhost:1", "--timeout=20m", "--deadline=10m"}, // above
+		{"--url=localhost:1", "--timeout=600s"},                  // equal to the default
+	} {
+		err := run(args)
+		if err == nil {
+			t.Errorf("%v should be refused", args)
+			continue
+		}
+		for _, want := range []string{"--timeout", "--deadline", "never fire"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%v: error should mention %q, got: %v", args, want, err)
+			}
+		}
+	}
+}
+
+// runContext is where both clocks are decided, so test it directly rather
+// than inferring from run()'s error text -- which would pass even if the
+// deadline were never applied, and needs a network round trip to reach.
+func TestRunContext(t *testing.T) {
+	tests := []struct {
+		name            string
+		timeout         time.Duration
+		deadline        time.Duration
+		wantErr         string
+		wantHasDeadline bool
+	}{
+		{name: "normal", timeout: 30 * time.Second, deadline: 10 * time.Minute, wantHasDeadline: true},
+		{name: "no budget", timeout: 30 * time.Minute, deadline: 0, wantHasDeadline: false},
+		{name: "timeout equals deadline", timeout: 10 * time.Minute, deadline: 10 * time.Minute, wantErr: "never fire"},
+		{name: "timeout above deadline", timeout: 20 * time.Minute, deadline: 10 * time.Minute, wantErr: "never fire"},
+		// A non-positive timeout is an already-expired per-query context, so
+		// every query fails before it is sent.
+		{name: "zero timeout", timeout: 0, deadline: 10 * time.Minute, wantErr: "--timeout must be positive"},
+		{name: "negative timeout", timeout: -5 * time.Second, deadline: 10 * time.Minute, wantErr: "--timeout must be positive"},
+		// A negative deadline must not be a second, undocumented spelling of
+		// "no budget".
+		{name: "negative deadline", timeout: 30 * time.Second, deadline: -time.Second, wantErr: "cannot be negative"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel, err := runContext(options{timeout: tc.timeout, deadline: tc.deadline})
+			defer cancel()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("want an error mentioning %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			dl, ok := ctx.Deadline()
+			if ok != tc.wantHasDeadline {
+				t.Fatalf("ctx has deadline = %v, want %v", ok, tc.wantHasDeadline)
+			}
+			if ok {
+				// Close to now+deadline, not some other duration.
+				if d := time.Until(dl); d > tc.deadline || d < tc.deadline-time.Minute {
+					t.Errorf("deadline is %s away, want about %s", d, tc.deadline)
+				}
+			}
+		})
+	}
+}
+
+// The bug this guards: rejecting timeout >= deadline only removes the case
+// where the per-query clock is dead from the first query. A run that simply
+// USES UP its budget still cut every outstanding query short at once, and
+// still advised raising --timeout -- which cannot help, and which reads as N
+// slow queries when it was one clock.
+func TestRunDeadlineExpiryNamesTheRightClock(t *testing.T) {
+	// A run context that has already expired, and a generous per-query
+	// timeout: exactly the state a late section of a long run is in.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+
+	c := testClient(&fakeQuery{block: time.Hour}, time.Minute)
+	_, err := c.LabelValues(ctx, "cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("want a deadline error")
+	}
+	if strings.Contains(err.Error(), "raise --timeout") {
+		t.Errorf("the run's budget expired, so --timeout is the wrong knob: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--deadline") {
+		t.Errorf("error should name --deadline: %v", err)
+	}
+	// And the hint alongside it must say the same thing.
+	h := hintFor([]string{"context deadline exceeded"}, mergeQuery, true)
+	if strings.Contains(h, "Raise --timeout") {
+		t.Errorf("hint still points at --timeout: %q", h)
+	}
+	if !strings.Contains(h, "one clock, not many slow queries") {
+		t.Errorf("hint should say it was one clock: %q", h)
+	}
+}
+
+// A genuine per-query timeout still gets the per-query advice.
+func TestPerQueryTimeoutStillNamesTimeout(t *testing.T) {
+	c := testClient(&fakeQuery{block: time.Hour}, 10*time.Millisecond)
+	_, err := c.LabelValues(context.Background(), "cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("want a deadline error")
+	}
+	if !strings.Contains(err.Error(), "raise --timeout") {
+		t.Errorf("a per-query timeout should name --timeout: %v", err)
+	}
+	if strings.Contains(err.Error(), "--deadline") {
+		t.Errorf("the run budget was not involved: %v", err)
+	}
+}
+
+// The bug this guards: overview reads the profile type list once, then picks
+// each section's type from it -- but gatherReport re-fetched and re-validated
+// the whole list for every section. Four sections meant four redundant
+// ProfileTypes calls, and when the lookup failed, four copies of the same
+// warning for a value that came from the server's own list.
+func TestOverviewResolvesTheProfileTypeOnce(t *testing.T) {
+	f := overviewFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType+`{comm="parca"}`] = cpuProfile(t, 120)
+	f.merges[testType] = cpuProfile(t, 150)
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := overviewOptions()
+	o.top = 0
+	if _, err := runOverview(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	// One call for overview's own list. Anything more is a section re-asking
+	// for a list it was handed.
+	if n := f.typeCalls.Load(); n != 1 {
+		t.Errorf("ProfileTypes called %d times, want 1", n)
+	}
+}
+
+// A plain report still resolves the type itself -- the shortcut is only for a
+// caller that already knows it.
+func TestReportStillResolvesItsOwnType(t *testing.T) {
+	f := reportFixture(t)
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	o := testOptions()
+	o.top = 0
+	out := captureStdout(t, func() {
+		end := time.Now()
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-10*time.Second), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if f.typeCalls.Load() == 0 {
+		t.Error("report must still check the type it was given")
+	}
+	if !strings.Contains(out, testType) {
+		t.Errorf("missing the heading:\n%s", out)
 	}
 }
