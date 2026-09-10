@@ -106,8 +106,9 @@ agentloop   232.447   5.3
 
 Almost all of the first row is `ThreadPoolImpl::ThreadFromThreadPool::worker`
 and almost all of the second is `runtime.mstart` — ClickHouse's pool workers
-and Go's parked Ms. Both are idleness, not bottlenecks. A fleet-wide off-CPU sweep therefore tends to rank services by how
-many idle threads they keep, which is not interesting.
+and Go's parked Ms. Both are idleness, not bottlenecks. A fleet-wide off-CPU
+sweep therefore tends to rank services by how many idle threads they keep,
+which is not interesting.
 
 Off-CPU earns its keep **targeted**, not swept: profile one operation you
 already believe is slow, and look for waits on its critical path. Judge the
@@ -166,7 +167,7 @@ and the command exits non-zero:
 !! INCOMPLETE
 !! 3 of 47 workload queries failed. The totals and percentages above
 !! EXCLUDE them and are therefore wrong.
-!!   workload=agentloop: context deadline exceeded
+!!   context deadline exceeded  (3 groups: workload=agentloop, workload=api, workload=web)
 !! Raise --timeout, or narrow the window with --from so each merge is smaller.
 ```
 
@@ -195,6 +196,7 @@ a rare cause is never the one truncated away:
 !! The server closed the stream mid-merge, which usually means the merge hit a
 !! server limit or the server errored on it. Try a narrower --from window, or
 !! fewer series with --match.
+!! Raise --timeout, or narrow the window with --from so each merge is smaller.
 ```
 
 That last hint matters more than it looks. A stream reset carries no gRPC
@@ -295,14 +297,14 @@ the failures as data:
   "unit": "cores",
   "rate": true,
   "groups": [
-    {"name": "tc", "value": 2.3160163, "pct": 77.95355099293167},
-    {"name": "vps", "value": 0.6549837, "pct": 22.04644900706833}
+    {"name": "tc", "value": 2.3160163, "pct": 77.95409962975428},
+    {"name": "vps", "value": 0.6549837, "pct": 22.045900370245704}
   ],
   "empty_groups": 0,
   "total": 2.971,
   "functions": [
     {"name": "github.com/parquet-go/parquet-go/encoding/thrift.(*structDecoder).decode",
-     "cum": 0.8312841, "flat": 0.1203611, "pct": 4.050860316391788}
+     "cum": 0.8312841, "flat": 0.1203611, "pct": 4.05119824974756}
   ],
   "functions_sorted_by": "flat",
   "failed": [],
@@ -369,8 +371,8 @@ github.com/parquet-go/parquet-go/encoding/thrift.(*structDe…  0.831  0.120  4.
 
 parca_agent:samples:count:cpu:nanoseconds:delta  ...
 
-COMM     CORES  %TOTAL
-parca    2.284  76.9
+COMM   CORES  %TOTAL
+parca  2.284  76.9
 ...
 ```
 
@@ -381,8 +383,8 @@ configured, and the label list is one cheap query — cheaper than making you
 know in advance.
 
 Heap is grouped only by `instance` or `job`, never by `cluster` — those are the
-labels heap series actually carry, for the reason given under [Beyond
-CPU](#beyond-cpu). Pairing the heap with `cluster` merged once per cluster,
+labels heap series actually carry, for the reason given under [Naming a profile
+type](#naming-a-profile-type). Pairing the heap with `cluster` merged once per cluster,
 found nothing, and reported "no data" for a heap profile with plenty in it.
 
 **It is not cheap overall.** A breakdown costs one merge per label value, and
@@ -404,8 +406,7 @@ profile type would produce the same table. It is shown once per type.
 to tell "this server has no heap profile" from "the heap query failed":
 
 ```
--- not reported: live heap (no instance or job label to group by; heap profiles
-   come from scrape targets, which carry those)
+-- not reported: live heap (no instance or job label to group by; heap profiles come from scrape targets, which carry those)
 ```
 
 A section that fails part-way still prints, carrying its own `!! INCOMPLETE`
@@ -482,12 +483,15 @@ stable across pod restarts.
 ### The `(unlabeled)` row
 
 If some series lack the `--by` label entirely, their CPU appears as
-`(unlabeled)` rather than being dropped — as long as it is more than 0.1% of
-the total. Below that the row is omitted, since a residual that small is
-usually rounding between the group merges and the unfiltered one rather than
-a real unlabelled series. This is deliberate: a single agent
+`(unlabeled)` rather than being dropped. This is deliberate: a single agent
 deployed without the label would otherwise vanish from the breakdown while
-still burning CPU, and the table would quietly fail to add up. When grouping by `namespace` or `workload` a large `(unlabeled)` row is
+still burning CPU, and the table would quietly fail to add up.
+
+The row needs to be worth more than 0.1% of the total to appear. Below that a
+residual is usually rounding between the per-group merges and the unfiltered
+one rather than a real unlabeled series.
+
+When grouping by `namespace` or `workload` a large `(unlabeled)` row is
 expected and correct — it is every process outside a Kubernetes pod (kernel
 threads, the kubelet, anything on the host). When grouping by `cluster` it
 usually means an agent is missing its external label:
@@ -497,7 +501,6 @@ usually means an agent is missing its external label:
 args:
   - --metadata-external-labels=cluster=tc
 ```
-
 
 ## Reaching a Parca that is not on localhost
 
