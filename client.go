@@ -114,8 +114,17 @@ func (c *Client) meta(ctx context.Context) (context.Context, context.CancelFunc)
 // These queries are cheap and usually instant, so a deadline here nearly
 // always means the server is unwell rather than the window being too large --
 // and it is retryable, which the bare gRPC text does not say.
-func (c *Client) metaErr(what string, err error) error {
+func (c *Client) metaErr(ctx context.Context, what string, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		// Which clock fired? The per-query context descends from the run's, so
+		// a query can be cut short by either, and they need different advice.
+		// Reporting "timed out after <--timeout>" when the run's budget
+		// expired was wrong twice over: the query may have had milliseconds,
+		// not the full timeout, and raising --timeout cannot help.
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s: the run's --deadline expired, so this query was cut short "+
+				"regardless of --timeout; raise --deadline, or narrow the window: %w", what, err)
+		}
 		return fmt.Errorf("%s: timed out after %s -- the server is slow or unreachable; "+
 			"retry, or raise --timeout: %w", what, c.timeout, err)
 	}
@@ -133,7 +142,7 @@ func (c *Client) LabelValues(ctx context.Context, name string, start, end time.T
 		End:       timestamppb.New(end),
 	})
 	if err != nil {
-		return nil, c.metaErr(fmt.Sprintf("values for label %q", name), err)
+		return nil, c.metaErr(ctx, fmt.Sprintf("values for label %q", name), err)
 	}
 	return resp.GetLabelValues(), nil
 }
@@ -146,7 +155,7 @@ func (c *Client) LabelNames(ctx context.Context, start, end time.Time) ([]string
 		End:   timestamppb.New(end),
 	})
 	if err != nil {
-		return nil, c.metaErr("labels", err)
+		return nil, c.metaErr(ctx, "labels", err)
 	}
 	return resp.GetLabelNames(), nil
 }
@@ -158,7 +167,7 @@ func (c *Client) ProfileTypeNames(ctx context.Context) ([]string, error) {
 	defer cancel()
 	resp, err := c.q.ProfileTypes(qctx, &qv1.ProfileTypesRequest{})
 	if err != nil {
-		return nil, c.metaErr("profile types", err)
+		return nil, c.metaErr(ctx, "profile types", err)
 	}
 	out := make([]string, 0, len(resp.GetTypes()))
 	for _, t := range resp.GetTypes() {

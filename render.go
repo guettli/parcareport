@@ -79,7 +79,7 @@ func renderTable(d *reportData) {
 			all = append(append([]failure{}, d.failed...),
 				failure{group: "(overall)", msg: shortErr(d.overallErr)})
 		}
-		printFailures(all, mergeQuery)
+		printFailures(all, mergeQuery, d.runExpired)
 	}
 
 	if len(d.Functions) > 0 {

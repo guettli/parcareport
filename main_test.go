@@ -395,7 +395,7 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 	}
 	failed = append(failed, failure{group: "instance=z", msg: "something else entirely"})
 
-	out := captureStdout(t, func() { printFailures(failed, mergeQuery) })
+	out := captureStdout(t, func() { printFailures(failed, mergeQuery, false) })
 
 	if !strings.Contains(out, "something else entirely") {
 		t.Errorf("the rare cause was hidden:\n%s", out)
@@ -410,10 +410,10 @@ func TestPrintFailuresGroupsByCause(t *testing.T) {
 }
 
 func TestHintForOnlyFiresWhenItHasSomethingToSay(t *testing.T) {
-	if h := hintFor([]string{"no such label"}, mergeQuery); h != "" {
+	if h := hintFor([]string{"no such label"}, mergeQuery, false); h != "" {
 		t.Errorf("want no hint, got %q", h)
 	}
-	if h := hintFor([]string{"context deadline exceeded"}, mergeQuery); !strings.Contains(h, "--timeout") {
+	if h := hintFor([]string{"context deadline exceeded"}, mergeQuery, false); !strings.Contains(h, "--timeout") {
 		t.Errorf("want a timeout hint, got %q", h)
 	}
 }
@@ -1072,11 +1072,11 @@ func TestLabelFailuresGetMetadataAdviceNotMergeAdvice(t *testing.T) {
 // A merge failure keeps the merge advice, which is the half that can be acted
 // on by changing the query.
 func TestMergeFailuresKeepMergeAdvice(t *testing.T) {
-	h := hintFor([]string{"stream terminated by RST_STREAM"}, mergeQuery)
+	h := hintFor([]string{"stream terminated by RST_STREAM"}, mergeQuery, false)
 	if !strings.Contains(h, "--match") {
 		t.Errorf("want merge advice, got %q", h)
 	}
-	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery); strings.Contains(m, "--match") {
+	if m := hintFor([]string{"stream terminated by RST_STREAM"}, metadataQuery, false); strings.Contains(m, "--match") {
 		t.Errorf("metadata advice must not suggest --match, got %q", m)
 	}
 }
@@ -2247,29 +2247,104 @@ func TestTimeoutAtOrAboveTheDeadlineIsRejected(t *testing.T) {
 	}
 }
 
-// A sane pairing must still be accepted -- the check has to reject the
-// impossible combination, not a smaller timeout.
-func TestTimeoutBelowTheDeadlineIsAccepted(t *testing.T) {
-	// Reaches the dial and then fails on the unreachable server, which is
-	// past the validation this test is about.
-	err := run([]string{"--url=127.0.0.1:1", "--timeout=30s", "--deadline=10m"})
-	if err == nil {
-		t.Skip("unexpectedly reached a server")
+// runContext is where both clocks are decided, so test it directly rather
+// than inferring from run()'s error text -- which would pass even if the
+// deadline were never applied, and needs a network round trip to reach.
+func TestRunContext(t *testing.T) {
+	tests := []struct {
+		name            string
+		timeout         time.Duration
+		deadline        time.Duration
+		wantErr         string
+		wantHasDeadline bool
+	}{
+		{name: "normal", timeout: 30 * time.Second, deadline: 10 * time.Minute, wantHasDeadline: true},
+		{name: "no budget", timeout: 30 * time.Minute, deadline: 0, wantHasDeadline: false},
+		{name: "timeout equals deadline", timeout: 10 * time.Minute, deadline: 10 * time.Minute, wantErr: "never fire"},
+		{name: "timeout above deadline", timeout: 20 * time.Minute, deadline: 10 * time.Minute, wantErr: "never fire"},
+		// A non-positive timeout is an already-expired per-query context, so
+		// every query fails before it is sent.
+		{name: "zero timeout", timeout: 0, deadline: 10 * time.Minute, wantErr: "--timeout must be positive"},
+		{name: "negative timeout", timeout: -5 * time.Second, deadline: 10 * time.Minute, wantErr: "--timeout must be positive"},
+		// A negative deadline must not be a second, undocumented spelling of
+		// "no budget".
+		{name: "negative deadline", timeout: 30 * time.Second, deadline: -time.Second, wantErr: "cannot be negative"},
 	}
-	if strings.Contains(err.Error(), "never fire") {
-		t.Errorf("a timeout below the deadline must be accepted, got: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel, err := runContext(options{timeout: tc.timeout, deadline: tc.deadline})
+			defer cancel()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("want an error mentioning %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			dl, ok := ctx.Deadline()
+			if ok != tc.wantHasDeadline {
+				t.Fatalf("ctx has deadline = %v, want %v", ok, tc.wantHasDeadline)
+			}
+			if ok {
+				// Close to now+deadline, not some other duration.
+				if d := time.Until(dl); d > tc.deadline || d < tc.deadline-time.Minute {
+					t.Errorf("deadline is %s away, want about %s", d, tc.deadline)
+				}
+			}
+		})
 	}
 }
 
-// --deadline=0 removes the budget for a deliberately long run, and then there
-// is no ceiling for --timeout to exceed.
-func TestDeadlineZeroDisablesTheBudget(t *testing.T) {
-	err := run([]string{"--url=127.0.0.1:1", "--timeout=30m", "--deadline=0"})
+// The bug this guards: rejecting timeout >= deadline only removes the case
+// where the per-query clock is dead from the first query. A run that simply
+// USES UP its budget still cut every outstanding query short at once, and
+// still advised raising --timeout -- which cannot help, and which reads as N
+// slow queries when it was one clock.
+func TestRunDeadlineExpiryNamesTheRightClock(t *testing.T) {
+	// A run context that has already expired, and a generous per-query
+	// timeout: exactly the state a late section of a long run is in.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+
+	c := testClient(&fakeQuery{block: time.Hour}, time.Minute)
+	_, err := c.LabelValues(ctx, "cluster", time.Now().Add(-time.Hour), time.Now())
 	if err == nil {
-		t.Skip("unexpectedly reached a server")
+		t.Fatal("want a deadline error")
 	}
-	if strings.Contains(err.Error(), "never fire") {
-		t.Errorf("with no budget there is nothing to exceed, got: %v", err)
+	if strings.Contains(err.Error(), "raise --timeout") {
+		t.Errorf("the run's budget expired, so --timeout is the wrong knob: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--deadline") {
+		t.Errorf("error should name --deadline: %v", err)
+	}
+	// And the hint alongside it must say the same thing.
+	h := hintFor([]string{"context deadline exceeded"}, mergeQuery, true)
+	if strings.Contains(h, "Raise --timeout") {
+		t.Errorf("hint still points at --timeout: %q", h)
+	}
+	if !strings.Contains(h, "one clock, not many slow queries") {
+		t.Errorf("hint should say it was one clock: %q", h)
+	}
+}
+
+// A genuine per-query timeout still gets the per-query advice.
+func TestPerQueryTimeoutStillNamesTimeout(t *testing.T) {
+	c := testClient(&fakeQuery{block: time.Hour}, 10*time.Millisecond)
+	_, err := c.LabelValues(context.Background(), "cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("want a deadline error")
+	}
+	if !strings.Contains(err.Error(), "raise --timeout") {
+		t.Errorf("a per-query timeout should name --timeout: %v", err)
+	}
+	if strings.Contains(err.Error(), "--deadline") {
+		t.Errorf("the run budget was not involved: %v", err)
 	}
 }
 

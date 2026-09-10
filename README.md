@@ -205,15 +205,21 @@ minutes to arrive.
 
 There are two clocks, and they have to be told apart. `--deadline` (default
 10m) is the budget for the whole run; `--timeout` (default 60s) bounds one
-query. A `--timeout` at or above `--deadline` is refused, because it could
-never fire: the run's own clock reaches every outstanding query first, and
-they all report their own deadline at the same moment. That reads as N slow
-queries when it was one clock, and the advice printed alongside — raise
-`--timeout` — cannot work. `--deadline=0` removes the budget for a
-deliberately long run.
+query. Every query's clock derives from the run's, so:
 
-`--timeout` bounds each query so one slow group fails visibly
-instead of stalling the run. That includes the label and profile-type lookups,
+- **`--timeout` at or above `--deadline` is refused.** It could never fire —
+  the run's budget expires first, every outstanding query reports its own
+  deadline at the same moment, and the advice to raise `--timeout` cannot
+  work. `--deadline=0` removes the budget for a deliberately long run.
+- **`--timeout` must be positive.** Zero is not "unbounded" here: it is a
+  deadline that has already passed, so every query would fail before being
+  sent.
+- **When the run's budget is what expired**, the failure says so and points at
+  `--deadline`, rather than blaming `--timeout` for a query that may have had
+  milliseconds rather than its full allowance. One clock fired, not N.
+
+It bounds each query so one slow group fails visibly instead of stalling the
+run — including the label and profile-type lookups,
 and the unfiltered merge behind the `(unlabeled)` row — which, carrying no
 matcher at all, is the widest query in the run and was the one query with no
 bound of its own.
