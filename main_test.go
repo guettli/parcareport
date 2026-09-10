@@ -664,7 +664,7 @@ func (f *fakeQuery) scrapeTimes(s int, start, end time.Time) []time.Time {
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
 	}
-	if s < f.extraScrape && len(out) > 1 {
+	if s < f.extraScrape && len(out) > 0 {
 		extra := out[len(out)-1].Add(-5 * time.Second)
 		if !extra.Before(start) {
 			out = append(out[:len(out)-1], extra, out[len(out)-1])
@@ -2685,6 +2685,39 @@ func TestSeriesCountedTwiceAreSaidOutLoud(t *testing.T) {
 	if !strings.Contains(out, "1 of the series matched had more than one scrape") {
 		t.Errorf("the doubled series should be named, not folded into the total:\n%s", out)
 	}
+	// Three series at 10 MiB with one of them folded twice: 40 MiB, not 30.
+	// Without this the note could be printed over a total that was never
+	// doubled, which is what the fake used to do.
+	if !strings.Contains(out, "40.0 MiB") {
+		t.Errorf("the doubled series should actually be in the total twice:\n%s", out)
+	}
+}
+
+// A window that reached none of the series is not an idle cluster, and the
+// two have to look different. This is the run the counting exists for.
+func TestACollapsedWindowStillNamesTheMissedSeries(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.multiSeries = 3
+	// Two of the three stopped scraping a few intervals ago, so the window
+	// cannot reach them. No group has anything, which is the page this test
+	// is about -- and the two missed series are why.
+	f.laggingSeries = 2
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	out := captureStdout(t, func() {
+		_ = report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end)
+	})
+	if !strings.Contains(out, "no scrape inside") {
+		t.Errorf("an empty report must still say the window missed the series:\n%s", out)
+	}
+	if !strings.Contains(out, "newest scrape per series") {
+		t.Errorf("the heading should still say what was being asked for:\n%s", out)
+	}
 }
 
 func TestLatestAndInterval(t *testing.T) {
@@ -2707,7 +2740,7 @@ func TestLatestAndInterval(t *testing.T) {
 	// pull in two scrapes per series.
 	gappy := [][]time.Time{{base, base.Add(60 * time.Second), base.Add(600 * time.Second)}}
 	if _, iv := latestAndInterval(gappy); iv != 60*time.Second {
-		t.Errorf("interval = %v, want the smallest gap (60s)", iv)
+		t.Errorf("interval = %v, want 60s: one long gap must not widen the estimate", iv)
 	}
 
 	// One close-together pair -- a restart, a backfill, a scrape that ran
@@ -2718,6 +2751,19 @@ func TestLatestAndInterval(t *testing.T) {
 	}
 	if _, iv := latestAndInterval(outlier); iv != 60*time.Second {
 		t.Errorf("interval = %v, want 60s: one short gap should not set the window", iv)
+	}
+
+	// A newly-started target, or one that just restarted, has two timestamps
+	// close together: one gap, so its own median IS that gap. Taking the
+	// smallest of the per-series medians let it collapse the window for
+	// everyone else.
+	newTarget := [][]time.Time{
+		{base, base.Add(60 * time.Second), base.Add(120 * time.Second)},
+		{base.Add(3 * time.Second), base.Add(63 * time.Second), base.Add(123 * time.Second)},
+		{base.Add(115 * time.Second), base.Add(120 * time.Second)},
+	}
+	if _, iv := latestAndInterval(newTarget); iv != 60*time.Second {
+		t.Errorf("interval = %v, want 60s: one short series should not set the fleet's window", iv)
 	}
 
 	// One profile per series: nothing to infer, and the caller then merges

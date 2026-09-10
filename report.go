@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -152,14 +153,17 @@ func unitName(header string) string {
 // series whose own newest scrape is more than half an interval older. Parca
 // staggers scrape targets across the interval, so that is about half of them.
 //
-// It is still safe against double-counting. interval is the SMALLEST gap in
-// any series, so no series can have two samples inside a half-open window of
-// that width.
+// Two counts come back with it, because the interval is an estimate and an
+// estimate can miss in either direction:
 //
-// stale counts the series whose newest sample falls outside the window. They
-// contribute nothing to the merge, and the caller says so: a series scraped
-// far less often than the fastest one would otherwise just vanish from a
-// total with no sign that it had.
+//   - stale: series with NO scrape inside the window. They contribute nothing.
+//     Usually they are scraped less often than the rest, though all the code
+//     knows is that the window missed them.
+//   - doubled: series with MORE than one scrape inside it, and so counted more
+//     than once.
+//
+// Either way the number is wrong, and a series vanishing from a total -- or
+// arriving in it twice -- without a word is what this tool exists to prevent.
 func snapshotWindow(ctx context.Context, c *Client, selector string, start, end time.Time) (
 	from, to, latest time.Time, stale, doubled int, err error) {
 	times, err := c.ProfileTimes(ctx, selector, start, end)
@@ -200,23 +204,30 @@ func snapshotWindow(ctx context.Context, c *Client, selector string, start, end 
 // latestAndInterval finds the newest timestamp in the selector and estimates
 // the scrape interval from the spacing between timestamps.
 //
-// The estimate is each series' median gap, then the smallest of those medians.
-// The lower median where the count is even, so an even split errs toward the
-// narrower window rather than one wide enough to hold two scrapes.
+// The estimate is the median of the per-series median gaps, taking the lower
+// median where a count is even, so an even split errs toward the narrower
+// window rather than one wide enough to hold two scrapes.
 //
-// The smallest gap outright would be safer against double-counting, but it is
-// far too easy to break: one close-together pair anywhere -- an agent restart,
-// a backfill, a scrape that ran early -- collapses the window for the entire
-// fleet, and then almost nothing falls inside it. Measured on synthetic
-// series, a single 5-second gap among 60-second scrapes cut a three-target
-// total to one target: a third of the truth, reported as if it were all of
-// it. A median ignores one outlier gap and keeps the whole fleet in the
-// window.
+// Two medians, not one, and neither of them the smallest gap. The smallest gap
+// outright is safer against double-counting but far too easy to break: one
+// close-together pair anywhere -- an agent restart, a backfill, a scrape that
+// ran early -- collapsed the window for the entire fleet, and then almost
+// nothing fell inside it. Measured, a single 5-second gap among 60-second
+// scrapes cut a three-target total to one target.
 //
-// What that costs: a series that really did scrape twice in one median gap
-// can have both scrapes inside the window and be counted twice. The caller
-// counts those and says so, rather than letting the number be quietly wrong.
+// A median within each series handles that when the series is long. It does
+// not help when the series is SHORT, which is exactly what a restart or a
+// newly-appeared target produces: two timestamps five seconds apart have one
+// gap, so their median is five seconds. Taking the smallest of the per-series
+// medians let that one new target collapse the window again. The median across
+// series ignores it, because most targets agree with each other.
+//
+// What that costs: a series really scraped faster than the fleet median has
+// more than one scrape inside the window and is counted more than once. The
+// caller counts those and says so, rather than letting the number be quietly
+// wrong.
 func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Duration) {
+	var medians []time.Duration
 	for _, series := range times {
 		var gaps []time.Duration
 		for i, t := range series {
@@ -233,12 +244,20 @@ func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Dur
 		if len(gaps) == 0 {
 			continue
 		}
-		sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
-		if median := gaps[(len(gaps)-1)/2]; interval == 0 || median < interval {
-			interval = median
-		}
+		medians = append(medians, lowerMedian(gaps))
 	}
-	return latest, interval
+	if len(medians) == 0 {
+		return latest, 0
+	}
+	return latest, lowerMedian(medians)
+}
+
+// lowerMedian sorts a copy and returns the middle value, the lower of the two
+// on an even count.
+func lowerMedian(d []time.Duration) time.Duration {
+	s := slices.Clone(d)
+	slices.Sort(s)
+	return s[(len(s)-1)/2]
 }
 
 // gatherReport runs the queries and assembles the result.
@@ -306,6 +325,13 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		// them.
 		StaleSeries:   staleSeries,
 		DoubledSeries: doubledSeries,
+	}
+	// Set with them, for the same reason: a run that ends at the no-rows
+	// return still has to say the numbers would have described the newest
+	// scrape, not the window.
+	if !snapAt.IsZero() {
+		at := snapAt.UTC()
+		d.SnapshotAt = &at
 	}
 
 	type result struct {
@@ -401,11 +427,6 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	octx, ocancel := context.WithTimeout(ctx, o.timeout)
 	overallRaw, overallErr := c.MergePprof(octx, selector(profType, "", "", o.match), qstart, qend)
 	ocancel()
-	d.SnapshotAt = nil
-	if !snapAt.IsZero() {
-		at := snapAt.UTC()
-		d.SnapshotAt = &at
-	}
 	var overall *profile.Profile
 	if overallErr == nil {
 		overall, overallErr = parsePprof(overallRaw)

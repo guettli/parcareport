@@ -332,9 +332,12 @@ That leaves two ways a series can be misrepresented, and both are counted
 rather than folded silently into the number:
 
 ```
-(2 of the series matched had no scrape inside the one-interval window, so they are not in these numbers)
-(1 of the series matched had more than one scrape inside the window and are counted twice)
+(2 of the series matched had no scrape inside the one-interval window, so they are missing from these numbers)
+(1 of the series matched had more than one scrape inside the window, so they are counted more than once)
 ```
+
+In `--output=json` those are `stale_series` and `doubled_series`, both omitted
+when zero.
 
 In `--output=json`, `delta` says which kind of profile it was and
 `snapshot_at` names the newest scrape it reached — `null` for a delta, where the window really

@@ -45,6 +45,10 @@ func renderTable(d *reportData) {
 			d.window.Round(time.Second))
 	}
 	if d.noRows {
+		// Both notes belong here most of all. A window that reached none of
+		// the series produces exactly this page, and without them an idle
+		// cluster and a window that missed everything look identical.
+		printSeriesNotes(d)
 		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)
 		return
@@ -156,11 +160,11 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 // landed inside the window -- not a guess at why.
 func printSeriesNotes(d *reportData) {
 	if d.StaleSeries > 0 {
-		fmt.Printf("(%d of the series matched had no scrape inside the one-interval window, so they are not in these numbers)\n",
+		fmt.Printf("(%d of the series matched had no scrape inside the one-interval window, so they are missing from these numbers)\n",
 			d.StaleSeries)
 	}
 	if d.DoubledSeries > 0 {
-		fmt.Printf("(%d of the series matched had more than one scrape inside the window and are counted twice)\n",
+		fmt.Printf("(%d of the series matched had more than one scrape inside the window, so they are counted more than once)\n",
 			d.DoubledSeries)
 	}
 }
