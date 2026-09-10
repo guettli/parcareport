@@ -301,16 +301,33 @@ the tool already fetches. That sums every series while summing at most one
 profile from each:
 
 ```
---by=job, 1-minute window   2.0 GiB   (snapshot at 02:00:52Z)
---by=job, 20-minute window  1.6 GiB   (snapshot at 02:19:52Z)
+--by=job, 1-minute window   2.0 GiB   (newest scrape ending 02:00:52Z)
+--by=job, 20-minute window  1.6 GiB   (newest scrape ending 02:19:52Z)
 ```
 
 Same magnitude across a twentyfold change in window, and the difference is
-real: it is a different instant, twenty minutes later. The heading says which
-instant the numbers describe:
+real: the second reading is twenty minutes later, and the heap had shrunk.
+
+The window is `(newest - interval, newest]`, not the newest instant plus and
+minus half an interval. `newest` is the most recent timestamp anywhere in the
+selector, so nothing exists after it: centring on it would spend half the
+width on empty space and drop every series whose own newest scrape is more
+than half an interval older than the newest of all. Parca staggers scrape
+targets across the interval, so that can be about half of them.
+
+The heading says what the numbers describe, and it is not one instant — each
+series contributes its own newest scrape:
 
 ```
-memory:inuse_space:bytes:space:bytes  snapshot at 2026-09-10T02:19:00Z  (newest in 2026-09-10T02:00:00Z .. 2026-09-10T02:20:00Z)
+memory:inuse_space:bytes:space:bytes  newest scrape per series, ending 2026-09-10T02:19:52Z  (looked in 2026-09-10T02:00:00Z .. 2026-09-10T02:20:00Z)
+```
+
+A series scraped far less often than the fastest one in the selector has no
+scrape inside that window. It is counted and named rather than silently left
+out:
+
+```
+(2 series scraped less often than the rest had nothing in this snapshot window, omitted)
 ```
 
 In `--output=json`, `delta` says which kind of profile it was and
@@ -492,7 +509,7 @@ both per section, so accepting them would silently do something else.
 | `--profile-type` | the CPU profile | full selector, or a unique substring like `cpu` |
 | `--top` | `15` | functions to list; `0` disables the table |
 | `--output` | `table` | `json` for a machine-readable report |
-| | | non-delta profiles read the newest snapshot in the window, not a merge |
+| | | non-delta profiles are merged over one scrape interval, not the whole window |
 | `--max-group-values` | `50` | overview: skip a breakdown with more values than this; `0` disables the skip |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
 | `--concurrency` | `4` | parallel queries, within one breakdown |

@@ -47,6 +47,12 @@ type reportData struct {
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
+	// StaleSeries counts series whose newest scrape fell outside the snapshot
+	// window because they are scraped less often than the fastest series in
+	// the selector. They contribute nothing to these numbers, and a series
+	// vanishing from a total without saying so is exactly what this tool is
+	// for pointing out.
+	StaleSeries int `json:"stale_series,omitempty"`
 	// Total is null when the unfiltered merge failed or came back empty. There
 	// is then no denominator, and the sum of the groups is not it: it omits
 	// every series carrying no group-by label. Percentages are null too.
@@ -121,63 +127,65 @@ func unitName(header string) string {
 	return strings.ToLower(header)
 }
 
-// profileFor fetches one selector's profile the way its type actually means.
+// snapshotWindow picks the window a non-delta profile should be merged over.
 //
-// A delta is merged over the window: the values accumulate, which is what
-// makes a rate over that window meaningful. A snapshot is not merged at all --
-// the window instead selects WHICH snapshot, and the newest one in it is used.
-// Merging snapshots sums levels, so a 20-minute window over a 60s scrape
-// interval reported twenty times the live heap (parcareport#26).
+// A merge sums across BOTH time and series. Only the first is wrong for a
+// snapshot -- the second is what makes a group total a total. Fetching one
+// profile fixes the first and breaks the second: a selector usually matches
+// several series, each written at its own instant, so one instant returns one
+// series. Measured: `--by=job` over all eight scrape targets reported 3.0 MiB
+// while a single instance in the same period was 18 MiB. A total cannot be
+// smaller than one of its parts.
 //
-// snapshotAt reports the profile's own timestamp, so the caller can say which
-// moment the numbers describe rather than implying the whole window.
-func profileFor(ctx context.Context, c *Client, selector string, delta bool, start, end time.Time) (raw []byte, snapshotAt time.Time, err error) {
-	if delta {
-		raw, err = c.MergePprof(ctx, selector, start, end)
-		return raw, time.Time{}, err
-	}
-
+// So merge, but over a window narrow enough to hold at most one profile per
+// series: one scrape interval, inferred from the spacing between timestamps,
+// ending at the newest profile.
+//
+// The window is (latest-interval, latest], not latest +/- interval/2. latest
+// is the newest timestamp anywhere in the selector, so nothing exists after
+// it: centring on it would spend half the width on empty space and drop every
+// series whose own newest scrape is more than half an interval older. Parca
+// staggers scrape targets across the interval, so that is about half of them.
+//
+// It is still safe against double-counting. interval is the SMALLEST gap in
+// any series, so no series can have two samples inside a half-open window of
+// that width.
+//
+// stale counts the series whose newest sample falls outside the window. They
+// contribute nothing to the merge, and the caller says so: a series scraped
+// far less often than the fastest one would otherwise just vanish from a
+// total with no sign that it had.
+func snapshotWindow(ctx context.Context, c *Client, selector string, start, end time.Time) (
+	from, to, latest time.Time, stale int, err error) {
 	times, err := c.ProfileTimes(ctx, selector, start, end)
 	if err != nil {
-		return nil, time.Time{}, err
+		return start, end, time.Time{}, 0, err
 	}
 	if len(times) == 0 {
-		return nil, time.Time{}, nil // nothing in the window
+		return start, end, time.Time{}, 0, nil // nothing in the window
 	}
-
-	// A merge sums across BOTH time and series. Only the first is wrong for a
-	// snapshot -- the second is what makes a group total a total. Fetching one
-	// profile fixes the first and breaks the second: a selector usually
-	// matches several series, each written at its own instant, so one instant
-	// returns one series. Measured: `--by=job` over all eight scrape targets
-	// reported 3.0 MiB while a single instance in the same period was 18 MiB.
-	// A total cannot be smaller than one of its parts.
-	//
-	// So merge, but over a window narrow enough to hold at most one profile
-	// per series: the scrape interval, inferred from the spacing between
-	// timestamps. Ending at the newest profile, so the answer describes the
-	// most recent state rather than an arbitrary slice.
 	latest, interval := latestAndInterval(times)
 	if interval <= 0 {
 		// One profile per series and no spacing to infer -- the window
-		// already holds a single scrape, so merging it is safe.
-		raw, err = c.MergePprof(ctx, selector, start, end)
-		return raw, latest, err
+		// already holds a single scrape, so merging it whole is safe.
+		return start, end, latest, 0, nil
 	}
-	// Half an interval either side of the newest profile: wide enough for
-	// every series' newest scrape, narrow enough to exclude the one before it.
-	from := latest.Add(-interval / 2)
-	to := latest.Add(interval / 2)
+	from = latest.Add(-interval).Add(time.Nanosecond)
+	to = latest
 	if from.Before(start) {
 		from = start
 	}
-	raw, err = c.MergePprof(ctx, selector, from, to)
-	return raw, latest, err
+	for _, series := range times {
+		if len(series) == 0 {
+			continue
+		}
+		if newest := series[len(series)-1]; newest.Before(from) {
+			stale++
+		}
+	}
+	return from, to, latest, stale, nil
 }
 
-// latestAndInterval returns the newest timestamp across all series, and the
-// smallest gap between consecutive profiles within a series -- the scrape
-// interval. Smallest rather than mean so an outage in the middle of the window
 // does not widen the estimate and pull in two scrapes per series.
 func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Duration) {
 	for _, series := range times {
@@ -221,6 +229,25 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 
 	window := end.Sub(start)
 	delta := isDeltaType(profType)
+
+	// For a snapshot type, pick the window ONCE, from the unfiltered
+	// selector, and merge every group over that same window. Letting each
+	// group infer its own would give the rows and the total different
+	// instants: an instance that stopped scraping ten minutes ago would
+	// report its last heap at full value against a total that correctly
+	// excludes it, and the rows would sum to more than 100%.
+	qstart, qend := start, end
+	var snapAt time.Time
+	staleSeries := 0
+	if !delta {
+		wctx, wcancel := context.WithTimeout(ctx, o.timeout)
+		f, t, latest, stale, err := snapshotWindow(wctx, c, selector(profType, "", "", o.match), start, end)
+		wcancel()
+		if err != nil {
+			return nil, err
+		}
+		qstart, qend, snapAt, staleSeries = f, t, latest, stale
+	}
 	d := &reportData{
 		ProfileType:  profType,
 		Delta:        delta,
@@ -264,7 +291,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 
 			qctx, qcancel := context.WithTimeout(ctx, o.timeout)
 			defer qcancel()
-			raw, _, err := profileFor(qctx, c, selector(profType, o.by, g, o.match), delta, start, end)
+			raw, err := c.MergePprof(qctx, selector(profType, o.by, g, o.match), qstart, qend)
 			if err != nil {
 				results[i] = result{name: g, err: err}
 				return
@@ -328,13 +355,14 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// Bounded like every per-group merge: carrying no matcher at all, this is
 	// the widest query in the run and the likeliest to be slow.
 	octx, ocancel := context.WithTimeout(ctx, o.timeout)
-	overallRaw, snapAt, overallErr := profileFor(octx, c, selector(profType, "", "", o.match), delta, start, end)
+	overallRaw, overallErr := c.MergePprof(octx, selector(profType, "", "", o.match), qstart, qend)
 	ocancel()
 	d.SnapshotAt = nil
 	if !snapAt.IsZero() {
 		at := snapAt.UTC()
 		d.SnapshotAt = &at
 	}
+	d.StaleSeries = staleSeries
 	var overall *profile.Profile
 	if overallErr == nil {
 		overall, overallErr = parsePprof(overallRaw)
