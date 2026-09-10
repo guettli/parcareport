@@ -208,6 +208,7 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		// The type came from the list read above, so it needs no lookup and
 		// no validation -- passing it as resolvedType skips both.
 		so.resolvedType, so.by = p.profType, p.by
+		so.moreToCome = true
 		so.profileType = p.profType
 		sd, serr := gatherReport(ctx, c, so, start, end)
 		if sd == nil {
@@ -290,23 +291,6 @@ func printSkipped(skipped []skippedJSON) {
 	for _, s := range skipped {
 		fmt.Printf("-- not reported: %s (%s)\n", s.What, s.Reason)
 	}
-}
-
-// looksTransient reports whether a failure is the server dropping the
-// connection rather than rejecting the request. Those are worth one retry;
-// a bad selector or an empty window is not.
-func looksTransient(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	for _, s := range []string{"RST_STREAM", "INTERNAL_ERROR", "unavailable", "Unavailable",
-		"connection reset", "error reading from server", "server preface"} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
 }
 
 // findHeapType picks the live-heap profile by its parts rather than by a

@@ -432,7 +432,10 @@ Two things follow:
   load that just defeated it. A query the server *rejected*, rather than
   dropped, is not retried: that would just repeat a wrong query. Retries get at
   most half of whatever `--deadline` is left, so a section with many dropped
-  groups cannot spend the budget the later sections still need. Label lookups
+  groups cannot spend the budget the later sections still need. (A plain
+  `parcareport` run is the whole run, so it keeps nothing back; and with
+  `--deadline=0` there is no budget to divide, leaving `--timeout` per query
+  as the only bound on how long retrying can go on.) Label lookups
   get the same single retry — losing one of those costs a whole breakdown, or
   the whole command, rather than one group.
 

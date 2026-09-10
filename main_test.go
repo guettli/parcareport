@@ -2719,8 +2719,11 @@ func TestTheRetryStopsWhenTheBudgetRunsOut(t *testing.T) {
 	f.mergeDelay = 100 * time.Millisecond
 
 	o := testOptions()
-	o.top, o.timeout = 0, 40*time.Millisecond
-	// Room for a few retries, not for all six.
+	// A timeout large against the deadline, so "is there room for one more"
+	// is what stops the pass. With a small one the half-budget cap fires
+	// first and this test would pass with the per-retry check deleted --
+	// which is what it is named for.
+	o.top, o.timeout = 0, 120*time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
 	defer cancel()
 
@@ -2792,6 +2795,9 @@ func TestTheRetryPassLeavesBudgetForWhatComesNext(t *testing.T) {
 
 	o := testOptions()
 	o.top, o.timeout = 0, 40*time.Millisecond
+	// Stand in for one section of an overview: more runs after this under
+	// the same deadline, which is what the cap is for.
+	o.moreToCome = true
 	// A full second: every single retry passes "is there room for one more",
 	// so only the cap on the pass as a whole can stop it.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2806,6 +2812,26 @@ func TestTheRetryPassLeavesBudgetForWhatComesNext(t *testing.T) {
 	}
 	if !strings.Contains(out, "asked again") {
 		t.Errorf("some groups should still have been retried:\n%s", out)
+	}
+}
+
+// A retry is another query, and a run with no budget left for one should not
+// start it: the retry would only fail on the deadline and the error the user
+// sees would be about the deadline rather than the dropped stream.
+func TestNoLabelLookupRetryWithoutBudgetForIt(t *testing.T) {
+	f := reportFixture(t)
+	f.valuesFailFirst = map[string]int{"cluster": 1}
+
+	// Less left than one query is allowed to take, so there is no room.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := labelValues(ctx, testClient(f, time.Minute), 60*time.Millisecond,
+		"cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("with no budget for a retry the dropped lookup should be reported, not retried")
+	}
+	if !strings.Contains(err.Error(), "RST_STREAM") {
+		t.Errorf("want the dropped stream reported, got: %v", err)
 	}
 }
 

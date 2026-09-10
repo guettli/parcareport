@@ -182,14 +182,17 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// it with a less informative one, and there is no third attempt: past
 	// that, retrying is just the same load again.
 	if again := transientGroups(results); len(again) > 0 {
-		// Half of what is left, at most. Checking only "is there room for one
-		// more" let a section with fifteen dropped groups keep passing the
-		// check until the budget was nearly gone, and every later section
-		// then failed on the deadline -- the retry made the run worse than no
-		// retry. Sections share one --deadline, so this one has to leave
-		// something behind for the rest.
+		// Half of what is left, at most, when something comes after this.
+		// Checking only "is there room for one more" let a section with
+		// fifteen dropped groups keep passing the check until the budget was
+		// nearly gone, and every later section then failed on the deadline --
+		// the retry made the run worse than no retry.
+		//
+		// Only when something comes after it. A plain report is the whole
+		// run, so holding half the budget back there would forfeit it for
+		// nothing.
 		var until time.Time
-		if dl, ok := ctx.Deadline(); ok {
+		if dl, ok := ctx.Deadline(); ok && o.moreToCome {
 			until = time.Now().Add(time.Until(dl) / 2)
 		}
 		// Up to --timeout each, one after another: without a line on stderr
@@ -477,11 +480,14 @@ func transientGroups(results []groupResult) []int {
 	return idx
 }
 
-// budgetLeftFor reports whether the run's budget has room to spare for extra
-// queries. Sections run one after another under a single --deadline, so a
-// retry that eats the remainder would turn one dropped stream into every later
-// section failing. Two timeouts' worth is the room to start; the retry stops
-// on its own when the budget goes.
+// budgetLeftFor reports whether the run's budget has room for another query:
+// more than two timeouts' worth, so a retry cannot be started that only has
+// time to fail on the deadline.
+//
+// This is the per-query guard. The retry pass has a second one -- at most half
+// the remaining budget, when sections follow -- and which of the two binds
+// depends on the numbers: this one first when the deadline is tight against
+// --timeout, the half-budget cap first when it is generous.
 func budgetLeftFor(ctx context.Context, timeout time.Duration) bool {
 	if ctx.Err() != nil {
 		return false
@@ -509,4 +515,21 @@ func labelValues(ctx context.Context, c *Client, timeout time.Duration, by strin
 		return vals, err
 	}
 	return again, nil
+}
+
+// looksTransient reports whether a failure is the server dropping the
+// connection rather than rejecting the request. Those are worth one retry;
+// a bad selector or an empty window is not.
+func looksTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{"RST_STREAM", "INTERNAL_ERROR", "unavailable", "Unavailable",
+		"connection reset", "error reading from server", "server preface"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }

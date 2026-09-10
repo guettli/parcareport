@@ -44,6 +44,10 @@ type options struct {
 	sortBy      string
 	output      string
 	maxGroups   int
+	// moreToCome says another report runs after this one under the same
+	// --deadline, so this one must not spend all of it. overview sets it;
+	// a plain report is the whole run.
+	moreToCome bool
 	// setFlags records which flags were given, so a subcommand can refuse one
 	// it would otherwise ignore.
 	setFlags    map[string]bool
