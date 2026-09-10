@@ -629,8 +629,8 @@ func formatFailures(failed []failure, kind failureKind) string {
 	shown := order
 	for i, msg := range order {
 		if i == showCauses {
-			// 9b: "1 more distinct errors" read wrong.
 			more := len(order) - showCauses
+			// "1 more distinct errors" reads wrong.
 			noun := "errors"
 			if more == 1 {
 				noun = "error"
