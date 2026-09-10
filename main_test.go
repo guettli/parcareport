@@ -236,6 +236,17 @@ type fakeQuery struct {
 	// error before succeeding, the way an overloaded server does.
 	failFirstN int64
 	failCount  atomic.Int64
+	// failSel fails every attempt for one selector, so a test can see what a
+	// server that never recovers does to the retry.
+	failSel string
+	// valuesFailFirst drops that many Values calls per label before
+	// answering, guarded by mergeMu.
+	valuesFailFirst map[string]int
+	// mergeCalls counts every merge by selector, including the ones that
+	// fail. failCount only counts the failFirstN path, so it cannot answer
+	// "how many times was this group asked".
+	mergeMu    sync.Mutex
+	mergeCalls map[string]int
 	block      time.Duration // make Values hang, to exercise the deadline
 }
 
@@ -272,6 +283,16 @@ func (f *fakeQuery) Values(ctx context.Context, in *qv1.ValuesRequest, _ ...grpc
 	if err := f.valuesErrFor[in.GetLabelName()]; err != nil {
 		return nil, err
 	}
+	// A label whose first lookups drop the stream, then works: the shape of a
+	// server that is briefly out of room, not one that is broken.
+	f.mergeMu.Lock()
+	if n := f.valuesFailFirst[in.GetLabelName()]; n > 0 {
+		f.valuesFailFirst[in.GetLabelName()] = n - 1
+		f.mergeMu.Unlock()
+		return nil, status.Error(codes.Internal,
+			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
+	}
+	f.mergeMu.Unlock()
 	if f.valuesErr != nil {
 		return nil, f.valuesErr
 	}
@@ -579,8 +600,18 @@ func cpuProfile(t *testing.T, samples int64) *profile.Profile {
 
 func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.CallOption) (*qv1.QueryResponse, error) {
 	sel := in.GetMerge().GetQuery()
+	f.mergeMu.Lock()
+	if f.mergeCalls == nil {
+		f.mergeCalls = map[string]int{}
+	}
+	f.mergeCalls[sel]++
+	f.mergeMu.Unlock()
 	if err := f.mergeErrs[sel]; err != nil {
 		return nil, err
+	}
+	if f.failSel != "" && f.failSel == sel {
+		return nil, status.Error(codes.Internal,
+			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
 	}
 	if f.failFirstN > 0 && f.failCount.Add(1) <= f.failFirstN {
 		return nil, status.Error(codes.Internal,
@@ -2469,7 +2500,13 @@ func TestOverviewLowersConcurrencyUnlessAsked(t *testing.T) {
 // A stream reset under load is the server going away, not the query being
 // wrong, and it is transient. One retry turns a lost breakdown into a slow
 // one.
-func TestOverviewRetriesATransientSectionOnce(t *testing.T) {
+func (f *fakeQuery) callsFor(sel string) int {
+	f.mergeMu.Lock()
+	defer f.mergeMu.Unlock()
+	return f.mergeCalls[sel]
+}
+
+func TestATransientlyFailedGroupIsRetried(t *testing.T) {
 	f := overviewFixture(t)
 	f.types = profileTypesFrom([]string{testType})
 	// One label, so one section: this test is about the retry, not about
@@ -2478,8 +2515,8 @@ func TestOverviewRetriesATransientSectionOnce(t *testing.T) {
 	f.values["cluster"] = []string{"tc"}
 	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
 	f.merges[testType] = cpuProfile(t, 100)
-	// Fail only the section's first merge, the way an overloaded server drops
-	// one stream. Failing two would defeat the single retry as well, which is
+	// Fail only the first merge, the way an overloaded server drops one
+	// stream. Failing two would defeat the single retry as well, which is
 	// what this test would then be measuring instead.
 	f.failFirstN = 1
 
@@ -2495,10 +2532,132 @@ func TestOverviewRetriesATransientSectionOnce(t *testing.T) {
 	if strings.Contains(out, "FAILED") || strings.Contains(out, "INCOMPLETE") {
 		t.Errorf("a retried section should not leave a banner behind:\n%s", out)
 	}
-	// Three merges: the failed group, then on retry the group again plus the
-	// unfiltered one the group table needs. One retry, never a loop.
-	if n := f.failCount.Load(); n != 3 {
-		t.Errorf("%d merge attempts, want 3 (failed group, then group + unfiltered)", n)
+	if !strings.Contains(out, "asked again") {
+		t.Errorf("a run that silently took twice as long is what this avoids:\n%s", out)
+	}
+}
+
+// The retry exists because the server ran out of room. Re-running the whole
+// fan-out would send it the same load again, which is the one thing the
+// failure says not to do.
+func TestRetryAsksOnlyTheGroupThatFailed(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"a", "b", "c", "d", "e"}
+	for _, g := range f.values["cluster"] {
+		f.merges[testType+`{cluster="`+g+`"}`] = cpuProfile(t, 10)
+	}
+	f.merges[testType] = cpuProfile(t, 50)
+	// One group keeps dropping its stream. It stays failed -- that is not
+	// what this test is about; what matters is who else got asked again.
+	failing := testType + `{cluster="c"}`
+	f.failSel = failing
+
+	o := overviewOptions()
+	o.top = 0
+	if _, err := runOverview(t, f, o); err == nil {
+		t.Fatal("a group that never answers should leave the run incomplete")
+	}
+	if n := f.callsFor(failing); n != 2 {
+		t.Errorf("the failed group was merged %d times, want 2 (once, then one retry)", n)
+	}
+	for _, g := range []string{"a", "b", "d", "e"} {
+		sel := testType + `{cluster="` + g + `"}`
+		if n := f.callsFor(sel); n != 1 {
+			t.Errorf("group %s was merged %d times, want 1: only the failed group is retried", g, n)
+		}
+	}
+}
+
+// Retrying a query the server rejected on its merits just sends the same
+// wrong query again.
+func TestPermanentFailuresAreNotRetried(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"a", "b"}
+	f.merges[testType+`{cluster="a"}`] = cpuProfile(t, 10)
+	f.merges[testType] = cpuProfile(t, 10)
+	failing := testType + `{cluster="b"}`
+	f.mergeErrs[failing] = status.Error(codes.InvalidArgument,
+		"profile-type selection must be of the form")
+
+	o := overviewOptions()
+	o.top = 0
+	out, _ := runOverview(t, f, o)
+	if n := f.callsFor(failing); n != 1 {
+		t.Errorf("a rejected query was merged %d times, want 1", n)
+	}
+	if strings.Contains(out, "asked again") {
+		t.Errorf("nothing was retried, so nothing should say so:\n%s", out)
+	}
+}
+
+// "The label is not there" and "the query for it failed" are different
+// answers, and saying the first when the second happened sends the reader
+// looking for a relabel_config that is not missing.
+func TestAFailedLabelLookupIsNotReportedAsAnAbsentLabel(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"tc"}
+	// The one breakdown the plan could have used cannot be counted.
+	f.valuesErrFor = map[string]error{"cluster": errors.New("boom")}
+
+	o := overviewOptions()
+	o.top = 0
+	out, _ := runOverview(t, f, o)
+	if strings.Contains(out, "exists in this window") {
+		t.Errorf("the label exists; its lookup failed. Output:\n%s", out)
+	}
+	if !strings.Contains(out, "label lookups above failed") {
+		t.Errorf("the reader should learn the lookups failed:\n%s", out)
+	}
+}
+
+// Losing a label lookup costs the whole section, not one group, so it gets
+// the same single retry.
+func TestADroppedLabelLookupIsRetried(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"tc"}
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	f.valuesFailFirst = map[string]int{"cluster": 1}
+
+	o := overviewOptions()
+	o.top = 0
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("a dropped label lookup should be retried, not lost: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "CLUSTER") {
+		t.Errorf("the section should have been planned after the retry:\n%s", out)
+	}
+}
+
+// Once, not until it works. A server that stays out of room would otherwise
+// get the whole fan-out again and again.
+func TestATransientFailureIsRetriedOnlyOnce(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"a", "b"}
+	f.merges[testType+`{cluster="a"}`] = cpuProfile(t, 10)
+	f.merges[testType] = cpuProfile(t, 10)
+	failing := testType + `{cluster="b"}`
+	f.failSel = failing // never recovers
+
+	o := overviewOptions()
+	o.top = 0
+	out, _ := runOverview(t, f, o)
+	if n := f.callsFor(failing); n != 2 {
+		t.Errorf("a group that never recovers was merged %d times, want exactly 2", n)
+	}
+	if !strings.Contains(out, "INCOMPLETE") && !strings.Contains(out, "FAILED") {
+		t.Errorf("a failure that survived the retry is still a failure:\n%s", out)
 	}
 }
 

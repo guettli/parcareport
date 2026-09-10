@@ -421,18 +421,29 @@ out, the queries come back as `RST_STREAM with error code: INTERNAL_ERROR` or
 `error reading from server`. Those are the connection going away mid-answer,
 not a complaint about the query — the same query on its own succeeds.
 
-Two things follow, both of which `overview` does for you:
+Two things follow:
 
-- It runs **2 queries at once**, not the `--concurrency` default of 4, because
-  it issues more queries than any other command and so meets the wall first.
-  An explicit `--concurrency` is always honoured; if your server copes, say so.
-- A section that failed with that signature is **retried once**. One retry
-  turns a lost breakdown into a slow one. Only once, and only for that
-  signature: retrying a real error would just double the load that caused it.
+- `overview` runs **2 queries at once**, not the `--concurrency` default of 4,
+  because it issues more queries than any other command and so meets the wall
+  first. An explicit `--concurrency` is always honoured; if your server copes,
+  say so.
+- A query that failed that way is **asked once more** — and only that query,
+  one at a time. Re-running the whole breakdown would send the server the same
+  load that just defeated it. A query the server *rejected*, rather than
+  dropped, is not retried: that would just repeat a wrong query. The retry is
+  skipped when little of the `--deadline` is left, so recovering one group
+  cannot starve every later section.
 
-If a section still fails, lower `--concurrency` to 1 and narrow `--from`.
-Raising the server's memory limit does not make this go away — it only moves
-the point at which it starts, and the failure is refusal, not a crash.
+When it happens you are told, because a run that quietly takes twice as long
+is worth knowing about:
+
+```
+(2 namespace queries were asked again: the server dropped the first attempt)
+```
+
+If queries still fail, lower `--concurrency` to 1 and narrow `--from`. Raising
+the server's memory limit does not make this go away — it only moves the point
+at which it starts, and the failure is refusal, not a crash.
 
 The hot functions come from the unfiltered merge, so every breakdown of one
 profile type would produce the same table. It is shown once per type.

@@ -58,6 +58,13 @@ func renderTable(d *reportData) {
 	if d.EmptyGroups > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", d.EmptyGroups, d.GroupBy)
 	}
+	// A run that quietly takes twice as long is the kind of thing this tool
+	// says out loud: the server dropped those queries, and it will do it
+	// again if the window stays this wide.
+	if d.Retried > 0 {
+		fmt.Printf("(%d %s %s asked again: the server dropped the first attempt)\n",
+			d.Retried, d.GroupBy, plural(d.Retried, "query was", "queries were"))
+	}
 
 	// One banner, however many things went wrong.
 	if len(d.failed) > 0 || d.overallErr != nil {
@@ -137,4 +144,12 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 		d.Error = err.Error()
 	}
 	_ = renderJSON(d)
+}
+
+// plural picks the wording for a count, so messages do not say "1 queries".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

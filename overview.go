@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -104,6 +103,9 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 	}
 
 	var plan []struct{ profType, by string }
+	// Set when a label lookup failed rather than came back empty, so the
+	// "nothing to break down by" message can tell the truth about why.
+	lookupFailed := false
 	if len(cpu) == 1 {
 		for _, by := range overviewBreakdowns {
 			if !have[by] {
@@ -115,7 +117,14 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			// having. Count first -- that is one cheap query -- and skip the
 			// ones that are too wide, saying so.
 			vals, err := c.LabelValues(ctx, by, start, end)
+			// The same dropped stream that costs a merge costs a label
+			// lookup, and losing one here costs the whole section rather
+			// than one group. One more try, for that signature only.
+			if err != nil && looksTransient(err) && budgetLeftFor(ctx, o.timeout) {
+				vals, err = c.LabelValues(ctx, by, start, end)
+			}
 			if err != nil {
+				lookupFailed = true
 				d.Skipped = append(d.Skipped, skippedJSON{
 					What:   "CPU by " + by,
 					Reason: shortErr(err),
@@ -133,10 +142,15 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			plan = append(plan, struct{ profType, by string }{cpu[0], by})
 		}
 		if len(plan) == 0 {
-			d.Skipped = append(d.Skipped, skippedJSON{
-				What:   "CPU breakdowns",
-				Reason: "none of " + strings.Join(overviewBreakdowns, ", ") + " exists in this window",
-			})
+			// "The label is not there" and "the query for it failed" are
+			// different answers, and saying the first when the second
+			// happened sends the reader looking for a missing relabel_config
+			// that is not missing.
+			reason := "none of " + strings.Join(overviewBreakdowns, ", ") + " exists in this window"
+			if lookupFailed {
+				reason = "the label lookups above failed, so there was nothing left to break the CPU profile down by"
+			}
+			d.Skipped = append(d.Skipped, skippedJSON{What: "CPU breakdowns", Reason: reason})
 		}
 	}
 	// Live heap, if the server has it. It is not a rate and says something the
@@ -199,17 +213,6 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		so.resolvedType, so.by = p.profType, p.by
 		so.profileType = p.profType
 		sd, serr := gatherReport(ctx, c, so, start, end)
-		// A stream reset under load is the server going away, not the query
-		// being wrong, and it is transient. One retry turns a lost breakdown
-		// into a slow one. Only once, and only for that signature: retrying a
-		// genuine error just doubles the load that caused it.
-		//
-		// The section's own error is a summary -- "3 of 8 queries failed" --
-		// and carries none of the causes, so the per-group failures are what
-		// has to be inspected.
-		if sectionLooksTransient(sd, serr) && ctx.Err() == nil {
-			sd, serr = gatherReport(ctx, c, so, start, end)
-		}
 		if sd == nil {
 			// One section failing is not the whole overview failing; that is
 			// the point of running several.
@@ -290,27 +293,6 @@ func printSkipped(skipped []skippedJSON) {
 	for _, s := range skipped {
 		fmt.Printf("-- not reported: %s (%s)\n", s.What, s.Reason)
 	}
-}
-
-// sectionLooksTransient reports whether a section failed because the server
-// dropped connections, looking past the summary error to the causes it
-// omits.
-func sectionLooksTransient(d *reportData, err error) bool {
-	if err == nil {
-		return false
-	}
-	if looksTransient(err) {
-		return true
-	}
-	if d == nil {
-		return false
-	}
-	for _, f := range d.Failed {
-		if looksTransient(errors.New(f.Error)) {
-			return true
-		}
-	}
-	return false
 }
 
 // looksTransient reports whether a failure is the server dropping the
