@@ -34,6 +34,9 @@ func renderTable(d *reportData) {
 		d.ProfileType, d.Start.Format("2006-01-02T15:04:05Z"), d.End.Format("2006-01-02T15:04:05Z"),
 		d.window.Round(time.Second))
 	if d.noRows {
+		// Worth saying here most of all: this is the run where everything was
+		// asked twice and still came back with nothing.
+		printRetried(d)
 		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)
 		return
@@ -58,6 +61,7 @@ func renderTable(d *reportData) {
 	if d.EmptyGroups > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", d.EmptyGroups, d.GroupBy)
 	}
+	printRetried(d)
 
 	// One banner, however many things went wrong.
 	if len(d.failed) > 0 || d.overallErr != nil {
@@ -137,4 +141,24 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 		d.Error = err.Error()
 	}
 	_ = renderJSON(d)
+}
+
+// plural picks the wording for a count, so messages do not say "1 queries".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// printRetried says how many queries had to be asked twice. A run that
+// quietly takes twice as long is the kind of thing this tool says out loud:
+// the server dropped those queries, and it will do it again if the window
+// stays this wide.
+func printRetried(d *reportData) {
+	if d.Retried == 0 {
+		return
+	}
+	fmt.Printf("(%d %s %s asked again: the server dropped the first attempt)\n",
+		d.Retried, d.GroupBy, plural(d.Retried, "query was", "queries were"))
 }

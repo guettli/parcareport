@@ -21,6 +21,10 @@ import (
 // workload only exist if the agents were given relabel_configs.
 var overviewBreakdowns = []string{"cluster", "namespace", "workload", "comm"}
 
+// overviewConcurrency is how many queries a section runs at once, when the
+// caller has not said. See the reasoning where it is applied.
+const overviewConcurrency = 2
+
 // overviewData is one overview: the same report run a few ways.
 type overviewData struct {
 	Start        time.Time     `json:"start"`
@@ -99,6 +103,9 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 	}
 
 	var plan []struct{ profType, by string }
+	// Set when a label lookup failed rather than came back empty, so the
+	// "nothing to break down by" message can tell the truth about why.
+	lookupFailed := false
 	if len(cpu) == 1 {
 		for _, by := range overviewBreakdowns {
 			if !have[by] {
@@ -109,8 +116,12 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			// server is hours of work and would swamp the sections worth
 			// having. Count first -- that is one cheap query -- and skip the
 			// ones that are too wide, saying so.
-			vals, err := c.LabelValues(ctx, by, start, end)
+			// The same dropped stream that costs a merge costs a label
+			// lookup, and losing one here costs the whole section rather
+			// than one group, so labelValues asks again once.
+			vals, err := labelValues(ctx, c, o.timeout, by, start, end)
 			if err != nil {
+				lookupFailed = true
 				d.Skipped = append(d.Skipped, skippedJSON{
 					What:   "CPU by " + by,
 					Reason: shortErr(err),
@@ -128,10 +139,15 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			plan = append(plan, struct{ profType, by string }{cpu[0], by})
 		}
 		if len(plan) == 0 {
-			d.Skipped = append(d.Skipped, skippedJSON{
-				What:   "CPU breakdowns",
-				Reason: "none of " + strings.Join(overviewBreakdowns, ", ") + " exists in this window",
-			})
+			// "The label is not there" and "the query for it failed" are
+			// different answers, and saying the first when the second
+			// happened sends the reader looking for a missing relabel_config
+			// that is not missing.
+			reason := "none of " + strings.Join(overviewBreakdowns, ", ") + " exists in this window"
+			if lookupFailed {
+				reason = "the label lookups above failed, so there was nothing left to break the CPU profile down by"
+			}
+			d.Skipped = append(d.Skipped, skippedJSON{What: "CPU breakdowns", Reason: reason})
 		}
 	}
 	// Live heap, if the server has it. It is not a rate and says something the
@@ -168,12 +184,31 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		return err
 	}
 
+	// Lower concurrency than a single report, unless asked otherwise.
+	//
+	// Sections already run one after another, but the queries inside a
+	// section went four abreast, and each concurrent merge materialises a
+	// profile server-side. A Parca sized for ingestion refuses at that rate:
+	// on the server this was measured against, an 8-group heap breakdown at
+	// --concurrency=8 failed all 8 with RST_STREAM, at 2 it lost the label
+	// lookup, and at 1 it succeeded. overview is the command most likely to
+	// meet that wall, because it issues more queries than anything else.
+	//
+	// Two rather than one: sequential would roughly double an already slow
+	// command for no benefit on a server that is coping. An explicit
+	// --concurrency always wins -- someone who has measured their own server
+	// knows better than this default.
+	if !o.setFlags["concurrency"] && o.concurrency > overviewConcurrency {
+		o.concurrency = overviewConcurrency
+	}
+
 	d.Complete = true
 	for _, p := range plan {
 		so := o
 		// The type came from the list read above, so it needs no lookup and
 		// no validation -- passing it as resolvedType skips both.
 		so.resolvedType, so.by = p.profType, p.by
+		so.moreToCome = true
 		so.profileType = p.profType
 		sd, serr := gatherReport(ctx, c, so, start, end)
 		if sd == nil {

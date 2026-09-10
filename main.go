@@ -44,6 +44,10 @@ type options struct {
 	sortBy      string
 	output      string
 	maxGroups   int
+	// moreToCome says another report runs after this one under the same
+	// --deadline, so this one must not spend all of it. overview sets it;
+	// a plain report is the whole run.
+	moreToCome bool
 	// setFlags records which flags were given, so a subcommand can refuse one
 	// it would otherwise ignore.
 	setFlags    map[string]bool
@@ -74,7 +78,7 @@ func run(args []string) error {
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.StringVar(&o.output, "output", outputTable, "'table' for a person, 'json' for a script")
 	fs.IntVar(&o.maxGroups, "max-group-values", 50, "overview: skip a breakdown whose label has more values than this")
-	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
+	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out (overview lowers this to 2 unless given)")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.DurationVar(&o.deadline, "deadline", 10*time.Minute, "budget for the whole run; 0 removes it and relies on --timeout alone")
 	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
@@ -153,7 +157,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end, o.concurrency)
+		return listLabels(ctx, c, subArg, start, end, o.concurrency, o.timeout)
 	case "overview":
 		if subArg != "" {
 			return fmt.Errorf("overview takes no argument, got %q", subArg)
@@ -283,9 +287,11 @@ func runContext(o options) (context.Context, context.CancelFunc, error) {
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int) error {
+func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int, timeout time.Duration) error {
 	if name != "" {
-		vals, err := c.LabelValues(ctx, name, start, end)
+		// One dropped stream kills this whole command, so it gets the same
+		// single retry as a group merge.
+		vals, err := labelValues(ctx, c, timeout, name, start, end)
 		if err != nil {
 			return err
 		}

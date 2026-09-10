@@ -40,6 +40,10 @@ type reportData struct {
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
+	// Retried is how many groups were asked a second time because the server
+	// dropped the first attempt. A run that quietly takes twice as long is
+	// the kind of thing this tool says out loud.
+	Retried int `json:"retried,omitempty"`
 	// Total is null when the unfiltered merge failed or came back empty. There
 	// is then no denominator, and the sum of the groups is not it: it omits
 	// every series carrying no group-by label. Percentages are null too.
@@ -141,7 +145,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			return nil, err
 		}
 	}
-	groups, err := c.LabelValues(ctx, o.by, start, end)
+	groups, err := labelValues(ctx, c, o.timeout, o.by, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -166,51 +170,54 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		Failed:       []failJSON{},
 	}
 
-	type result struct {
-		name   string
-		value  float64
-		header string
-		rate   bool
-		err    error
-	}
-	results := make([]result, len(groups))
+	results := mergeGroups(ctx, c, o, profType, groups, start, end, window)
 
-	// A run can take minutes. With no output at all, "still merging" and
-	// "hung" look identical -- and with the default --timeout the first thing
-	// you saw could be an error after a minute of silence.
-	prog := newProgress("merging", o.by+" groups", len(groups))
-	prog.start()
-
-	sem := make(chan struct{}, max(1, o.concurrency))
-	var wg sync.WaitGroup
-	for i, g := range groups {
-		wg.Add(1)
-		go func(i int, g string) {
-			defer wg.Done()
-			defer prog.step()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			qctx, qcancel := context.WithTimeout(ctx, o.timeout)
-			defer qcancel()
-			raw, err := c.MergePprof(qctx, selector(profType, o.by, g, o.match), start, end)
-			if err != nil {
-				results[i] = result{name: g, err: err}
-				return
+	// A dropped stream is the server going away mid-answer, not the query
+	// being wrong, and it is transient. Ask again -- but only for the groups
+	// that failed that way, and one at a time. Re-running the whole fan-out
+	// would double the load on a server that has just said it has none to
+	// spare, which is what caused the failure in the first place.
+	//
+	// Once each. A second failure keeps the first error rather than replacing
+	// it with a less informative one, and there is no third attempt: past
+	// that, retrying is just the same load again.
+	if again := transientGroups(results); len(again) > 0 {
+		// Half of what is left, at most, when something comes after this.
+		// Checking only "is there room for one more" let a section with
+		// fifteen dropped groups keep passing the check until the budget was
+		// nearly gone, and every later section then failed on the deadline --
+		// the retry made the run worse than no retry.
+		//
+		// Only when something comes after it. A plain report is the whole
+		// run, so holding half the budget back there would forfeit it for
+		// nothing.
+		var until time.Time
+		if dl, ok := ctx.Deadline(); ok && o.moreToCome {
+			until = time.Now().Add(time.Until(dl) / 2)
+		}
+		// Up to --timeout each, one after another: without a line on stderr
+		// this is minutes of silence after the merging bar has cleared, and
+		// "still retrying" and "hung" look identical.
+		prog := newProgress("retrying", o.by+" groups", len(again))
+		prog.start()
+		for _, idx := range again {
+			if !budgetLeftFor(ctx, o.timeout) {
+				break
 			}
-			p, err := parsePprof(raw)
-			if err != nil || p == nil {
-				results[i] = result{name: g, err: err}
-				return
+			if !until.IsZero() && time.Now().After(until) {
+				break
 			}
-			m, err := interpret(p, window)
-			results[i] = result{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
-		}(i, g)
+			if r := mergeOne(ctx, c, o, profType, groups[idx], start, end, window); r.err == nil {
+				results[idx] = r
+			}
+			d.Retried++
+			prog.step()
+		}
+		prog.stop()
 	}
-	wg.Wait()
-	prog.stop()
-	// Checked once, right after the fan-out: if the run's budget went while
-	// those queries were in flight, every one of them was cut short by it.
+
+	// Checked once, after every attempt: if the run's budget went while those
+	// queries were in flight, every one of them was cut short by it.
 	runExpired := ctx.Err() != nil
 	d.runExpired = runExpired
 
@@ -404,4 +411,125 @@ func reportShortfall(o options, groupCount int, failed []failure, overallErr err
 			"the function table are missing: %s", shortErr(overallErr))
 	}
 	return nil
+}
+
+// groupResult is one group's merge: its value, or why it has none.
+type groupResult struct {
+	name   string
+	value  float64
+	header string
+	rate   bool
+	err    error
+}
+
+// mergeGroups merges one profile per label value, up to concurrency at a time,
+// and returns a result per group in the order given.
+func mergeGroups(ctx context.Context, c *Client, o options, profType string, groups []string,
+	start, end time.Time, window time.Duration) []groupResult {
+	results := make([]groupResult, len(groups))
+
+	// A run can take minutes. With no output at all, "still merging" and
+	// "hung" look identical -- and with the default --timeout the first thing
+	// you saw could be an error after a minute of silence.
+	prog := newProgress("merging", o.by+" groups", len(groups))
+	prog.start()
+	defer prog.stop()
+
+	sem := make(chan struct{}, max(1, o.concurrency))
+	var wg sync.WaitGroup
+	for i, g := range groups {
+		wg.Add(1)
+		go func(i int, g string) {
+			defer wg.Done()
+			defer prog.step()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = mergeOne(ctx, c, o, profType, g, start, end, window)
+		}(i, g)
+	}
+	wg.Wait()
+	return results
+}
+
+// mergeOne merges a single group, bounded by --timeout.
+func mergeOne(ctx context.Context, c *Client, o options, profType, g string,
+	start, end time.Time, window time.Duration) groupResult {
+	qctx, qcancel := context.WithTimeout(ctx, o.timeout)
+	defer qcancel()
+	raw, err := c.MergePprof(qctx, selector(profType, o.by, g, o.match), start, end)
+	if err != nil {
+		return groupResult{name: g, err: err}
+	}
+	p, err := parsePprof(raw)
+	if err != nil || p == nil {
+		return groupResult{name: g, err: err}
+	}
+	m, err := interpret(p, window)
+	return groupResult{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
+}
+
+// transientGroups returns the indexes of groups that failed in a way worth one
+// more attempt.
+func transientGroups(results []groupResult) []int {
+	var idx []int
+	for i, r := range results {
+		if r.err != nil && looksTransient(r.err) {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+// budgetLeftFor reports whether the run's budget has room for another query:
+// more than two timeouts' worth, so a retry cannot be started that only has
+// time to fail on the deadline.
+//
+// This is the per-query guard. The retry pass has a second one -- at most half
+// the remaining budget, when sections follow -- and which of the two binds
+// depends on the numbers: this one first when the deadline is tight against
+// --timeout, the half-budget cap first when it is generous.
+func budgetLeftFor(ctx context.Context, timeout time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(dl) > 2*timeout
+}
+
+// labelValues lists a label's values, asking again once if the server dropped
+// the answer. Losing this one costs the whole report rather than one group:
+// there is nothing left to break anything down by.
+func labelValues(ctx context.Context, c *Client, timeout time.Duration, by string, start, end time.Time) ([]string, error) {
+	vals, err := c.LabelValues(ctx, by, start, end)
+	if err == nil || !looksTransient(err) || !budgetLeftFor(ctx, timeout) {
+		return vals, err
+	}
+	// Keep the first error if the second attempt fails too. A deadline that
+	// expired during the retry would otherwise replace the RST_STREAM that
+	// explains the failure with a "context deadline exceeded" that does not.
+	again, againErr := c.LabelValues(ctx, by, start, end)
+	if againErr != nil {
+		return vals, err
+	}
+	return again, nil
+}
+
+// looksTransient reports whether a failure is the server dropping the
+// connection rather than rejecting the request. Those are worth one retry;
+// a bad selector or an empty window is not.
+func looksTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{"RST_STREAM", "INTERNAL_ERROR", "unavailable", "Unavailable",
+		"connection reset", "error reading from server", "server preface"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
