@@ -414,6 +414,26 @@ about two minutes against a real server. So a label with more than
 `--concurrency` bounds the queries within one section, not across sections;
 sections run one after another. Start with a narrow `--from`.
 
+**A busy Parca refuses wide queries rather than answering them slowly.** Every
+merge materialises a profile in the server's memory, so several at once is
+several profiles at once, on a process that is also ingesting. When it runs
+out, the queries come back as `RST_STREAM with error code: INTERNAL_ERROR` or
+`error reading from server`. Those are the connection going away mid-answer,
+not a complaint about the query — the same query on its own succeeds.
+
+Two things follow, both of which `overview` does for you:
+
+- It runs **2 queries at once**, not the `--concurrency` default of 4, because
+  it issues more queries than any other command and so meets the wall first.
+  An explicit `--concurrency` is always honoured; if your server copes, say so.
+- A section that failed with that signature is **retried once**. One retry
+  turns a lost breakdown into a slow one. Only once, and only for that
+  signature: retrying a real error would just double the load that caused it.
+
+If a section still fails, lower `--concurrency` to 1 and narrow `--from`.
+Raising the server's memory limit does not make this go away — it only moves
+the point at which it starts, and the failure is refusal, not a crash.
+
 The hot functions come from the unfiltered merge, so every breakdown of one
 profile type would produce the same table. It is shown once per type.
 
@@ -451,7 +471,7 @@ both per section, so accepting them would silently do something else.
 | `--output` | `table` | `json` for a machine-readable report |
 | `--max-group-values` | `50` | overview: skip a breakdown with more values than this; `0` disables the skip |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
-| `--concurrency` | `4` | parallel queries, within one breakdown |
+| `--concurrency` | `4` | parallel queries, within one breakdown (`overview` uses 2 unless you set it) |
 | `--timeout` | `60s` | per-query deadline |
 | `--deadline` | `10m` | budget for the whole run; `0` removes it |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |

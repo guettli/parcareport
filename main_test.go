@@ -227,7 +227,16 @@ type fakeQuery struct {
 	// empty pprof, which is what Parca returns for a window with no samples.
 	merges    map[string]*profile.Profile
 	mergeErrs map[string]error
-	block     time.Duration // make Values hang, to exercise the deadline
+	// maxParallel records the peak number of merges in flight, so a test can
+	// see what concurrency was actually used.
+	inFlight    atomic.Int64
+	maxParallel atomic.Int64
+	mergeDelay  time.Duration
+	// failFirstN fails that many merge attempts with a transient-looking
+	// error before succeeding, the way an overloaded server does.
+	failFirstN int64
+	failCount  atomic.Int64
+	block      time.Duration // make Values hang, to exercise the deadline
 }
 
 func (f *fakeQuery) ProfileTypes(ctx context.Context, _ *qv1.ProfileTypesRequest, _ ...grpc.CallOption) (*qv1.ProfileTypesResponse, error) {
@@ -572,6 +581,21 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 	sel := in.GetMerge().GetQuery()
 	if err := f.mergeErrs[sel]; err != nil {
 		return nil, err
+	}
+	if f.failFirstN > 0 && f.failCount.Add(1) <= f.failFirstN {
+		return nil, status.Error(codes.Internal,
+			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
+	}
+	n := f.inFlight.Add(1)
+	for {
+		peak := f.maxParallel.Load()
+		if n <= peak || f.maxParallel.CompareAndSwap(peak, n) {
+			break
+		}
+	}
+	defer f.inFlight.Add(-1)
+	if f.mergeDelay > 0 {
+		time.Sleep(f.mergeDelay)
 	}
 	p := f.merges[sel]
 	if p == nil {
@@ -2394,5 +2418,114 @@ func TestReportStillResolvesItsOwnType(t *testing.T) {
 	}
 	if !strings.Contains(out, testType) {
 		t.Errorf("missing the heading:\n%s", out)
+	}
+}
+
+// overview issues more queries than anything else, and a Parca sized for
+// ingestion refuses at four abreast: measured on a real server, an 8-group
+// heap breakdown failed all 8 at --concurrency=8 and succeeded at 1.
+func TestOverviewLowersConcurrencyUnlessAsked(t *testing.T) {
+	// Enough groups to exceed the cap, and a delay on each merge so they
+	// actually overlap -- without both, the observed peak is 1 whatever the
+	// setting, and the assertion means nothing.
+	fixture := func() *fakeQuery {
+		f := overviewFixture(t)
+		f.types = profileTypesFrom([]string{testType})
+		f.names = []string{"cluster"}
+		f.values["cluster"] = []string{"c1", "c2", "c3", "c4", "c5"}
+		for _, c := range f.values["cluster"] {
+			f.merges[testType+`{cluster="`+c+`"}`] = cpuProfile(t, 10)
+		}
+		f.merges[testType] = cpuProfile(t, 50)
+		f.mergeDelay = 20 * time.Millisecond
+		return f
+	}
+
+	// Default: turned down.
+	f := fixture()
+	o := overviewOptions()
+	o.top, o.concurrency = 0, 4
+	if _, err := runOverview(t, f, o); err != nil {
+		t.Fatal(err)
+	}
+	if peak := f.maxParallel.Load(); peak > int64(overviewConcurrency) {
+		t.Errorf("ran %d queries at once, want at most %d", peak, overviewConcurrency)
+	}
+
+	// Explicit: honoured. Someone who has measured their own server knows
+	// better than this default.
+	f2 := fixture()
+	o2 := overviewOptions()
+	o2.top, o2.concurrency = 0, 4
+	o2.setFlags = map[string]bool{"concurrency": true}
+	if _, err := runOverview(t, f2, o2); err != nil {
+		t.Fatal(err)
+	}
+	if peak := f2.maxParallel.Load(); peak <= int64(overviewConcurrency) {
+		t.Errorf("an explicit --concurrency=4 was lowered anyway (peak %d)", peak)
+	}
+}
+
+// A stream reset under load is the server going away, not the query being
+// wrong, and it is transient. One retry turns a lost breakdown into a slow
+// one.
+func TestOverviewRetriesATransientSectionOnce(t *testing.T) {
+	f := overviewFixture(t)
+	f.types = profileTypesFrom([]string{testType})
+	// One label, so one section: this test is about the retry, not about
+	// other breakdowns having no data.
+	f.names = []string{"cluster"}
+	f.values["cluster"] = []string{"tc"}
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType] = cpuProfile(t, 100)
+	// Fail only the section's first merge, the way an overloaded server drops
+	// one stream. Failing two would defeat the single retry as well, which is
+	// what this test would then be measuring instead.
+	f.failFirstN = 1
+
+	o := overviewOptions()
+	o.top = 0
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("a transient failure should be retried, not reported: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "CLUSTER") {
+		t.Errorf("the retried section should appear:\n%s", out)
+	}
+	if strings.Contains(out, "FAILED") || strings.Contains(out, "INCOMPLETE") {
+		t.Errorf("a retried section should not leave a banner behind:\n%s", out)
+	}
+	// Three merges: the failed group, then on retry the group again plus the
+	// unfiltered one the group table needs. One retry, never a loop.
+	if n := f.failCount.Load(); n != 3 {
+		t.Errorf("%d merge attempts, want 3 (failed group, then group + unfiltered)", n)
+	}
+}
+
+// A genuine error must not be retried -- that just doubles the load that
+// caused it.
+func TestLooksTransient(t *testing.T) {
+	for _, s := range []string{
+		"stream terminated by RST_STREAM with error code: INTERNAL_ERROR",
+		"error reading from server: EOF",
+		`"error reading server preface: connection reset by peer"`,
+		"code = Unavailable desc = connection error",
+	} {
+		if !looksTransient(errors.New(s)) {
+			t.Errorf("%q is the server going away", s)
+		}
+	}
+	for _, s := range []string{
+		"no data in this window",
+		"profile-type selection must be of the form",
+		"context deadline exceeded",
+		"no label \"clustr\"",
+	} {
+		if looksTransient(errors.New(s)) {
+			t.Errorf("%q is not worth retrying", s)
+		}
+	}
+	if looksTransient(nil) {
+		t.Error("nil is not a failure")
 	}
 }

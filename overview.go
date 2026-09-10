@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -20,6 +21,10 @@ import (
 // these their agents were configured to emit -- namespace, container and
 // workload only exist if the agents were given relabel_configs.
 var overviewBreakdowns = []string{"cluster", "namespace", "workload", "comm"}
+
+// overviewConcurrency is how many queries a section runs at once, when the
+// caller has not said. See the reasoning where it is applied.
+const overviewConcurrency = 2
 
 // overviewData is one overview: the same report run a few ways.
 type overviewData struct {
@@ -168,6 +173,24 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		return err
 	}
 
+	// Lower concurrency than a single report, unless asked otherwise.
+	//
+	// Sections already run one after another, but the queries inside a
+	// section went four abreast, and each concurrent merge materialises a
+	// profile server-side. A Parca sized for ingestion refuses at that rate:
+	// on the server this was measured against, an 8-group heap breakdown at
+	// --concurrency=8 failed all 8 with RST_STREAM, at 2 it lost the label
+	// lookup, and at 1 it succeeded. overview is the command most likely to
+	// meet that wall, because it issues more queries than anything else.
+	//
+	// Two rather than one: sequential would roughly double an already slow
+	// command for no benefit on a server that is coping. An explicit
+	// --concurrency always wins -- someone who has measured their own server
+	// knows better than this default.
+	if !o.setFlags["concurrency"] && o.concurrency > overviewConcurrency {
+		o.concurrency = overviewConcurrency
+	}
+
 	d.Complete = true
 	for _, p := range plan {
 		so := o
@@ -176,6 +199,17 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		so.resolvedType, so.by = p.profType, p.by
 		so.profileType = p.profType
 		sd, serr := gatherReport(ctx, c, so, start, end)
+		// A stream reset under load is the server going away, not the query
+		// being wrong, and it is transient. One retry turns a lost breakdown
+		// into a slow one. Only once, and only for that signature: retrying a
+		// genuine error just doubles the load that caused it.
+		//
+		// The section's own error is a summary -- "3 of 8 queries failed" --
+		// and carries none of the causes, so the per-group failures are what
+		// has to be inspected.
+		if sectionLooksTransient(sd, serr) && ctx.Err() == nil {
+			sd, serr = gatherReport(ctx, c, so, start, end)
+		}
 		if sd == nil {
 			// One section failing is not the whole overview failing; that is
 			// the point of running several.
@@ -256,6 +290,44 @@ func printSkipped(skipped []skippedJSON) {
 	for _, s := range skipped {
 		fmt.Printf("-- not reported: %s (%s)\n", s.What, s.Reason)
 	}
+}
+
+// sectionLooksTransient reports whether a section failed because the server
+// dropped connections, looking past the summary error to the causes it
+// omits.
+func sectionLooksTransient(d *reportData, err error) bool {
+	if err == nil {
+		return false
+	}
+	if looksTransient(err) {
+		return true
+	}
+	if d == nil {
+		return false
+	}
+	for _, f := range d.Failed {
+		if looksTransient(errors.New(f.Error)) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksTransient reports whether a failure is the server dropping the
+// connection rather than rejecting the request. Those are worth one retry;
+// a bad selector or an empty window is not.
+func looksTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{"RST_STREAM", "INTERNAL_ERROR", "unavailable", "Unavailable",
+		"connection reset", "error reading from server", "server preface"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // findHeapType picks the live-heap profile by its parts rather than by a

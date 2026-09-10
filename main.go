@@ -74,7 +74,7 @@ func run(args []string) error {
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.StringVar(&o.output, "output", outputTable, "'table' for a person, 'json' for a script")
 	fs.IntVar(&o.maxGroups, "max-group-values", 50, "overview: skip a breakdown whose label has more values than this")
-	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
+	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out (overview lowers this to 2 unless given)")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.DurationVar(&o.deadline, "deadline", 10*time.Minute, "budget for the whole run; 0 removes it and relies on --timeout alone")
 	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
