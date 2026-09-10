@@ -44,11 +44,19 @@ type options struct {
 	sortBy      string
 	output      string
 	maxGroups   int
+	// moreToCome says another report runs after this one under the same
+	// --deadline, so this one must not spend all of it. overview sets it;
+	// a plain report is the whole run.
+	moreToCome bool
 	// setFlags records which flags were given, so a subcommand can refuse one
 	// it would otherwise ignore.
-	setFlags     map[string]bool
-	concurrency  int
-	timeout      time.Duration
+	setFlags    map[string]bool
+	concurrency int
+	timeout     time.Duration
+	deadline    time.Duration
+	// resolvedType lets a caller that already knows the profile type skip the
+	// lookup. Not a flag: only overview sets it.
+	resolvedType string
 	bearerToken  string
 	tokenFile    string
 	username     string
@@ -70,8 +78,9 @@ func run(args []string) error {
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.StringVar(&o.output, "output", outputTable, "'table' for a person, 'json' for a script")
 	fs.IntVar(&o.maxGroups, "max-group-values", 50, "overview: skip a breakdown whose label has more values than this")
-	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out")
+	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out (overview lowers this to 2 unless given)")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
+	fs.DurationVar(&o.deadline, "deadline", 10*time.Minute, "budget for the whole run; 0 removes it and relies on --timeout alone")
 	fs.StringVar(&o.bearerToken, "bearer-token", "", "Authorization: Bearer token (requires --insecure=false)")
 	fs.StringVar(&o.tokenFile, "bearer-token-file", "", "read the bearer token from a file, keeping it out of the process list")
 	fs.StringVar(&o.username, "username", "", "basic auth username (requires --insecure=false)")
@@ -130,7 +139,10 @@ func run(args []string) error {
 	}
 	defer c.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel, err := runContext(o)
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	switch sub {
@@ -145,7 +157,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end, o.concurrency)
+		return listLabels(ctx, c, subArg, start, end, o.concurrency, o.timeout)
 	case "overview":
 		if subArg != "" {
 			return fmt.Errorf("overview takes no argument, got %q", subArg)
@@ -232,12 +244,54 @@ func readSecretFile(flag, path string) (string, error) {
 	return v, nil
 }
 
+// runContext builds the context every query descends from, and refuses the
+// clock settings that cannot mean what they say.
+//
+// Two clocks: --deadline bounds the whole run, --timeout bounds one query.
+// Each query's context derives from the run's, so the run's deadline always
+// wins when --timeout is not strictly smaller -- the per-query clock then
+// never fires at all.
+func runContext(o options) (context.Context, context.CancelFunc, error) {
+	noop := func() {}
+	// A non-positive --timeout is not "unbounded": gatherReport wraps every
+	// merge in WithTimeout(ctx, o.timeout), and 0 or negative yields a context
+	// that has already expired. Every query then fails before it is sent,
+	// reported as N simultaneous deadline-exceededs with advice to raise
+	// --timeout -- the exact output this validation exists to prevent. Client
+	// metadata queries meanwhile read <= 0 as unbounded, so the two halves of
+	// the tool would disagree. Refuse it.
+	//
+	// It matters more now that --deadline=0 means "no budget", because
+	// --timeout=0 is the obvious next thing to try.
+	if o.timeout <= 0 {
+		return nil, noop, fmt.Errorf("--timeout must be positive, got %s: a zero or negative "+
+			"per-query deadline has already expired, so every query would fail before it was sent", o.timeout)
+	}
+	if o.deadline < 0 {
+		return nil, noop, fmt.Errorf("--deadline cannot be negative, got %s: use 0 to run without a budget",
+			o.deadline)
+	}
+	if o.deadline > 0 && o.timeout >= o.deadline {
+		return nil, noop, fmt.Errorf("--timeout (%s) must be below --deadline (%s), or it can never fire: "+
+			"every query's clock derives from the run's, so the run's budget expires first and the "+
+			"per-query deadline is never reached. Lower --timeout, or raise --deadline",
+			o.timeout, o.deadline)
+	}
+	if o.deadline == 0 {
+		return context.Background(), noop, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), o.deadline)
+	return ctx, cancel, nil
+}
+
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int) error {
+func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int, timeout time.Duration) error {
 	if name != "" {
-		vals, err := c.LabelValues(ctx, name, start, end)
+		// One dropped stream kills this whole command, so it gets the same
+		// single retry as a group merge.
+		vals, err := labelValues(ctx, c, timeout, name, start, end)
 		if err != nil {
 			return err
 		}
@@ -315,7 +369,7 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 	if len(failedMsgs) > 0 {
 		// shortErr keeps only the gRPC tail, which for a deadline is the least
 		// useful half: the advice metaErr attached sits in front of it.
-		if h := hintFor(failedMsgs, metadataQuery); h != "" {
+		if h := hintFor(failedMsgs, metadataQuery, ctx.Err() != nil); h != "" {
 			fmt.Print(h)
 		}
 	}
@@ -625,13 +679,13 @@ type failure struct {
 // same way showed five lines and "and 3 more", while a single group failing
 // for a different reason might be the one truncated away. Grouping by message
 // gives every distinct cause a line, and collapses a wholesale outage to one.
-func printFailures(failed []failure, kind failureKind) {
-	fmt.Print(formatFailures(failed, kind))
+func printFailures(failed []failure, kind failureKind, runExpired bool) {
+	fmt.Print(formatFailures(failed, kind, runExpired))
 }
 
 // formatFailures builds what printFailures prints, so a caller that must not
 // write to stdout yet can hold on to it.
-func formatFailures(failed []failure, kind failureKind) string {
+func formatFailures(failed []failure, kind failureKind, runExpired bool) string {
 	var b strings.Builder
 	var order []string
 	byMsg := map[string][]string{}
@@ -669,7 +723,7 @@ func formatFailures(failed []failure, kind failureKind) string {
 	}
 	// Only the causes actually on screen, so a hint never refers to a line
 	// that was truncated away.
-	if h := hintFor(shown, kind); h != "" {
+	if h := hintFor(shown, kind, runExpired); h != "" {
 		b.WriteString(h)
 	}
 	return b.String()
@@ -680,7 +734,16 @@ func formatFailures(failed []failure, kind failureKind) string {
 // "stream terminated by RST_STREAM with error code: INTERNAL_ERROR" is the
 // motivating case: there is no gRPC boilerplate for shortErr to strip and
 // nothing in it says what to do, yet it can take minutes to arrive.
-func hintFor(msgs []string, kind failureKind) string {
+func hintFor(msgs []string, kind failureKind, runExpired bool) string {
+	if runExpired {
+		// One clock fired, not N. Saying "raise --timeout" here sent the
+		// reader after the wrong knob -- and after a value that could not
+		// have helped.
+		return "!! The run's --deadline expired, so every query still outstanding was cut\n" +
+			"!! short at the same moment. This is one clock, not many slow queries.\n" +
+			"!! Raise --deadline, narrow the window with --from, or group by a label with\n" +
+			"!! fewer values.\n"
+	}
 	var reset, deadline bool
 	for _, m := range msgs {
 		switch {

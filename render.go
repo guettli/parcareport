@@ -45,10 +45,11 @@ func renderTable(d *reportData) {
 			d.window.Round(time.Second))
 	}
 	if d.noRows {
-		// Both notes belong here most of all. A window that reached none of
-		// the series produces exactly this page, and without them an idle
-		// cluster and a window that missed everything look identical.
+		// Both belong here most of all. A window that reached none of the
+		// series produces exactly this page, and so does a run where
+		// everything was asked twice and still came back with nothing.
 		printSeriesNotes(d)
+		printRetried(d)
 		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)
 		return
@@ -74,6 +75,7 @@ func renderTable(d *reportData) {
 	if d.EmptyGroups > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", d.EmptyGroups, d.GroupBy)
 	}
+	printRetried(d)
 
 	// One banner, however many things went wrong.
 	if len(d.failed) > 0 || d.overallErr != nil {
@@ -95,7 +97,7 @@ func renderTable(d *reportData) {
 			all = append(append([]failure{}, d.failed...),
 				failure{group: "(overall)", msg: shortErr(d.overallErr)})
 		}
-		printFailures(all, mergeQuery)
+		printFailures(all, mergeQuery, d.runExpired)
 	}
 
 	if len(d.Functions) > 0 {
@@ -167,4 +169,24 @@ func printSeriesNotes(d *reportData) {
 		fmt.Printf("(%d of the series matched had more than one scrape inside the window, so they are counted more than once)\n",
 			d.DoubledSeries)
 	}
+}
+
+// plural picks the wording for a count, so messages do not say "1 queries".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// printRetried says how many queries had to be asked twice. A run that
+// quietly takes twice as long is the kind of thing this tool says out loud:
+// the server dropped those queries, and it will do it again if the window
+// stays this wide.
+func printRetried(d *reportData) {
+	if d.Retried == 0 {
+		return
+	}
+	fmt.Printf("(%d %s %s asked again: the server dropped the first attempt)\n",
+		d.Retried, d.GroupBy, plural(d.Retried, "query was", "queries were"))
 }

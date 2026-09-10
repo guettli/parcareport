@@ -203,8 +203,23 @@ That last hint matters more than it looks. A stream reset carries no gRPC
 boilerplate to strip and says nothing about what to do, yet it can take
 minutes to arrive.
 
-`--timeout` (default 60s) bounds each query so one slow group fails visibly
-instead of stalling the run. That includes the label and profile-type lookups,
+There are two clocks, and they have to be told apart. `--deadline` (default
+10m) is the budget for the whole run; `--timeout` (default 60s) bounds one
+query. Every query's clock derives from the run's, so:
+
+- **`--timeout` at or above `--deadline` is refused.** It could never fire —
+  the run's budget expires first, every outstanding query reports its own
+  deadline at the same moment, and the advice to raise `--timeout` cannot
+  work. `--deadline=0` removes the budget for a deliberately long run.
+- **`--timeout` must be positive.** Zero is not "unbounded" here: it is a
+  deadline that has already passed, so every query would fail before being
+  sent.
+- **When the run's budget is what expired**, the failure says so and points at
+  `--deadline`, rather than blaming `--timeout` for a query that may have had
+  milliseconds rather than its full allowance. One clock fired, not N.
+
+It bounds each query so one slow group fails visibly instead of stalling the
+run — including the label and profile-type lookups,
 and the unfiltered merge behind the `(unlabeled)` row — which, carrying no
 matcher at all, is the widest query in the run and was the one query with no
 bound of its own.
@@ -483,6 +498,45 @@ about two minutes against a real server. So a label with more than
 `--concurrency` bounds the queries within one section, not across sections;
 sections run one after another. Start with a narrow `--from`.
 
+**A busy Parca refuses wide queries rather than answering them slowly.** Every
+merge materialises a profile in the server's memory, so several at once is
+several profiles at once, on a process that is also ingesting. When it runs
+out, the queries come back as `RST_STREAM with error code: INTERNAL_ERROR` or
+`error reading from server`. Those are the connection going away mid-answer,
+not a complaint about the query — the same query on its own succeeds.
+
+Two things follow:
+
+- `overview` runs **2 queries at once**, not the `--concurrency` default of 4,
+  because it issues more queries than any other command and so meets the wall
+  first. An explicit `--concurrency` is always honoured; if your server copes,
+  say so.
+- A query that failed that way is **asked once more** — and only that query,
+  one at a time. Re-running the whole breakdown would send the server the same
+  load that just defeated it. A query the server *rejected*, rather than
+  dropped, is not retried: that would just repeat a wrong query. Retries get at
+  most half of whatever `--deadline` is left, so a section with many dropped
+  groups cannot spend the budget the later sections still need. (A plain
+  `parcareport` run is the whole run, so it keeps nothing back; and with
+  `--deadline=0` there is no budget to divide, leaving `--timeout` per query
+  as the only bound on how long retrying can go on.) Label lookups
+  get the same single retry — losing one of those costs a whole breakdown, or
+  the whole command, rather than one group.
+
+  This part is not specific to `overview`: a plain `parcareport` run retries
+  its own dropped queries the same way.
+
+When it happens you are told, because a run that quietly takes twice as long
+is worth knowing about:
+
+```
+(2 namespace queries were asked again: the server dropped the first attempt)
+```
+
+If queries still fail, lower `--concurrency` to 1 and narrow `--from`. Raising
+the server's memory limit does not make this go away — it only moves the point
+at which it starts, and the failure is refusal, not a crash.
+
 The hot functions come from the unfiltered merge, so every breakdown of one
 profile type would produce the same table. It is shown once per type.
 
@@ -521,8 +575,9 @@ both per section, so accepting them would silently do something else.
 | | | non-delta profiles are merged over one scrape interval, not the whole window |
 | `--max-group-values` | `50` | overview: skip a breakdown with more values than this; `0` disables the skip |
 | `--sort` | `flat` | order functions by `flat` (self time) or `cum`; `self` and `cumulative` also work |
-| `--concurrency` | `4` | parallel queries, within one breakdown |
+| `--concurrency` | `4` | parallel queries, within one breakdown (`overview` uses 2 unless you set it) |
 | `--timeout` | `60s` | per-query deadline |
+| `--deadline` | `10m` | budget for the whole run; `0` removes it |
 | `--insecure` | `true` | plaintext connection; `false` uses TLS |
 | `--bearer-token-file` | | read an auth token from a file (needs `--insecure=false`) |
 | `--username` / `--password-file` | | basic auth (needs `--insecure=false`) |
