@@ -47,12 +47,17 @@ type reportData struct {
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
-	// StaleSeries counts series whose newest scrape fell outside the snapshot
-	// window because they are scraped less often than the fastest series in
-	// the selector. They contribute nothing to these numbers, and a series
-	// vanishing from a total without saying so is exactly what this tool is
-	// for pointing out.
+	// StaleSeries counts series with no scrape inside the snapshot window --
+	// usually because they are scraped less often than the fastest series in
+	// the selector, though the code only knows the window missed them. They
+	// contribute nothing to these numbers, and a series vanishing from a
+	// total without saying so is exactly what this tool exists to point out.
 	StaleSeries int `json:"stale_series,omitempty"`
+	// DoubledSeries counts series with MORE than one scrape inside the
+	// window, which are therefore counted twice. The interval estimate is a
+	// median, so a series that genuinely scraped twice in one median gap can
+	// land here. Rare, and said out loud rather than left in the number.
+	DoubledSeries int `json:"doubled_series,omitempty"`
 	// Total is null when the unfiltered merge failed or came back empty. There
 	// is then no denominator, and the sum of the groups is not it: it omits
 	// every series carrying no group-by label. Percentages are null too.
@@ -156,19 +161,19 @@ func unitName(header string) string {
 // far less often than the fastest one would otherwise just vanish from a
 // total with no sign that it had.
 func snapshotWindow(ctx context.Context, c *Client, selector string, start, end time.Time) (
-	from, to, latest time.Time, stale int, err error) {
+	from, to, latest time.Time, stale, doubled int, err error) {
 	times, err := c.ProfileTimes(ctx, selector, start, end)
 	if err != nil {
-		return start, end, time.Time{}, 0, err
+		return start, end, time.Time{}, 0, 0, err
 	}
 	if len(times) == 0 {
-		return start, end, time.Time{}, 0, nil // nothing in the window
+		return start, end, time.Time{}, 0, 0, nil // nothing in the window
 	}
 	latest, interval := latestAndInterval(times)
 	if interval <= 0 {
 		// One profile per series and no spacing to infer -- the window
 		// already holds a single scrape, so merging it whole is safe.
-		return start, end, latest, 0, nil
+		return start, end, latest, 0, 0, nil
 	}
 	from = latest.Add(-interval).Add(time.Nanosecond)
 	to = latest
@@ -176,19 +181,44 @@ func snapshotWindow(ctx context.Context, c *Client, selector string, start, end 
 		from = start
 	}
 	for _, series := range times {
-		if len(series) == 0 {
-			continue
+		inWindow := 0
+		for _, t := range series {
+			if !t.Before(from) && !t.After(to) {
+				inWindow++
+			}
 		}
-		if newest := series[len(series)-1]; newest.Before(from) {
+		switch {
+		case inWindow == 0:
 			stale++
+		case inWindow > 1:
+			doubled++
 		}
 	}
-	return from, to, latest, stale, nil
+	return from, to, latest, stale, doubled, nil
 }
 
-// does not widen the estimate and pull in two scrapes per series.
+// latestAndInterval finds the newest timestamp in the selector and estimates
+// the scrape interval from the spacing between timestamps.
+//
+// The estimate is each series' median gap, then the smallest of those medians.
+// The lower median where the count is even, so an even split errs toward the
+// narrower window rather than one wide enough to hold two scrapes.
+//
+// The smallest gap outright would be safer against double-counting, but it is
+// far too easy to break: one close-together pair anywhere -- an agent restart,
+// a backfill, a scrape that ran early -- collapses the window for the entire
+// fleet, and then almost nothing falls inside it. Measured on synthetic
+// series, a single 5-second gap among 60-second scrapes cut a three-target
+// total to one target: a third of the truth, reported as if it were all of
+// it. A median ignores one outlier gap and keeps the whole fleet in the
+// window.
+//
+// What that costs: a series that really did scrape twice in one median gap
+// can have both scrapes inside the window and be counted twice. The caller
+// counts those and says so, rather than letting the number be quietly wrong.
 func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Duration) {
 	for _, series := range times {
+		var gaps []time.Duration
 		for i, t := range series {
 			if t.After(latest) {
 				latest = t
@@ -196,9 +226,16 @@ func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Dur
 			if i == 0 {
 				continue
 			}
-			if gap := t.Sub(series[i-1]); gap > 0 && (interval == 0 || gap < interval) {
-				interval = gap
+			if gap := t.Sub(series[i-1]); gap > 0 {
+				gaps = append(gaps, gap)
 			}
+		}
+		if len(gaps) == 0 {
+			continue
+		}
+		sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
+		if median := gaps[(len(gaps)-1)/2]; interval == 0 || median < interval {
+			interval = median
 		}
 	}
 	return latest, interval
@@ -238,15 +275,16 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// excludes it, and the rows would sum to more than 100%.
 	qstart, qend := start, end
 	var snapAt time.Time
-	staleSeries := 0
+	staleSeries, doubledSeries := 0, 0
 	if !delta {
 		wctx, wcancel := context.WithTimeout(ctx, o.timeout)
-		f, t, latest, stale, err := snapshotWindow(wctx, c, selector(profType, "", "", o.match), start, end)
+		f, t, latest, stale, doubled, err := snapshotWindow(wctx, c, selector(profType, "", "", o.match), start, end)
 		wcancel()
 		if err != nil {
 			return nil, err
 		}
-		qstart, qend, snapAt, staleSeries = f, t, latest, stale
+		qstart, qend, snapAt = f, t, latest
+		staleSeries, doubledSeries = stale, doubled
 	}
 	d := &reportData{
 		ProfileType:  profType,
@@ -262,6 +300,12 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		Groups:       []groupJSON{},
 		Functions:    []funcJSON{},
 		Failed:       []failJSON{},
+		// Set here rather than after the fan-out: a collapsed window can
+		// leave every group empty, and that is exactly the run where the
+		// reader most needs to know scrapes existed and the window missed
+		// them.
+		StaleSeries:   staleSeries,
+		DoubledSeries: doubledSeries,
 	}
 
 	type result struct {
@@ -362,7 +406,6 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		at := snapAt.UTC()
 		d.SnapshotAt = &at
 	}
-	d.StaleSeries = staleSeries
 	var overall *profile.Profile
 	if overallErr == nil {
 		overall, overallErr = parsePprof(overallRaw)

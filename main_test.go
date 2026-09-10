@@ -226,6 +226,14 @@ type fakeQuery struct {
 	// check that the rows and the total describe the same moment.
 	mergeMu      sync.Mutex
 	mergeWindows [][2]time.Time
+	// extraScrape gives that many series one additional scrape a few seconds
+	// after their newest, the way a restart or a backfill does. Their median
+	// gap is unchanged, so the window still spans an interval -- and holds
+	// both of those samples.
+	extraScrape int
+	// laggingSeries makes that many of the series stop scraping a couple of
+	// intervals before the rest, the way a target that went away does.
+	laggingSeries int
 	// multiSeries makes one selector look like N scrape targets, each written
 	// at its own instant -- the shape that broke the single-profile approach.
 	multiSeries int
@@ -600,7 +608,7 @@ func (f *fakeQuery) QueryRange(ctx context.Context, in *qv1.QueryRangeRequest, _
 	// itself and the test that mattered could not fail.
 	var series []*qv1.MetricsSeries
 	for s := 0; s < f.seriesCount(); s++ {
-		times := fakeScrapeTimes(s, f.seriesCount(), in.GetStart().AsTime(), in.GetEnd().AsTime())
+		times := f.scrapeTimes(s, in.GetStart().AsTime(), in.GetEnd().AsTime())
 		if len(times) == 0 {
 			continue
 		}
@@ -631,7 +639,7 @@ func (f *fakeQuery) seriesCount() int {
 // targets by a hash of the target. A fake that put every series within a
 // second of the others could not show a merge window dropping half of them,
 // which is exactly the bug that hid behind the old one.
-func fakeScrapeTimes(s, seriesCount int, start, end time.Time) []time.Time {
+func (f *fakeQuery) scrapeTimes(s int, start, end time.Time) []time.Time {
 	// Scrapes run up to the end of whatever window is asked for -- what a
 	// live server looks like -- except in the snapshot fixtures, whose newest
 	// profile is snapshotTime.
@@ -639,7 +647,13 @@ func fakeScrapeTimes(s, seriesCount int, start, end time.Time) []time.Time {
 	if !snapshotTime.Before(start) && !snapshotTime.After(end) {
 		anchor = snapshotTime
 	}
+	seriesCount := f.seriesCount()
 	offset := time.Duration(s) * fakeScrapeInterval / time.Duration(seriesCount)
+	// A target that stopped scraping a while back: its newest sample is
+	// several intervals old, so a one-interval window cannot reach it.
+	if s >= seriesCount-f.laggingSeries {
+		offset += 3 * fakeScrapeInterval
+	}
 	var out []time.Time
 	for at := anchor.Add(-offset); !at.Before(start); at = at.Add(-fakeScrapeInterval) {
 		if at.After(end) {
@@ -649,6 +663,12 @@ func fakeScrapeTimes(s, seriesCount int, start, end time.Time) []time.Time {
 	}
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
+	}
+	if s < f.extraScrape && len(out) > 1 {
+		extra := out[len(out)-1].Add(-5 * time.Second)
+		if !extra.Before(start) {
+			out = append(out[:len(out)-1], extra, out[len(out)-1])
+		}
 	}
 	return out
 }
@@ -678,7 +698,7 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 		// window that excluded one could not be detected.
 		factor = 0
 		for s := 0; s < f.seriesCount(); s++ {
-			factor += len(fakeScrapeTimes(s, f.seriesCount(), m.GetStart().AsTime(), m.GetEnd().AsTime()))
+			factor += len(f.scrapeTimes(s, m.GetStart().AsTime(), m.GetEnd().AsTime()))
 		}
 		f.mergeMu.Lock()
 		f.mergeWindows = append(f.mergeWindows, [2]time.Time{m.GetStart().AsTime(), m.GetEnd().AsTime()})
@@ -2613,6 +2633,60 @@ func TestSnapshotGroupsAndTotalShareOneWindow(t *testing.T) {
 	}
 }
 
+// A series the window missed contributes nothing to the total. Letting it
+// vanish silently is the failure this whole change is about, one level down.
+func TestSeriesTheWindowMissedAreCounted(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	// Five targets staggered across a 60s interval, but the window is only
+	// one interval wide, and the fixture's oldest targets sit outside it.
+	f.multiSeries = 5
+	// Two of them stopped scraping a few intervals ago, so a one-interval
+	// window cannot reach them.
+	f.laggingSeries = 2
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 10<<20)
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "2 of the series matched had no scrape inside") {
+		t.Errorf("the two stopped series should be counted, not dropped silently:\n%s", out)
+	}
+}
+
+// The interval is a median, so a series that really did scrape twice inside
+// one median gap gets counted twice. Rare, but the number is then wrong, and
+// a wrong number that looks right is the thing this tool refuses.
+func TestSeriesCountedTwiceAreSaidOutLoud(t *testing.T) {
+	f := reportFixture(t)
+	f.types = profileTypesFrom([]string{heapType})
+	f.multiSeries = 3
+	// One of them scraped again five seconds after its newest.
+	f.extraScrape = 1
+	f.merges[heapType+`{cluster="tc"}`] = heapProfile(t, 10<<20)
+	f.merges[heapType] = heapProfile(t, 10<<20)
+
+	o := testOptions()
+	o.profileType, o.top = heapType, 0
+	end := snapshotTime.Add(10 * time.Second)
+	out := captureStdout(t, func() {
+		if err := report(context.Background(), testClient(f, time.Minute), o,
+			end.Add(-20*time.Minute), end); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "1 of the series matched had more than one scrape") {
+		t.Errorf("the doubled series should be named, not folded into the total:\n%s", out)
+	}
+}
+
 func TestLatestAndInterval(t *testing.T) {
 	base := time.Date(2026, 9, 10, 2, 0, 0, 0, time.UTC)
 	// Two series, 60s apart within each, offset from one another -- which is
@@ -2634,6 +2708,16 @@ func TestLatestAndInterval(t *testing.T) {
 	gappy := [][]time.Time{{base, base.Add(60 * time.Second), base.Add(600 * time.Second)}}
 	if _, iv := latestAndInterval(gappy); iv != 60*time.Second {
 		t.Errorf("interval = %v, want the smallest gap (60s)", iv)
+	}
+
+	// One close-together pair -- a restart, a backfill, a scrape that ran
+	// early -- must not collapse the window for the whole fleet. Taking the
+	// smallest gap outright cut a three-target total to one target.
+	outlier := [][]time.Time{
+		{base, base.Add(5 * time.Second), base.Add(65 * time.Second), base.Add(125 * time.Second)},
+	}
+	if _, iv := latestAndInterval(outlier); iv != 60*time.Second {
+		t.Errorf("interval = %v, want 60s: one short gap should not set the window", iv)
 	}
 
 	// One profile per series: nothing to infer, and the caller then merges

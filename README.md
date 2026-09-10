@@ -322,16 +322,22 @@ series contributes its own newest scrape:
 memory:inuse_space:bytes:space:bytes  newest scrape per series, ending 2026-09-10T02:19:52Z  (looked in 2026-09-10T02:00:00Z .. 2026-09-10T02:20:00Z)
 ```
 
-A series scraped far less often than the fastest one in the selector has no
-scrape inside that window. It is counted and named rather than silently left
-out:
+The interval is each series' median gap, then the smallest of those medians.
+Not the smallest gap outright: one close-together pair anywhere — an agent
+restart, a backfill, a scrape that ran early — would collapse the window for
+the whole fleet, and almost nothing would fall inside it. A median ignores one
+outlier.
+
+That leaves two ways a series can be misrepresented, and both are counted
+rather than folded silently into the number:
 
 ```
-(2 series scraped less often than the rest had nothing in this snapshot window, omitted)
+(2 of the series matched had no scrape inside the one-interval window, so they are not in these numbers)
+(1 of the series matched had more than one scrape inside the window and are counted twice)
 ```
 
 In `--output=json`, `delta` says which kind of profile it was and
-`snapshot_at` names the instant — `null` for a delta, where the window really
+`snapshot_at` names the newest scrape it reached — `null` for a delta, where the window really
 was merged.
 
 Widening the window on a snapshot profile therefore reaches further back for a

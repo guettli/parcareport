@@ -66,10 +66,7 @@ func renderTable(d *reportData) {
 		total = *d.Total
 	}
 	printGroupTable(strings.ToUpper(d.GroupBy), d.header, rows, total, d.knowTotal)
-	if d.StaleSeries > 0 {
-		fmt.Printf("(%d series scraped less often than the rest had nothing in this snapshot window, omitted)\n",
-			d.StaleSeries)
-	}
+	printSeriesNotes(d)
 	if d.EmptyGroups > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", d.EmptyGroups, d.GroupBy)
 	}
@@ -152,4 +149,18 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 		d.Error = err.Error()
 	}
 	_ = renderJSON(d)
+}
+
+// printSeriesNotes says which series the snapshot window did not describe
+// properly. It reports what was measured -- how many scrapes of each series
+// landed inside the window -- not a guess at why.
+func printSeriesNotes(d *reportData) {
+	if d.StaleSeries > 0 {
+		fmt.Printf("(%d of the series matched had no scrape inside the one-interval window, so they are not in these numbers)\n",
+			d.StaleSeries)
+	}
+	if d.DoubledSeries > 0 {
+		fmt.Printf("(%d of the series matched had more than one scrape inside the window and are counted twice)\n",
+			d.DoubledSeries)
+	}
 }
