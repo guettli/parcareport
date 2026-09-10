@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	qgrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/query/v1alpha1/queryv1alpha1grpc"
@@ -168,6 +169,55 @@ func (c *Client) ProfileTypeNames(ctx context.Context) ([]string, error) {
 			s += ":delta"
 		}
 		out = append(out, s)
+	}
+	return out, nil
+}
+
+// ProfileTimes returns when each profile matching the selector was written
+// inside [start,end], per series.
+//
+// Two things are needed from this. The newest timestamp says which moment a
+// snapshot describes. The spacing between timestamps says how wide a window
+// holds exactly one profile per series -- which is the window a snapshot has
+// to be read over, because a selector usually matches several series and each
+// is written at its own instant.
+//
+// Cheap: it reads the series index, not the profile bodies.
+func (c *Client) ProfileTimes(ctx context.Context, selector string, start, end time.Time) ([][]time.Time, error) {
+	qctx, cancel := c.meta(ctx)
+	defer cancel()
+	resp, err := c.q.QueryRange(qctx, &qv1.QueryRangeRequest{
+		Query: selector,
+		Start: timestamppb.New(start),
+		End:   timestamppb.New(end),
+	})
+	if err != nil {
+		// The two RPCs disagree about how to say "nothing here", and the
+		// difference matters: this tool's whole stance is that an empty
+		// window and a failed query must not be confused.
+		//
+		//   Merge      -> OK, empty pprof
+		//   QueryRange -> NotFound, "No data found for the query..."
+		//
+		// Verified against a real server. Reporting NotFound as a failure
+		// turned every group without a heap profile into "the query failed"
+		// -- 7 of 8 in the run that caught this -- so normalise it to the
+		// same "no data" the merge path produces.
+		if status.Code(err) == codes.NotFound {
+			return nil, nil
+		}
+		return nil, c.metaErr(fmt.Sprintf("query range %q", selector), err)
+	}
+	var out [][]time.Time
+	for _, s := range resp.GetSeries() {
+		var ts []time.Time
+		for _, sample := range s.GetSamples() {
+			ts = append(ts, sample.GetTimestamp().AsTime())
+		}
+		if len(ts) > 0 {
+			sort.Slice(ts, func(i, j int) bool { return ts[i].Before(ts[j]) })
+			out = append(out, ts)
+		}
 	}
 	return out, nil
 }

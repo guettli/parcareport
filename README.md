@@ -285,9 +285,29 @@ That process's entire RSS was 117 MiB, so the second number was impossible.
 The nasty part is that it does not look wrong — it looks like a service with a
 big heap.
 
-So for a non-delta type the window does not select *how much to add up*, it
-selects **which profile to read**, and the newest one in the window is used.
-The heading says which instant the numbers describe:
+A merge sums across **two** axes, though, and only one of them is wrong here.
+Summing across *time* multiplies a level by the scrape count. Summing across
+*series* is what makes a group total a total — a selector usually matches
+several scrape targets, and you want all of them.
+
+Reading a single profile fixes the first and breaks the second, because each
+target is written at its own instant, so one instant returns one target. That
+under-reported `--by=job` across eight targets as 3.0 MiB when one instance
+alone was 18 MiB — a total smaller than one of its parts.
+
+So a non-delta type is merged over **one scrape interval**, ending at the
+newest profile. The interval is inferred from the spacing of the timestamps
+the tool already fetches. That sums every series while summing at most one
+profile from each:
+
+```
+--by=job, 1-minute window   2.0 GiB   (snapshot at 02:00:52Z)
+--by=job, 20-minute window  1.6 GiB   (snapshot at 02:19:52Z)
+```
+
+Same magnitude across a twentyfold change in window, and the difference is
+real: it is a different instant, twenty minutes later. The heading says which
+instant the numbers describe:
 
 ```
 memory:inuse_space:bytes:space:bytes  snapshot at 2026-09-10T02:19:00Z  (newest in 2026-09-10T02:00:00Z .. 2026-09-10T02:20:00Z)

@@ -136,15 +136,64 @@ func profileFor(ctx context.Context, c *Client, selector string, delta bool, sta
 		raw, err = c.MergePprof(ctx, selector, start, end)
 		return raw, time.Time{}, err
 	}
-	at, err := c.LatestProfileTime(ctx, selector, start, end)
+
+	times, err := c.ProfileTimes(ctx, selector, start, end)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
-	if at.IsZero() {
+	if len(times) == 0 {
 		return nil, time.Time{}, nil // nothing in the window
 	}
-	raw, err = c.SingleProfilePprof(ctx, selector, at)
-	return raw, at, err
+
+	// A merge sums across BOTH time and series. Only the first is wrong for a
+	// snapshot -- the second is what makes a group total a total. Fetching one
+	// profile fixes the first and breaks the second: a selector usually
+	// matches several series, each written at its own instant, so one instant
+	// returns one series. Measured: `--by=job` over all eight scrape targets
+	// reported 3.0 MiB while a single instance in the same period was 18 MiB.
+	// A total cannot be smaller than one of its parts.
+	//
+	// So merge, but over a window narrow enough to hold at most one profile
+	// per series: the scrape interval, inferred from the spacing between
+	// timestamps. Ending at the newest profile, so the answer describes the
+	// most recent state rather than an arbitrary slice.
+	latest, interval := latestAndInterval(times)
+	if interval <= 0 {
+		// One profile per series and no spacing to infer -- the window
+		// already holds a single scrape, so merging it is safe.
+		raw, err = c.MergePprof(ctx, selector, start, end)
+		return raw, latest, err
+	}
+	// Half an interval either side of the newest profile: wide enough for
+	// every series' newest scrape, narrow enough to exclude the one before it.
+	from := latest.Add(-interval / 2)
+	to := latest.Add(interval / 2)
+	if from.Before(start) {
+		from = start
+	}
+	raw, err = c.MergePprof(ctx, selector, from, to)
+	return raw, latest, err
+}
+
+// latestAndInterval returns the newest timestamp across all series, and the
+// smallest gap between consecutive profiles within a series -- the scrape
+// interval. Smallest rather than mean so an outage in the middle of the window
+// does not widen the estimate and pull in two scrapes per series.
+func latestAndInterval(times [][]time.Time) (latest time.Time, interval time.Duration) {
+	for _, series := range times {
+		for i, t := range series {
+			if t.After(latest) {
+				latest = t
+			}
+			if i == 0 {
+				continue
+			}
+			if gap := t.Sub(series[i-1]); gap > 0 && (interval == 0 || gap < interval) {
+				interval = gap
+			}
+		}
+	}
+	return latest, interval
 }
 
 // gatherReport runs the queries and assembles the result.
