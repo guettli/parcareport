@@ -119,7 +119,7 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			// The same dropped stream that costs a merge costs a label
 			// lookup, and losing one here costs the whole section rather
 			// than one group, so labelValues asks again once.
-			vals, err := labelValues(ctx, c, o.timeout, by, start, end)
+			vals, err := labelValues(ctx, c, o.timeout, by, o.match, start, end)
 			if err != nil {
 				lookupFailed = true
 				d.Skipped = append(d.Skipped, skippedJSON{
@@ -153,14 +153,14 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 	// Live heap, if the server has it. It is not a rate and says something the
 	// CPU profile cannot.
 	if heap := findHeapType(types); heap != "" {
-		// instance and job only. `have` is the union of label names across
+		// instance and job only. `labels` is the union of label names across
 		// every profile type, so falling back to `cluster` paired the heap
 		// with a label that only parca-agent's CPU series carry: the section
 		// then merged once per cluster, found nothing, and reported "(no data
 		// in this window)" for a heap profile that has plenty -- the same
 		// conflation of "absent label" with "no data" the tool refuses
 		// everywhere else.
-		by := firstPresent(have, "instance", "job")
+		by := firstPresent(labels, "instance", "job")
 		if by == "" {
 			d.Skipped = append(d.Skipped, skippedJSON{
 				What:   "live heap",
@@ -306,10 +306,15 @@ func findHeapType(types []string) string {
 	return ""
 }
 
-func firstPresent(have map[string]bool, names ...string) string {
+// firstPresent returns the first of names that the server actually has, or ""
+// if it has none of them. It takes the label list rather than a set so callers
+// holding either shape can use it.
+func firstPresent(have []string, names ...string) string {
 	for _, n := range names {
-		if have[n] {
-			return n
+		for _, h := range have {
+			if h == n {
+				return n
+			}
 		}
 	}
 	return ""

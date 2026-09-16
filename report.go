@@ -48,6 +48,17 @@ type reportData struct {
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
+	// ExcludedGroups counts label values that yielded no row while a --match was
+	// set. EmptyGroups is the same *shape* of number -- "values that produced no
+	// row" -- but a different cause, and conflating them is misleading: "no
+	// samples in this window" invites you to widen the window, when under a
+	// --match the matcher is the likelier culprit.
+	//
+	// "Likely" is not "certain": the values come from the server's unfiltered
+	// list, so a value that is genuinely idle under the --match lands here too,
+	// and nothing cheap tells the two apart. Without a --match the question does
+	// not arise and everything that yields nothing is EmptyGroups.
+	ExcludedGroups int `json:"excluded_groups,omitempty"`
 	// StaleSeries counts series with no scrape inside the snapshot window --
 	// usually because they are scraped less often than the fastest series in
 	// the selector, though the code only knows the window missed them. They
@@ -291,7 +302,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			return nil, err
 		}
 	}
-	groups, err := labelValues(ctx, c, o.timeout, o.by, start, end)
+	groups, err := labelValues(ctx, c, o.timeout, o.by, o.match, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -418,10 +429,27 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		if r.header != "" {
 			groupHeader, groupRate = r.header, r.rate
 		}
-		// A label value with no samples in the window says nothing, and there
-		// can be hundreds of them. Count them, do not list them.
-		if r.value == 0 {
-			d.EmptyGroups++
+		// A matched series that profiled zero, or a value that matched nothing.
+		// Either way it says nothing, and there can be hundreds; count them,
+		// do not list them. Which counter it lands in is decided by whether a
+		// --match was set, because that decides what an empty answer *means*.
+		//
+		// With no --match the value came back from a query that had no
+		// matcher, so an empty answer did have no samples.
+		//
+		// With one, the values all came from the server's UNFILTERED list --
+		// the Values API ignores --match -- so an empty answer is far more
+		// likely to be the matcher pruning the value than the window being
+		// idle. Not certainly: an idle value under a --match lands here too,
+		// and nothing cheap tells the two apart. The wording is chosen to be
+		// true either way, where "no samples in this window" is the one
+		// reading that sends the reader to widen a window that was fine.
+		if r.empty || r.value == 0 {
+			if o.match != "" {
+				d.ExcludedGroups++
+			} else {
+				d.EmptyGroups++
+			}
 			continue
 		}
 		rows = append(rows, Row{Name: r.name, Cores: r.value})
@@ -432,7 +460,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 
 	if len(rows) == 0 {
 		d.Unit, d.Rate = unitName(groupHeader), groupRate
-		banner, err := noRows(o, groups, failed, d.EmptyGroups, profType, typeVerified, ctx.Err() != nil)
+		banner, err := noRows(o, groups, failed, d.EmptyGroups, d.ExcludedGroups, profType, typeVerified, ctx.Err() != nil)
 		d.noRows, d.banner = true, banner
 		d.Error = err.Error()
 		return d, err
@@ -541,7 +569,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 // It returns the banner rather than printing it. Gathering must not write to
 // stdout: in JSON mode a banner beside the document makes the whole output
 // unparseable, which is a worse failure than the one it describes.
-func noRows(o options, groups []string, failed []failure, empty int, profType string, typeVerified bool, runExpired bool) (string, error) {
+func noRows(o options, groups []string, failed []failure, empty, excluded int, profType string, typeVerified bool, runExpired bool) (string, error) {
 	if len(failed) > 0 {
 		// They mix: some queries can fail while every survivor comes back
 		// genuinely empty. Reporting that as "all N failed" off len(failed)
@@ -552,10 +580,21 @@ func noRows(o options, groups []string, failed []failure, empty int, profType st
 				"!! This is not an empty window -- the queries did not come back.\n",
 				len(failed), o.by)
 		} else {
-			fmt.Fprintf(&b, "!! FAILED: %d of %d %s queries failed and the other %d had no samples,\n"+
+			// The survivors are not one thing when a --match is set: some were
+			// pruned by it and some were genuinely idle. Calling all of them
+			// "no samples" here would reintroduce, in this branch, the very
+			// conflation the rest of the function now avoids.
+			rest := fmt.Sprintf("%d had no samples", empty)
+			switch {
+			case excluded > 0 && empty > 0:
+				rest = fmt.Sprintf("%d yielded nothing under --match and %d had no samples", excluded, empty)
+			case excluded > 0:
+				rest = fmt.Sprintf("%d yielded nothing under --match", excluded)
+			}
+			fmt.Fprintf(&b, "!! FAILED: %d of %d %s queries failed and the other %s,\n"+
 				"!! so there is nothing to report. Whether this window is idle is unknown:\n"+
 				"!! the failed queries were never answered.\n",
-				len(failed), len(groups), o.by, empty)
+				len(failed), len(groups), o.by, rest)
 		}
 		b.WriteString(formatFailures(failed, mergeQuery, runExpired))
 		return b.String(), fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by)
@@ -568,6 +607,34 @@ func noRows(o options, groups []string, failed []failure, empty int, profType st
 				"!! server -- that lookup failed. A selector this server does not offer\n" +
 				"!! looks exactly like this. Check it with `parcareport types`.\n",
 			fmt.Errorf("no data in this window, and %q was never verified", profType)
+	}
+	if excluded > 0 {
+		// Some or all of the empty groups were pruned by --match rather than
+		// idle. "no data in this window" is then the wrong conclusion -- the
+		// window is fine, the matcher is what removed them -- and it is the
+		// single most likely outcome of a typo'd --match.
+		//
+		// Worded for the partial case too: some values pruned, the rest
+		// genuinely idle reads very differently from all of them pruned.
+		//
+		// Reaching here with empty > 0 needs a --match to have set
+		// ExcludedGroups on some values while EmptyGroups got others -- and
+		// a --match sends EVERY zero group to ExcludedGroups, whatever the
+		// cause, so in practice empty is 0 and the first form is the one
+		// printed. The second is kept because that is a property of the
+		// counter, not of this message: if the classification ever narrows,
+		// the sentence is already right instead of silently saying "all N".
+		what := fmt.Sprintf("all %d", excluded)
+		if empty > 0 {
+			what = fmt.Sprintf("%d of %d", excluded, excluded+empty)
+		}
+		return fmt.Sprintf("!! No rows: %s %s values yielded nothing under --match '%s'.\n"+
+				"!! The label itself exists, so the values came from the server and the\n"+
+				"!! matcher is the likelier reason they yielded nothing than an idle window.\n"+
+				"!! That is also what a typo'd --match looks like. Check it with\n"+
+				"!! `parcareport labels`.\n",
+				what, o.by, o.match),
+			fmt.Errorf("no rows: %d of %d %s values yielded nothing under --match %q", excluded, excluded+empty, o.by, o.match)
 	}
 	// Say so on stdout as well. A section heading followed by silence reads
 	// as truncated output, especially in an overview where other sections did
@@ -597,7 +664,11 @@ type groupResult struct {
 	value  float64
 	header string
 	rate   bool
-	err    error
+	// empty is set when the server returned a profile with no bytes, i.e. the
+	// selector matched no series. Distinct from value == 0, which is a series
+	// that matched and genuinely profiled zero.
+	empty bool
+	err   error
 }
 
 // mergeGroups merges one profile per label value, up to concurrency at a time,
@@ -639,8 +710,18 @@ func mergeOne(ctx context.Context, c *Client, o options, profType, g string,
 		return groupResult{name: g, err: err}
 	}
 	p, err := parsePprof(raw)
-	if err != nil || p == nil {
+	if err != nil {
 		return groupResult{name: g, err: err}
+	}
+	if p == nil {
+		// The server answered with no bytes at all: the selector matched no
+		// series. With no --match this means the value has no samples in the
+		// window, but WITH one it most often means --match pruned the value
+		// away -- the value came from the server's full list, which knows
+		// nothing about --match. mergeGroups decides which, since only it can
+		// see whether a --match was set. Carried as a flag rather than an
+		// error because an empty answer is a normal, successful outcome.
+		return groupResult{name: g, empty: true}
 	}
 	m, err := interpret(p, window)
 	return groupResult{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
@@ -680,15 +761,15 @@ func budgetLeftFor(ctx context.Context, timeout time.Duration) bool {
 // labelValues lists a label's values, asking again once if the server dropped
 // the answer. Losing this one costs the whole report rather than one group:
 // there is nothing left to break anything down by.
-func labelValues(ctx context.Context, c *Client, timeout time.Duration, by string, start, end time.Time) ([]string, error) {
-	vals, err := c.LabelValues(ctx, by, start, end)
+func labelValues(ctx context.Context, c *Client, timeout time.Duration, by, match string, start, end time.Time) ([]string, error) {
+	vals, err := c.LabelValues(ctx, by, match, start, end)
 	if err == nil || !looksTransient(err) || !budgetLeftFor(ctx, timeout) {
 		return vals, err
 	}
 	// Keep the first error if the second attempt fails too. A deadline that
 	// expired during the retry would otherwise replace the RST_STREAM that
 	// explains the failure with a "context deadline exceeded" that does not.
-	again, againErr := c.LabelValues(ctx, by, start, end)
+	again, againErr := c.LabelValues(ctx, by, match, start, end)
 	if againErr != nil {
 		return vals, err
 	}

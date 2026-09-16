@@ -134,11 +134,17 @@ func (c *Client) metaErr(ctx context.Context, what string, err error) error {
 
 // LabelValues lists the distinct values of a label in the window. This is what
 // lets the tool discover clusters instead of being told about them.
-func (c *Client) LabelValues(ctx context.Context, name string, start, end time.Time) ([]string, error) {
+//
+// match is the user's --match, passed through so the values are those the
+// matchers actually select. Without it the fan-out asks the server to merge one
+// group per value fleet-wide and discards the ones --match excluded, which is
+// the difference between 40 merges and 1700 on a busy server.
+func (c *Client) LabelValues(ctx context.Context, name, match string, start, end time.Time) ([]string, error) {
 	qctx, cancel := c.meta(ctx)
 	defer cancel()
 	resp, err := c.q.Values(qctx, &qv1.ValuesRequest{
 		LabelName: name,
+		Match:     matchers(match),
 		Start:     timestamppb.New(start),
 		End:       timestamppb.New(end),
 	})

@@ -157,7 +157,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end, o.concurrency, o.timeout)
+		return listLabels(ctx, c, subArg, o.match, start, end, o.concurrency, o.timeout)
 	case "overview":
 		if subArg != "" {
 			return fmt.Errorf("overview takes no argument, got %q", subArg)
@@ -287,11 +287,11 @@ func runContext(o options) (context.Context, context.CancelFunc, error) {
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int, timeout time.Duration) error {
+func listLabels(ctx context.Context, c *Client, name, match string, start, end time.Time, concurrency int, timeout time.Duration) error {
 	if name != "" {
 		// One dropped stream kills this whole command, so it gets the same
 		// single retry as a group merge.
-		vals, err := labelValues(ctx, c, timeout, name, start, end)
+		vals, err := labelValues(ctx, c, timeout, name, match, start, end)
 		if err != nil {
 			return err
 		}
@@ -335,7 +335,7 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 			defer func() { <-sem }()
 			// The deadline is taken inside LabelValues, after the semaphore,
 			// so a goroutine parked waiting for a slot does not burn it.
-			vals, err := c.LabelValues(ctx, n, start, end)
+			vals, err := c.LabelValues(ctx, n, match, start, end)
 			rows[i] = row{name: n, vals: vals, err: err}
 		}(i, n)
 	}
@@ -441,7 +441,43 @@ func explainNoValues(ctx context.Context, c *Client, label string, start, end ti
 		}
 	}
 	sort.Strings(names)
-	return fmt.Errorf("no label %q in %s; the server has: %s", label, window, strings.Join(names, ", "))
+	msg := fmt.Sprintf("no label %q in %s; the server has: %s", label, window, strings.Join(names, ", "))
+	return errors.New(msg + missingByHint(label, names))
+}
+
+// missingByHint suggests a next step when the label a breakdown was asked for
+// does not exist. It returns "" unless it has something to say.
+//
+// `--by` defaults to `cluster`, which is the label a Parca collecting from
+// several clusters is expected to carry. A server that scrapes one cluster, or
+// whose agent is not configured to add it, has no such label -- and the bare
+// "no label" message reads like a typo in the flag rather than a fact about the
+// deployment. The two have different fixes, so name them.
+//
+// Only `cluster` gets this: any other --by value is a deliberate choice, and
+// whoever typed it does not need to be told the label is missing.
+func missingByHint(label string, names []string) string {
+	if label != "cluster" {
+		return ""
+	}
+	for _, n := range names {
+		if n == "cluster" {
+			return ""
+		}
+	}
+	// Name a label this server actually has, so the suggestion is copy-pasteable
+	// rather than one more thing to look up. The list above is the only place
+	// the reader can see what exists, so point there rather than at a label
+	// that may not be in it.
+	pick := "one from the list above"
+	if alt := firstPresent(names, "namespace", "pod", "node", "comm", "container"); alt != "" {
+		pick = "--by " + alt
+	}
+	return "\n" +
+		"!! This server carries no cluster label, which is what --by defaults to.\n" +
+		"!! If it scrapes one cluster, pick a label from the list above (" + pick + ").\n" +
+		"!! If it scrapes several, add the label at the agent, so one Parca can be\n" +
+		"!! told which cluster a series came from.\n"
 }
 
 // resolveProfileType returns the selector to use and whether it was actually
@@ -617,6 +653,64 @@ func selector(profType, label, value, extra string) string {
 		return profType
 	}
 	return fmt.Sprintf("%s{%s}", profType, strings.Join(matchers, ","))
+}
+
+// matchers splits --match into the individual matchers the Values API wants,
+// where MergePprof wants the whole string.
+//
+// Not a plain strings.Split: a comma inside a quoted value is part of the
+// value, not a separator, and `pod=~"a,b"` is a matcher someone will write.
+//
+// Escaped quotes count too. PromQL writes a quote inside a value as \" , and
+// a splitter that toggles on every `"` reads `a="x\"y",b="2"` as ONE matcher
+// with the comma swallowed -- so `escaped` tracks the backslash and the quote
+// it escapes.
+func matchers(match string) []string {
+	match = strings.TrimSpace(match)
+	if match == "" {
+		return nil
+	}
+	var out []string
+	var cur strings.Builder
+	var quote rune
+	escaped := false
+	for _, r := range match {
+		if escaped {
+			// Write the escaped rune and forget the backslash. It cannot
+			// open or close a quote, whatever it is.
+			escaped = false
+			cur.WriteRune(r)
+			continue
+		}
+		switch {
+		case quote != 0:
+			switch r {
+			case '\\':
+				escaped = true
+			case quote:
+				quote = 0
+			}
+			cur.WriteRune(r)
+		case r == '\\':
+			// A backslash outside quotes is literal; keep it and carry on.
+			escaped = true
+			cur.WriteRune(r)
+		case r == '"' || r == '\'':
+			quote = r
+			cur.WriteRune(r)
+		case r == ',':
+			if s := strings.TrimSpace(cur.String()); s != "" {
+				out = append(out, s)
+			}
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, s)
+	}
+	return out
 }
 
 // parseWindow accepts RFC3339 or a relative offset from now ("-6h").
