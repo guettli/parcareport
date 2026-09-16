@@ -331,7 +331,7 @@ func testClient(f *fakeQuery, timeout time.Duration) *Client {
 func TestMetadataQueriesRespectTimeout(t *testing.T) {
 	c := testClient(&fakeQuery{block: time.Hour}, 20*time.Millisecond)
 	start := time.Now()
-	_, err := c.LabelValues(context.Background(), "cluster", start.Add(-time.Hour), start)
+	_, err := c.LabelValues(context.Background(), "cluster", "", start.Add(-time.Hour), start)
 	if err == nil {
 		t.Fatal("a hung Values call must fail, not hang")
 	}
@@ -456,7 +456,7 @@ func TestMissingByHintSuggestsALabelThatExists(t *testing.T) {
 // `parcareport labels typo` used to print nothing and exit 0.
 func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
 	c := testClient(&fakeQuery{names: []string{"node"}}, 0)
-	err := listLabels(context.Background(), c, "cluster", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
+	err := listLabels(context.Background(), c, "cluster", "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
 	if err == nil {
 		t.Fatal("an unknown label must not look like an empty success")
 	}
@@ -1016,7 +1016,7 @@ func TestListLabelsSurvivesOneFailingLabel(t *testing.T) {
 
 	var err error
 	out := captureStdout(t, func() {
-		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
+		err = listLabels(context.Background(), testClient(f, 0), "", "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
 	})
 
 	if err == nil {
@@ -1044,7 +1044,7 @@ func TestListLabelsKeepsRowsWithTheirLabelsUnderContention(t *testing.T) {
 		valuesDelay: 2 * time.Millisecond,
 	}
 	out := captureStdout(t, func() {
-		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 1, time.Minute); err != nil {
+		if err := listLabels(context.Background(), testClient(f, 0), "", "", time.Now().Add(-time.Hour), time.Now(), 1, time.Minute); err != nil {
 			t.Error(err)
 		}
 	})
@@ -1112,7 +1112,7 @@ func TestMatchProfileTypeRefusesToGuess(t *testing.T) {
 func TestListLabelsToleratesZeroConcurrency(t *testing.T) {
 	f := &fakeQuery{names: []string{"a", "b"}, values: map[string][]string{"a": {"av"}, "b": {"bv"}}}
 	out := captureStdout(t, func() {
-		if err := listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 0, time.Minute); err != nil {
+		if err := listLabels(context.Background(), testClient(f, 0), "", "", time.Now().Add(-time.Hour), time.Now(), 0, time.Minute); err != nil {
 			t.Error(err)
 		}
 	})
@@ -1225,7 +1225,7 @@ func TestLabelFailuresGetMetadataAdviceNotMergeAdvice(t *testing.T) {
 	}
 	var err error
 	out := captureStdout(t, func() {
-		err = listLabels(context.Background(), testClient(f, 0), "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
+		err = listLabels(context.Background(), testClient(f, 0), "", "", time.Now().Add(-time.Hour), time.Now(), 4, time.Minute)
 	})
 	if err == nil {
 		t.Fatal("want a non-zero exit")
@@ -2492,7 +2492,7 @@ func TestRunDeadlineExpiryNamesTheRightClock(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	c := testClient(&fakeQuery{block: time.Hour}, time.Minute)
-	_, err := c.LabelValues(ctx, "cluster", time.Now().Add(-time.Hour), time.Now())
+	_, err := c.LabelValues(ctx, "cluster", "", time.Now().Add(-time.Hour), time.Now())
 	if err == nil {
 		t.Fatal("want a deadline error")
 	}
@@ -2515,7 +2515,7 @@ func TestRunDeadlineExpiryNamesTheRightClock(t *testing.T) {
 // A genuine per-query timeout still gets the per-query advice.
 func TestPerQueryTimeoutStillNamesTimeout(t *testing.T) {
 	c := testClient(&fakeQuery{block: time.Hour}, 10*time.Millisecond)
-	_, err := c.LabelValues(context.Background(), "cluster", time.Now().Add(-time.Hour), time.Now())
+	_, err := c.LabelValues(context.Background(), "cluster", "", time.Now().Add(-time.Hour), time.Now())
 	if err == nil {
 		t.Fatal("want a deadline error")
 	}
@@ -2859,7 +2859,7 @@ func TestListingOneLabelsValuesIsRetried(t *testing.T) {
 	f.valuesFailFirst = map[string]int{"cluster": 1}
 
 	out := captureStdout(t, func() {
-		if err := listLabels(context.Background(), testClient(f, time.Minute), "cluster",
+		if err := listLabels(context.Background(), testClient(f, time.Minute), "cluster", "",
 			time.Now().Add(-time.Hour), time.Now(), 4, time.Minute); err != nil {
 			t.Fatalf("a dropped lookup should be retried, not fatal: %v", err)
 		}
@@ -2879,7 +2879,7 @@ func TestAFailedRetryKeepsTheFirstError(t *testing.T) {
 	f.valuesErrFor = map[string]error{"cluster": context.DeadlineExceeded}
 
 	_, err := labelValues(context.Background(), testClient(f, time.Minute), time.Minute,
-		"cluster", time.Now().Add(-time.Hour), time.Now())
+		"cluster", "", time.Now().Add(-time.Hour), time.Now())
 	if err == nil {
 		t.Fatal("both attempts failed, so this should be an error")
 	}
@@ -2934,7 +2934,7 @@ func TestNoLabelLookupRetryWithoutBudgetForIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	_, err := labelValues(ctx, testClient(f, time.Minute), 60*time.Millisecond,
-		"cluster", time.Now().Add(-time.Hour), time.Now())
+		"cluster", "", time.Now().Add(-time.Hour), time.Now())
 	if err == nil {
 		t.Fatal("with no budget for a retry the dropped lookup should be reported, not retried")
 	}
@@ -3532,5 +3532,109 @@ func TestFirstPresentMatchesTheSetItReplaced(t *testing.T) {
 	// A label appearing once per profile type must not change the answer.
 	if got := firstPresent([]string{"zaaa", "job", "job", "instance"}, "instance", "job"); got != "instance" {
 		t.Errorf("got %q, want instance", got)
+	}
+}
+
+// A value that exists on the server but that --match prunes is a different
+// thing from a value with no samples in the window, and the tool must not
+// merge the two: "no samples in this window" sends the reader off to widen a
+// window that was never the problem.
+func TestReportSeparatesMatchExcludedFromGenuinelyEmpty(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"tc", "vps", "gone"}
+	// Only tc and vps have data; `gone` matches no series under --match.
+	f.merges[testType+`{cluster="tc",namespace="default"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps",namespace="default"}`] = cpuProfile(t, 50)
+	// The unfiltered total still exists, so the run is not a noRows run.
+	f.merges[testType+`{namespace="default"}`] = cpuProfile(t, 150)
+
+	o := testOptions()
+	o.match = `namespace="default"`
+	out, err := runReport(t, f, o)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "clusters") && !strings.Contains(out, "cluster") {
+		t.Fatalf("sanity: the table should be there:\n%s", out)
+	}
+	// The note has to quote the matcher, or "yielded nothing" says nothing
+	// about why.
+	if !strings.Contains(out, o.match) {
+		t.Errorf("the omitted values must be attributed to the matcher:\n%s", out)
+	}
+	if strings.Contains(out, "no samples in this window") {
+		t.Errorf("an excluded value is not a window problem:\n%s", out)
+	}
+}
+
+// When --match prunes every value, "no data in this window" is the wrong
+// conclusion -- and it is the likeliest outcome of a typo'd --match, so it is
+// worth its own message.
+func TestReportSaysMatchPrunedEverything(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"tc", "vps"}
+	// Every per-group merge is empty, but the label itself exists.
+	delete(f.merges, testType+`{cluster="tc"}`)
+	delete(f.merges, testType+`{cluster="vps"}`)
+
+	o := testOptions()
+	o.match = `namespace="typo"`
+	out, err := runReport(t, f, o)
+	if err == nil {
+		t.Fatal("want a non-zero exit when there are no rows")
+	}
+	// The two empties must not be summed into one "no samples" story.
+	if strings.Contains(out, "no samples in this window") {
+		t.Errorf("the window was never the problem:\n%s", out)
+	}
+	if !strings.Contains(out, "yielded nothing under --match") {
+		t.Errorf("want the matcher named as the cause:\n%s", out)
+	}
+}
+
+// The message must name --match, since the value is visible on the server and
+// the reader otherwise wonders where it went.
+func TestReportNoRowsMessageNamesTheMatcher(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"tc", "vps"}
+
+	o := testOptions()
+	o.match = `namespace="typo"`
+	out, err := runReport(t, f, o)
+	if err == nil {
+		t.Fatal("want a non-zero exit")
+	}
+	if !strings.Contains(out, `namespace="typo"`) {
+		t.Errorf("the banner must quote the matcher that pruned everything:\n%s", out)
+	}
+	if !strings.Contains(out, "yielded nothing under --match") {
+		t.Errorf("want the pruning named as the cause:\n%s", out)
+	}
+	if strings.Contains(out, "no data in this window") {
+		t.Errorf("the window is not the problem here:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "typo") {
+		t.Errorf("the error should carry the matcher too: %v", err)
+	}
+}
+
+// Without --match there is nothing to exclude, so the old wording must stay:
+// a value with no samples really did have no samples.
+func TestReportWithoutMatchStillSaysNoSamples(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"tc", "vps", "idle"}
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType] = cpuProfile(t, 150)
+
+	out, err := runReport(t, f, testOptions())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "no samples in this window") {
+		t.Errorf("without a --match the old wording is right:\n%s", out)
+	}
+	if strings.Contains(out, "yielded nothing") {
+		t.Errorf("there is no --match to attribute anything to:\n%s", out)
 	}
 }

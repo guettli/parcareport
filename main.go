@@ -157,7 +157,7 @@ func run(args []string) error {
 		if subArg == "" {
 			subArg = fs.Arg(0)
 		}
-		return listLabels(ctx, c, subArg, start, end, o.concurrency, o.timeout)
+		return listLabels(ctx, c, subArg, o.match, start, end, o.concurrency, o.timeout)
 	case "overview":
 		if subArg != "" {
 			return fmt.Errorf("overview takes no argument, got %q", subArg)
@@ -287,11 +287,11 @@ func runContext(o options) (context.Context, context.CancelFunc, error) {
 // listLabels summarizes label names, or dumps one label's values in full.
 // Summarizing by default matters: a label like `comm` has thousands of values,
 // and printing them all turns a discovery command into a wall of text.
-func listLabels(ctx context.Context, c *Client, name string, start, end time.Time, concurrency int, timeout time.Duration) error {
+func listLabels(ctx context.Context, c *Client, name, match string, start, end time.Time, concurrency int, timeout time.Duration) error {
 	if name != "" {
 		// One dropped stream kills this whole command, so it gets the same
 		// single retry as a group merge.
-		vals, err := labelValues(ctx, c, timeout, name, start, end)
+		vals, err := labelValues(ctx, c, timeout, name, match, start, end)
 		if err != nil {
 			return err
 		}
@@ -335,7 +335,7 @@ func listLabels(ctx context.Context, c *Client, name string, start, end time.Tim
 			defer func() { <-sem }()
 			// The deadline is taken inside LabelValues, after the semaphore,
 			// so a goroutine parked waiting for a slot does not burn it.
-			vals, err := c.LabelValues(ctx, n, start, end)
+			vals, err := c.LabelValues(ctx, n, match, start, end)
 			rows[i] = row{name: n, vals: vals, err: err}
 		}(i, n)
 	}
@@ -653,6 +653,44 @@ func selector(profType, label, value, extra string) string {
 		return profType
 	}
 	return fmt.Sprintf("%s{%s}", profType, strings.Join(matchers, ","))
+}
+
+// matchers splits --match into the individual matchers the Values API wants,
+// where MergePprof wants the whole string.
+//
+// Not a plain strings.Split: a comma inside a quoted value is part of the
+// value, not a separator, and `pod=~"a,b"` is a matcher someone will write.
+func matchers(match string) []string {
+	match = strings.TrimSpace(match)
+	if match == "" {
+		return nil
+	}
+	var out []string
+	var cur strings.Builder
+	var quote rune
+	for _, r := range match {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+			cur.WriteRune(r)
+		case r == '"' || r == '\'':
+			quote = r
+			cur.WriteRune(r)
+		case r == ',':
+			if s := strings.TrimSpace(cur.String()); s != "" {
+				out = append(out, s)
+			}
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, s)
+	}
+	return out
 }
 
 // parseWindow accepts RFC3339 or a relative offset from now ("-6h").

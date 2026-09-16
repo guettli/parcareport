@@ -72,6 +72,17 @@ func renderTable(d *reportData) {
 	}
 	printGroupTable(strings.ToUpper(d.GroupBy), d.header, rows, total, d.knowTotal)
 	printSeriesNotes(d)
+	if d.ExcludedGroups > 0 {
+		// Naming --match is the point. These values exist on the server --
+		// the reader can see them with `parcareport --labels` -- so without
+		// naming the matcher they look like values that went missing.
+		//
+		// "yielded nothing under" rather than "is not carried by": a value
+		// that matched but was simply idle lands here too, and only the
+		// yielded-nothing reading is true of both.
+		fmt.Printf("(%d %s values yielded nothing under %s, omitted)\n",
+			d.ExcludedGroups, d.GroupBy, d.Match)
+	}
 	if d.EmptyGroups > 0 {
 		fmt.Printf("(%d %s values had no samples in this window, omitted)\n", d.EmptyGroups, d.GroupBy)
 	}
