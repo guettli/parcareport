@@ -616,6 +616,14 @@ func noRows(o options, groups []string, failed []failure, empty, excluded int, p
 		//
 		// Worded for the partial case too: some values pruned, the rest
 		// genuinely idle reads very differently from all of them pruned.
+		//
+		// Reaching here with empty > 0 needs a --match to have set
+		// ExcludedGroups on some values while EmptyGroups got others -- and
+		// a --match sends EVERY zero group to ExcludedGroups, whatever the
+		// cause, so in practice empty is 0 and the first form is the one
+		// printed. The second is kept because that is a property of the
+		// counter, not of this message: if the classification ever narrows,
+		// the sentence is already right instead of silently saying "all N".
 		what := fmt.Sprintf("all %d", excluded)
 		if empty > 0 {
 			what = fmt.Sprintf("%d of %d", excluded, excluded+empty)
@@ -623,7 +631,7 @@ func noRows(o options, groups []string, failed []failure, empty, excluded int, p
 		return fmt.Sprintf("!! No rows: %s %s values yielded nothing under --match '%s'.\n"+
 				"!! The label itself exists, so the values came from the server -- the matcher\n"+
 				"!! is what removed them, not an idle window. That is what a typo'd --match\n"+
-				"!! looks like. Check it with `parcareport --labels`.\n",
+				"!! looks like. Check it with `parcareport labels`.\n",
 				what, o.by, o.match),
 			fmt.Errorf("no rows: %d of %d %s values yielded nothing under --match %q", excluded, excluded+empty, o.by, o.match)
 	}

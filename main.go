@@ -660,6 +660,11 @@ func selector(profType, label, value, extra string) string {
 //
 // Not a plain strings.Split: a comma inside a quoted value is part of the
 // value, not a separator, and `pod=~"a,b"` is a matcher someone will write.
+//
+// Escaped quotes count too. PromQL writes a quote inside a value as \" , and
+// a splitter that toggles on every `"` reads `a="x\"y",b="2"` as ONE matcher
+// with the comma swallowed -- so `escaped` tracks the backslash and the quote
+// it escapes.
 func matchers(match string) []string {
 	match = strings.TrimSpace(match)
 	if match == "" {
@@ -668,12 +673,27 @@ func matchers(match string) []string {
 	var out []string
 	var cur strings.Builder
 	var quote rune
+	escaped := false
 	for _, r := range match {
+		if escaped {
+			// Write the escaped rune and forget the backslash. It cannot
+			// open or close a quote, whatever it is.
+			escaped = false
+			cur.WriteRune(r)
+			continue
+		}
 		switch {
 		case quote != 0:
-			if r == quote {
+			switch r {
+			case '\\':
+				escaped = true
+			case quote:
 				quote = 0
 			}
+			cur.WriteRune(r)
+		case r == '\\':
+			// A backslash outside quotes is literal; keep it and carry on.
+			escaped = true
 			cur.WriteRune(r)
 		case r == '"' || r == '\'':
 			quote = r

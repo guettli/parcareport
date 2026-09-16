@@ -74,7 +74,7 @@ func renderTable(d *reportData) {
 	printSeriesNotes(d)
 	if d.ExcludedGroups > 0 {
 		// Naming --match is the point. These values exist on the server --
-		// the reader can see them with `parcareport --labels` -- so without
+		// the reader can see them with `parcareport labels` -- so without
 		// naming the matcher they look like values that went missing.
 		//
 		// "yielded nothing under" rather than "is not carried by": a value

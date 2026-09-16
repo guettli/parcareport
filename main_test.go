@@ -3655,9 +3655,12 @@ func TestMatchersSplitsOnCommasOnlyOutsideQuotes(t *testing.T) {
 		`pod=~"a,b",ns="x"`:      {`pod=~"a,b"`, `ns="x"`},
 		`pod="has,comma",ns="x"`: {`pod="has,comma"`, `ns="x"`},
 		"a='single'":             {"a='single'"},
-		// A quote inside a quoted value, and an empty matcher from doubled
-		// or leading/trailing commas.
+		// A quote inside a quoted value, and the case that only breaks when
+		// that escaped quote is followed by a comma: a splitter that toggles
+		// on every quote swallows the separator and yields ONE matcher.
 		`a="quo\"te"`:           {`a="quo\"te"`},
+		`a="quo\"te",b="2"`:     {`a="quo\"te"`, `b="2"`},
+		`pod="has\"q",ns="x"`:   {`pod="has\"q"`, `ns="x"`},
 		`a="1",`:                {`a="1"`},
 		`,a="1"`:                {`a="1"`},
 		`a="1",,b="2"`:          {`a="1"`, `b="2"`},
