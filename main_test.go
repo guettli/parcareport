@@ -389,6 +389,70 @@ func TestExplainNoValuesDistinguishesTheReasons(t *testing.T) {
 	}
 }
 
+// A server with no `cluster` label is the shape of a single-cluster Parca, or
+// one whose agent is not configured to add it. `--by` defaults to `cluster`, so
+// every bare `parcareport` run against such a server dies -- and the plain "no
+// label" message reads like a typo in the flag rather than a fact about the
+// server. The hint has to name both fixes.
+func TestNoClusterLabelExplainsTheTwoWaysOut(t *testing.T) {
+	err := explainNoValues(context.Background(),
+		testClient(&fakeQuery{names: []string{"node", "comm", "namespace"}}, 0),
+		"cluster", time.Now().Add(-time.Hour), time.Now())
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	got := err.Error()
+	// The value is copy-pasteable, picked from labels the server actually has.
+	if !strings.Contains(got, "--by namespace") {
+		t.Errorf("want a suggestion naming a label that exists:\n%s", got)
+	}
+	// And the reason the label is conventionally there.
+	if !strings.Contains(got, "add the label at the agent") {
+		t.Errorf("want the relabel fix as the other way out:\n%s", got)
+	}
+	// The label list still comes first: the hint is an addition, not a
+	// replacement for the fact.
+	if !strings.Contains(got, `no label "cluster"`) {
+		t.Errorf("the hint swallowed the diagnosis:\n%s", got)
+	}
+}
+
+// Any other --by value is a deliberate choice, so only `cluster` is annotated.
+// A typo'd flag should stay quiet rather than get a lecture about relabeling.
+func TestMissingByHintOnlyFiresForCluster(t *testing.T) {
+	names := []string{"node", "comm"}
+	if h := missingByHint("clustr", names); h != "" {
+		t.Errorf("a non-default --by must not be annotated, got %q", h)
+	}
+	if h := missingByHint("cluster", names); h == "" {
+		t.Error("the default --by is the one case that needs the hint")
+	}
+	// A server that has the label needs nothing, even though nothing else
+	// changed -- this is what keeps it quiet on a multi-cluster Parca.
+	if h := missingByHint("cluster", []string{"cluster", "namespace"}); h != "" {
+		t.Errorf("a server with the label must not be annotated, got %q", h)
+	}
+}
+
+// The suggestion must be a flag the reader can paste, so it has to name a label
+// the server actually carries -- and fall back to `namespace`, the most useful
+// generally-present one, when none of the preferred labels exist.
+func TestMissingByHintSuggestsALabelThatExists(t *testing.T) {
+	got := missingByHint("cluster", []string{"comm", "node", "namespace"})
+	if !strings.Contains(got, "--by namespace") {
+		t.Errorf("want the first preferred label present, got:\n%s", got)
+	}
+	// None of the preferred labels exist. Naming one anyway would point at a
+	// label missing from the list printed right above it, so point at the list.
+	got = missingByHint("cluster", []string{"zaaa", "zbbb"})
+	if strings.Contains(got, "--by namespace") {
+		t.Errorf("suggested a label the server does not have:\n%s", got)
+	}
+	if !strings.Contains(got, "list above") {
+		t.Errorf("want the hint to point at the label list, got:\n%s", got)
+	}
+}
+
 // `parcareport labels typo` used to print nothing and exit 0.
 func TestListLabelsRejectsAnUnknownLabel(t *testing.T) {
 	c := testClient(&fakeQuery{names: []string{"node"}}, 0)
@@ -3435,5 +3499,38 @@ func TestLatestAndInterval(t *testing.T) {
 	single := [][]time.Time{{base}, {base.Add(3 * time.Second)}}
 	if _, iv := latestAndInterval(single); iv != 0 {
 		t.Errorf("interval = %v, want 0 with nothing to measure", iv)
+	}
+}
+
+// The signature change from map[string]bool to []string must not alter what
+// firstPresent answers. The heap call site passes the same label list the set
+// was built from, so equivalence here is what makes that refactor safe.
+func TestFirstPresentMatchesTheSetItReplaced(t *testing.T) {
+	old := func(have map[string]bool, names ...string) string {
+		for _, n := range names {
+			if have[n] {
+				return n
+			}
+		}
+		return ""
+	}
+	sets := [][]string{
+		{}, {"instance"}, {"job"}, {"job", "instance"},
+		{"cluster", "namespace", "instance", "job", "comm"}, {"zaaa", "zbbb"},
+	}
+	for _, s := range sets {
+		have := map[string]bool{}
+		for _, l := range s {
+			have[l] = true
+		}
+		for _, names := range [][]string{{"instance", "job"}, {"job"}, {"zaaa"}} {
+			if got, want := firstPresent(s, names...), old(have, names...); got != want {
+				t.Errorf("set=%v names=%v: got %q, want %q", s, names, got, want)
+			}
+		}
+	}
+	// A label appearing once per profile type must not change the answer.
+	if got := firstPresent([]string{"zaaa", "job", "job", "instance"}, "instance", "job"); got != "instance" {
+		t.Errorf("got %q, want instance", got)
 	}
 }

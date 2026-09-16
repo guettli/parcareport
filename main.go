@@ -441,7 +441,43 @@ func explainNoValues(ctx context.Context, c *Client, label string, start, end ti
 		}
 	}
 	sort.Strings(names)
-	return fmt.Errorf("no label %q in %s; the server has: %s", label, window, strings.Join(names, ", "))
+	msg := fmt.Sprintf("no label %q in %s; the server has: %s", label, window, strings.Join(names, ", "))
+	return errors.New(msg + missingByHint(label, names))
+}
+
+// missingByHint suggests a next step when the label a breakdown was asked for
+// does not exist. It returns "" unless it has something to say.
+//
+// `--by` defaults to `cluster`, which is the label a Parca collecting from
+// several clusters is expected to carry. A server that scrapes one cluster, or
+// whose agent is not configured to add it, has no such label -- and the bare
+// "no label" message reads like a typo in the flag rather than a fact about the
+// deployment. The two have different fixes, so name them.
+//
+// Only `cluster` gets this: any other --by value is a deliberate choice, and
+// whoever typed it does not need to be told the label is missing.
+func missingByHint(label string, names []string) string {
+	if label != "cluster" {
+		return ""
+	}
+	for _, n := range names {
+		if n == "cluster" {
+			return ""
+		}
+	}
+	// Name a label this server actually has, so the suggestion is copy-pasteable
+	// rather than one more thing to look up. The list above is the only place
+	// the reader can see what exists, so point there rather than at a label
+	// that may not be in it.
+	pick := "one from the list above"
+	if alt := firstPresent(names, "namespace", "pod", "node", "comm", "container"); alt != "" {
+		pick = "--by " + alt
+	}
+	return "\n" +
+		"!! This server carries no cluster label, which is what --by defaults to.\n" +
+		"!! If it scrapes one cluster, pick a label from the list above (" + pick + ").\n" +
+		"!! If it scrapes several, add the label at the agent, so one Parca can be\n" +
+		"!! told which cluster a series came from.\n"
 }
 
 // resolveProfileType returns the selector to use and whether it was actually
