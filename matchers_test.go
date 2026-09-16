@@ -6,13 +6,14 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
-// Ground truth: hand the joined splitter output to Prometheus's own parser
-// and to the un-split original; both must parse, and the split must agree
-// with what Prometheus itself considers separate matchers.
-// Prometheus's own parser is the authority on where one matcher ends and
-// the next begins -- it is the same parser the server runs these through.
-// Asserting our split against it beats a hand-written table, which is
-// exactly what missed the escaped-quote case.
+// Prometheus's own parser is the authority on where one matcher ends and the
+// next begins -- it is the parser the server runs these through. Asserting
+// matchers() against it beats a hand-written table, which is only an
+// approximation of it and is exactly what missed the escaped-quote case: the
+// table had an escaped quote, but only ever as the LAST matcher, where a
+// swallowed separator is invisible.
+//
+// Cases must be valid PromQL, so the count Prometheus reports is meaningful.
 func TestMatchersAgreesWithThePromQLParser(t *testing.T) {
 	cases := []string{
 		`a="1",b="2"`,
@@ -22,6 +23,10 @@ func TestMatchersAgreesWithThePromQLParser(t *testing.T) {
 		`pod="has\"q",ns="x"`,
 		`a='single'`,
 		`a="1",b=~"x,y",c!="z"`,
+		// An escaped backslash, then a real closing quote, then a separator.
+		// The escape path has to end at the right quote or this one matcher
+		// swallows the next.
+		`a="x\\",b="2"`,
 	}
 	for _, in := range cases {
 		wrapped := "m{" + in + "}"
