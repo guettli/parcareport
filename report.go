@@ -580,10 +580,21 @@ func noRows(o options, groups []string, failed []failure, empty, excluded int, p
 				"!! This is not an empty window -- the queries did not come back.\n",
 				len(failed), o.by)
 		} else {
-			fmt.Fprintf(&b, "!! FAILED: %d of %d %s queries failed and the other %d had no samples,\n"+
+			// The survivors are not one thing when a --match is set: some were
+			// pruned by it and some were genuinely idle. Calling all of them
+			// "no samples" here would reintroduce, in this branch, the very
+			// conflation the rest of the function now avoids.
+			rest := fmt.Sprintf("%d had no samples", empty)
+			switch {
+			case excluded > 0 && empty > 0:
+				rest = fmt.Sprintf("%d yielded nothing under --match and %d had no samples", excluded, empty)
+			case excluded > 0:
+				rest = fmt.Sprintf("%d yielded nothing under --match", excluded)
+			}
+			fmt.Fprintf(&b, "!! FAILED: %d of %d %s queries failed and the other %s,\n"+
 				"!! so there is nothing to report. Whether this window is idle is unknown:\n"+
 				"!! the failed queries were never answered.\n",
-				len(failed), len(groups), o.by, empty)
+				len(failed), len(groups), o.by, rest)
 		}
 		b.WriteString(formatFailures(failed, mergeQuery, runExpired))
 		return b.String(), fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by)

@@ -3676,3 +3676,27 @@ func TestMatchersSplitsOnCommasOnlyOutsideQuotes(t *testing.T) {
 		}
 	}
 }
+
+// The failed branch has its own wording for the survivors, and it was the
+// one place left calling a --match-pruned value "no samples". Same
+// conflation, different branch.
+func TestReportFailedBranchNamesTheMatchForPrunedSurvivors(t *testing.T) {
+	f := reportFixture(t)
+	f.values["cluster"] = []string{"a", "b", "c"}
+	// a and b are pruned by --match; c fails outright.
+	f.mergeErrs[testType+`{cluster="c",namespace="default"}`] = errors.New("boom")
+
+	o := testOptions()
+	o.match = `namespace="default"`
+	out, err := runReport(t, f, o)
+	if err == nil {
+		t.Fatal("want a non-zero exit")
+	}
+	if !strings.Contains(out, "yielded nothing under --match") {
+		t.Errorf("the pruned survivors must be told apart from idle ones:\n%s", out)
+	}
+	// c matched nothing either, so "1 of 2" is the shape here: 2 of 3 pruned.
+	if strings.Contains(out, "2 had no samples") {
+		t.Errorf("they were pruned, not idle:\n%s", out)
+	}
+}
