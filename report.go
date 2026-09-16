@@ -629,9 +629,10 @@ func noRows(o options, groups []string, failed []failure, empty, excluded int, p
 			what = fmt.Sprintf("%d of %d", excluded, excluded+empty)
 		}
 		return fmt.Sprintf("!! No rows: %s %s values yielded nothing under --match '%s'.\n"+
-				"!! The label itself exists, so the values came from the server -- the matcher\n"+
-				"!! is what removed them, not an idle window. That is what a typo'd --match\n"+
-				"!! looks like. Check it with `parcareport labels`.\n",
+				"!! The label itself exists, so the values came from the server and the\n"+
+				"!! matcher is the likelier reason they yielded nothing than an idle window.\n"+
+				"!! That is also what a typo'd --match looks like. Check it with\n"+
+				"!! `parcareport labels`.\n",
 				what, o.by, o.match),
 			fmt.Errorf("no rows: %d of %d %s values yielded nothing under --match %q", excluded, excluded+empty, o.by, o.match)
 	}
