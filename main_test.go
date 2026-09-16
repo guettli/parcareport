@@ -3638,3 +3638,41 @@ func TestReportWithoutMatchStillSaysNoSamples(t *testing.T) {
 		t.Errorf("there is no --match to attribute anything to:\n%s", out)
 	}
 }
+
+// matchers feeds ValuesRequest.Match, which the server drops today, so a
+// mis-split here is latent rather than visible. It still has to be right: a
+// comma inside a quoted value belongs to the value, and `pod=~"a,b"` is a
+// matcher someone will write.
+func TestMatchersSplitsOnCommasOnlyOutsideQuotes(t *testing.T) {
+	// Each case is what a user would type, paired with the split it must get.
+	// A naive strings.Split gets the quoted-comma cases wrong.
+	cases := map[string][]string{
+		"":                       nil,
+		"   ":                    nil,
+		`a="1"`:                  {`a="1"`},
+		`a="1",b="2"`:            {`a="1"`, `b="2"`},
+		`pod=~"a,b"`:             {`pod=~"a,b"`},
+		`pod=~"a,b",ns="x"`:      {`pod=~"a,b"`, `ns="x"`},
+		`pod="has,comma",ns="x"`: {`pod="has,comma"`, `ns="x"`},
+		"a='single'":             {"a='single'"},
+		// A quote inside a quoted value, and an empty matcher from doubled
+		// or leading/trailing commas.
+		`a="quo\"te"`:           {`a="quo\"te"`},
+		`a="1",`:                {`a="1"`},
+		`,a="1"`:                {`a="1"`},
+		`a="1",,b="2"`:          {`a="1"`, `b="2"`},
+		`a="1",b=~"x,y",c!="z"`: {`a="1"`, `b=~"x,y"`, `c!="z"`},
+	}
+	for in, want := range cases {
+		got := matchers(in)
+		if len(got) != len(want) {
+			t.Errorf("matchers(%q) = %#v, want %#v", in, got, want)
+			continue
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("matchers(%q)[%d] = %q, want %q", in, i, got[i], want[i])
+			}
+		}
+	}
+}

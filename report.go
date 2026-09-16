@@ -48,14 +48,16 @@ type reportData struct {
 
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
-	// ExcludedGroups counts label values that exist on the server but that no
-	// series matching --match carries. EmptyGroups is the same *shape* of
-	// number -- "values that produced no row" -- but a different cause, and
-	// conflating them is misleading: "no samples in this window" invites you
-	// to widen the window, when for these the window was never the problem.
+	// ExcludedGroups counts label values that yielded no row while a --match was
+	// set. EmptyGroups is the same *shape* of number -- "values that produced no
+	// row" -- but a different cause, and conflating them is misleading: "no
+	// samples in this window" invites you to widen the window, when under a
+	// --match the matcher is the likelier culprit.
 	//
-	// They are only distinguishable when a --match is set; without one a
-	// value that yielded nothing really did have no samples.
+	// "Likely" is not "certain": the values come from the server's unfiltered
+	// list, so a value that is genuinely idle under the --match lands here too,
+	// and nothing cheap tells the two apart. Without a --match the question does
+	// not arise and everything that yields nothing is EmptyGroups.
 	ExcludedGroups int `json:"excluded_groups,omitempty"`
 	// StaleSeries counts series with no scrape inside the snapshot window --
 	// usually because they are scraped less often than the fastest series in
