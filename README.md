@@ -88,7 +88,7 @@ reports each in its own unit — dividing bytes by wall-time would be nonsense:
 | profile | column | means |
 |---|---|---|
 | `…:cpu:nanoseconds:delta` | `CORES` | average cores busy |
-| `…:wallclock:nanoseconds:…` | `BLOCKED` | average threads waiting (off-CPU) |
+| `…:wallclock:nanoseconds:…:delta` | `BLOCKED` | average threads waiting (off-CPU) |
 | `memory:inuse_space:…` | `BYTES` | live heap |
 | `goroutine:…` / `mutex:contentions:…` | `COUNT` | totals |
 | `mutex:delay:…` / `block:delay:…` | `SECONDS` | total time waited |
@@ -428,7 +428,7 @@ every `pct` is `null` with it. The sum of the listed groups is not the total —
 it omits every series carrying no group-by label — so there is no honest number
 to put there.
 
-`unit` is a stable machine name (`cores`, `blocked_threads`, `bytes`, `count`)
+`unit` is a stable machine name (`cores`, `blocked_threads`, `bytes`, `seconds`, `count`)
 rather than the column heading, which is free to be reworded. `rate` says
 whether the value was divided by the window; bytes and counts are not rates.
 

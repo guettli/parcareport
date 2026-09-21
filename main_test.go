@@ -3704,17 +3704,35 @@ func TestReportFailedBranchNamesTheMatchForPrunedSurvivors(t *testing.T) {
 	}
 }
 
-// delayProfile builds the shape of Go's mutex/block profile: a nanosecond
-// "delay" counter accumulated per contention event, with no time-based period.
+// delayProfile builds the shape Parca returns for a Go mutex/block "delay"
+// selector: a cumulative nanosecond counter whose period is contentions, not
+// time. Parca merges to the requested sample type, so there is one value
+// column. It carries a function so the table path is exercised too.
 func delayProfile(nanos int64) *profile.Profile {
+	fn := &profile.Function{ID: 1, Name: "sync.(*Mutex).Unlock"}
+	loc := &profile.Location{ID: 1, Line: []profile.Line{{Function: fn}}}
 	return &profile.Profile{
-		SampleType: []*profile.ValueType{
-			{Type: "contentions", Unit: "count"},
-			{Type: "delay", Unit: "nanoseconds"},
-		},
+		SampleType: []*profile.ValueType{{Type: "delay", Unit: "nanoseconds"}},
 		PeriodType: &profile.ValueType{Type: "contentions", Unit: "count"},
 		Period:     1,
-		Sample:     []*profile.Sample{{Value: []int64{1, nanos}}},
+		Function:   []*profile.Function{fn},
+		Location:   []*profile.Location{loc},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{loc}, Value: []int64{nanos}}},
+	}
+}
+
+// wallclockProfile is the off-CPU shape: a nanosecond duration that IS a delta
+// over the window, so averaging it is the correct reading.
+func wallclockProfile(nanos int64) *profile.Profile {
+	fn := &profile.Function{ID: 1, Name: "runtime.mstart"}
+	loc := &profile.Location{ID: 1, Line: []profile.Line{{Function: fn}}}
+	return &profile.Profile{
+		SampleType: []*profile.ValueType{{Type: "wallclock", Unit: "nanoseconds"}},
+		PeriodType: &profile.ValueType{Type: "samples", Unit: "count"},
+		Period:     1,
+		Function:   []*profile.Function{fn},
+		Location:   []*profile.Location{loc},
+		Sample:     []*profile.Sample{{Location: []*profile.Location{loc}, Value: []int64{nanos}}},
 	}
 }
 
@@ -3749,10 +3767,29 @@ func TestNonDeltaDurationIsTotalNotRate(t *testing.T) {
 	}
 }
 
+// The function table must be in the same unit as the group table above it.
+// Conflating "scale to seconds" with "divide by the window" left this path in
+// raw nanoseconds while the group total said seconds, for a %TOTAL of 1e11.
+func TestNonDeltaDurationFunctionTableIsSeconds(t *testing.T) {
+	rows, err := topFunctions(delayProfile(2e9), time.Hour, sortFlat, false)
+	if err != nil {
+		t.Fatalf("topFunctions: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	if rows[0].Flat != 2 {
+		t.Errorf("flat = %v, want the 2s total, not nanoseconds", rows[0].Flat)
+	}
+	if rows[0].Cores != 2 {
+		t.Errorf("cum = %v, want the 2s total, not nanoseconds", rows[0].Cores)
+	}
+}
+
 // A delta duration (wallclock) really is a rate over the window, so it must
 // still be averaged -- 3600s of waiting across an hour is one thread blocked.
 func TestDeltaDurationStaysARate(t *testing.T) {
-	m, err := interpret(delayProfile(3600e9), time.Hour, true)
+	m, err := interpret(wallclockProfile(3600e9), time.Hour, true)
 	if err != nil {
 		t.Fatalf("interpret: %v", err)
 	}

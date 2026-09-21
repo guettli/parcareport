@@ -147,6 +147,8 @@ func unitName(header string) string {
 		return "bytes"
 	case "COUNT":
 		return "count"
+	case "SECONDS":
+		return "seconds"
 	}
 	return strings.ToLower(header)
 }
@@ -494,7 +496,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	knowTotal := overallErr == nil && overall != nil
 	unlabeled := -1
 	if overall != nil {
-		mt, err := interpret(overall, window, isDeltaType(profType))
+		mt, err := interpret(overall, window, delta)
 		if err != nil {
 			return nil, err
 		}
@@ -526,7 +528,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	}
 
 	if o.top > 0 && overall != nil {
-		fns, err := topFunctions(overall, window, sortBy, isDeltaType(profType))
+		fns, err := topFunctions(overall, window, sortBy, delta)
 		if err != nil {
 			return nil, err
 		}

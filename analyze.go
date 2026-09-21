@@ -21,9 +21,19 @@ type Row struct {
 // a rate: dividing a heap size or a goroutine count by the window is nonsense,
 // so the unit decides both the number and the column header.
 type Metric struct {
-	Header string  // column title, e.g. CORES / BLOCKED / BYTES / COUNT
+	Header string  // column title, e.g. CORES / BLOCKED / BYTES / SECONDS / COUNT
 	Value  float64 // already normalized per the header's meaning
 	Rate   bool    // true if Value was divided by the window
+
+	// Duration is true when the raw sample values are a time -- or a sample
+	// count that becomes one via the period -- so per-function sums have to be
+	// scaled to seconds before they mean anything. Rate then says whether they
+	// are *additionally* divided by the window.
+	//
+	// The two must stay separate. A cumulative delay counter is scaled but not
+	// divided, and collapsing both into Rate would print its function table in
+	// raw nanoseconds against a group table in seconds.
+	Duration bool
 }
 
 // interpret summarizes a profile the way its units actually mean.
@@ -60,7 +70,7 @@ func interpret(p *profile.Profile, window time.Duration, isDelta bool) (Metric, 
 			if err != nil {
 				return Metric{}, err
 			}
-			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true}, nil
+			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true, Duration: true}, nil
 		}
 		return Metric{Header: "COUNT", Value: float64(total)}, nil
 	}
@@ -71,15 +81,15 @@ func interpret(p *profile.Profile, window time.Duration, isDelta bool) (Metric, 
 			return Metric{}, err
 		}
 		if sampleTypeIsCPU(p, idx) {
-			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true}, nil
+			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true, Duration: true}, nil
 		}
 		if !isDelta {
 			// Cumulative since process start, so there is no window to
 			// average over -- report the total it actually is.
-			return Metric{Header: "SECONDS", Value: secs}, nil
+			return Metric{Header: "SECONDS", Value: secs, Duration: true}, nil
 		}
 		// wallclock: average threads waiting, not cores.
-		return Metric{Header: "BLOCKED", Value: cores(secs, window), Rate: true}, nil
+		return Metric{Header: "BLOCKED", Value: cores(secs, window), Rate: true, Duration: true}, nil
 	}
 	return Metric{}, fmt.Errorf("unsupported sample unit %q", unit)
 }
@@ -210,7 +220,6 @@ func topFunctions(p *profile.Profile, window time.Duration, by sortKey, isDelta 
 	if err != nil {
 		return nil, err
 	}
-	rate := m.Rate
 	cum := map[string]int64{}
 	flat := map[string]int64{}
 
@@ -257,19 +266,23 @@ func topFunctions(p *profile.Profile, window time.Duration, by sortKey, isDelta 
 
 	rows := make([]Row, 0, len(cum))
 	for name, c := range cum {
-		var cs, fs float64
-		if rate {
-			var err error
-			if cs, err = scaleToSeconds(p, c, unit); err != nil {
-				return nil, err
-			}
-			if fs, err = scaleToSeconds(p, flat[name], unit); err != nil {
-				return nil, err
-			}
-		}
-		if !rate {
-			// Byte and count profiles are totals, not per-second rates.
+		if !m.Duration {
+			// Byte and count profiles are already totals in their own unit.
 			rows = append(rows, Row{Name: name, Cores: float64(c), Flat: float64(flat[name])})
+			continue
+		}
+		cs, err := scaleToSeconds(p, c, unit)
+		if err != nil {
+			return nil, err
+		}
+		fs, err := scaleToSeconds(p, flat[name], unit)
+		if err != nil {
+			return nil, err
+		}
+		if !m.Rate {
+			// A cumulative duration: scaled to seconds like any other time,
+			// but with no window to average over.
+			rows = append(rows, Row{Name: name, Cores: cs, Flat: fs})
 			continue
 		}
 		rows = append(rows, Row{Name: name, Cores: cores(cs, window), Flat: cores(fs, window)})
