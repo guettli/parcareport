@@ -22,8 +22,9 @@ func TestMatchSendsZeroGroupsToExcludedNotEmpty(t *testing.T) {
 	o := testOptions()
 	o.match = `namespace="default"`
 	out, err := runReport(t, f, o)
-	if err == nil {
-		t.Fatal("want nonzero")
+	// Answered, and the answer was nothing: an outcome, not a failure.
+	if err != nil {
+		t.Fatalf("a matcher that pruned everything is not a failure: %v", err)
 	}
 	// Both land in the same bucket, so the message says "all" and names the
 	// matcher. It must NOT say the window had no samples.

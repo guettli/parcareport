@@ -15,6 +15,29 @@ import (
 	"github.com/google/pprof/profile"
 )
 
+// The three outcomes a run can have. docs/bottlenecks.md tells the reader --
+// specifically an agent -- to use these to tell "I looked and there is nothing
+// there" from "I could not look", and until now the tool could not: an honestly
+// empty window and three dead queries both came back complete:false and exit 1,
+// separable only by reading an English error string.
+//
+// The distinction is the difference between "this service is idle" and "your
+// monitoring is broken", which is not a subtlety.
+const (
+	// outcomeFound: rows were produced.
+	outcomeFound = "found"
+	// outcomeEmpty: every query was answered, and the answer was nothing. A
+	// successful measurement, and exit 0.
+	outcomeEmpty = "empty"
+	// outcomeIncomplete: something was not answered, so what is missing is
+	// unknown. Exit non-zero.
+	outcomeIncomplete = "incomplete"
+)
+
+// breakdownNone is what `breakdown` says when no group table was priced at
+// all. One spelling, so a consumer has one case to write.
+const breakdownNone = "none"
+
 // reportData is everything a report found, separated from how it is shown.
 //
 // The split exists because the table is written for a person -- columns padded
@@ -23,6 +46,9 @@ import (
 // the JSON renderer emit full symbol names, raw numbers, and the failures as
 // data.
 type reportData struct {
+	// ProfileType is the selector the run used. Empty only in a document for
+	// a run that failed before resolving one, where profile_type_verified is
+	// null beside it: no type was chosen, so none is reported.
 	ProfileType string `json:"profile_type"`
 	// TypeVerified is false when the ProfileTypes lookup failed and the
 	// selector was taken on trust. An unverified type is the likeliest
@@ -106,11 +132,16 @@ type reportData struct {
 	Functions []funcJSON `json:"functions"`
 	SortedBy  string     `json:"functions_sorted_by,omitempty"`
 
-	// Failed and Complete are the point of the format. A consumer should not
-	// have to grep stdout for `!!` to notice the numbers are wrong.
-	Failed   []failJSON `json:"failed"`
-	Complete bool       `json:"complete"`
-	Error    string     `json:"error,omitempty"`
+	// Failed, Outcome and Complete are the point of the format. A consumer
+	// should not have to grep stdout for `!!` to notice the numbers are wrong,
+	// nor parse an error string to tell an idle window from a broken run.
+	Failed []failJSON `json:"failed"`
+	// Outcome is "found", "empty" or "incomplete". Complete is kept as the
+	// boolean it always was -- outcome != incomplete -- so existing consumers
+	// keep working; it just no longer has to answer a question it cannot.
+	Outcome  string `json:"outcome"`
+	Complete bool   `json:"complete"`
+	Error    string `json:"error,omitempty"`
 
 	// Rendering state the table needs and JSON does not: the display heading,
 	// whether the total is trustworthy, and the failures in their original
@@ -146,7 +177,17 @@ type groupJSON struct {
 	Pct   *float64 `json:"pct"`
 	// Unlabeled marks the residual row: series matching the selector that
 	// carry no value for the group-by label at all.
-	Unlabeled bool `json:"unlabeled,omitempty"`
+	//
+	// No omitempty: an absent key and a false one are different claims, and a
+	// consumer should read a field rather than match "(unlabeled)" against a
+	// name this tool is free to reword.
+	//
+	// Not a perfect oracle. The flag is still derived from that spelling, so a
+	// server genuinely carrying a value of "(unlabeled)" collides with the
+	// residual row when both are present. Carrying the flag from the row that
+	// synthesised it would fix that; until then this is a better key to read
+	// than the string, not a guarantee.
+	Unlabeled bool `json:"unlabeled"`
 	// DrillDown is the command that narrows the report to this row. Null for
 	// the unlabeled row, which no matcher can select, and for a row already
 	// pinned by --match. See drillFor.
@@ -165,11 +206,20 @@ type funcJSON struct {
 	Cum  float64  `json:"cum"`
 	Flat float64  `json:"flat"`
 	Pct  *float64 `json:"pct"`
+	// Unsymbolized marks the bucket every nameless frame lands in, so a
+	// consumer deciding whether a profile is attributable reads a field rather
+	// than learning how this tool spells it. Derived from that spelling, with
+	// the same caveat as Unlabeled.
+	Unsymbolized bool `json:"unsymbolized"`
 }
 
 type failJSON struct {
 	Group string `json:"group"`
 	Error string `json:"error"`
+	// Hint is the advice the printed banner gives for this class of failure:
+	// raise --timeout, narrow the window, and so on. It used to exist only in
+	// the text, so a consumer got the diagnosis and not the remedy.
+	Hint string `json:"hint,omitempty"`
 }
 
 // unitName turns a display heading into a stable machine name. The heading is
@@ -346,7 +396,14 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		return nil, err
 	}
 	if len(groups) == 0 {
-		return nil, explainNoValues(ctx, c, o.by, start, end)
+		err := explainNoValues(ctx, c, o.by, start, end)
+		if !errors.Is(err, errEmptyWindow) {
+			return nil, err
+		}
+		// A window with nothing in it still gets a document and a zero exit.
+		// The alternative -- the error path -- makes querying last month look
+		// exactly like a server that stopped answering.
+		return emptyWindowReport(o, profType, typeVerified, start, end, err), nil
 	}
 	sort.Strings(groups)
 
@@ -576,15 +633,34 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		rows = append(rows, Row{Name: r.name, Cores: r.value})
 	}
 	for _, f := range failed {
-		d.Failed = append(d.Failed, failJSON{Group: f.group, Error: f.msg})
+		d.Failed = append(d.Failed, failJSON{
+			Group: f.group,
+			Error: f.msg,
+			// The same advice the banner prints, so the document carries the
+			// remedy and not only the diagnosis.
+			Hint: plainHint([]string{f.msg}, mergeQuery, ctx.Err() != nil),
+		})
 	}
 
 	if len(rows) == 0 {
+		// The unit is still known even with nothing to show: it came from the
+		// profile type, not from the rows. An empty "unit" would be the
+		// instability the field exists to prevent.
 		d.Unit, d.Rate = unitName(groupHeader), groupRate
-		banner, err := noRows(o, groups, failed, d.EmptyGroups, d.ExcludedGroups, profType, typeVerified, ctx.Err() != nil)
-		d.noRows, d.banner = true, banner
-		d.Error = err.Error()
-		return d, err
+		if d.Unit == "" {
+			// Rate alongside Unit, not just Unit: "cores" with rate:false is a
+			// contradiction, and an empty report was emitting exactly that.
+			h, r := headerFor(profType)
+			d.Unit, d.Rate = unitName(h), r
+		}
+		v := noRows(o, groups, failed, d.EmptyGroups, d.ExcludedGroups, profType, typeVerified, ctx.Err() != nil)
+		d.noRows, d.banner = true, v.banner
+		d.Outcome, d.Complete = v.outcome, v.outcome != outcomeIncomplete
+		d.Notes = append(d.Notes, v.note)
+		if v.err != nil {
+			d.Error = v.err.Error()
+		}
+		return d, v.err
 	}
 
 	d.groupsSum = total
@@ -648,7 +724,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			return nil, err
 		}
 		for _, r := range fns {
-			f := funcJSON{Name: r.Name, Cum: r.Cores, Flat: r.Flat}
+			f := funcJSON{Name: r.Name, Cum: r.Cores, Flat: r.Flat, Unsymbolized: r.Name == unsymbolizedName}
 			if grand > 0 {
 				v := r.Flat
 				if sortBy == sortCum {
@@ -671,9 +747,20 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	d.Notes = notesFor(o, d)
 
 	if overallErr != nil {
-		d.Failed = append(d.Failed, failJSON{Group: "(overall)", Error: shortErr(overallErr)})
+		d.Failed = append(d.Failed, failJSON{
+			Group: "(overall)",
+			Error: shortErr(overallErr),
+			Hint:  plainHint([]string{shortErr(overallErr)}, mergeQuery, ctx.Err() != nil),
+		})
 	}
 	d.Complete = len(failed) == 0 && overallErr == nil
+	d.Outcome = outcomeFound
+	if !d.Complete {
+		// Rows were produced, but something was not answered, so what is
+		// missing is unknown. That is a different claim from "nothing is
+		// missing" and from "there was nothing to find".
+		d.Outcome = outcomeIncomplete
+	}
 	// Kept on the struct so the table renderer can reproduce the banners and
 	// the JSON renderer can put them in one field.
 	d.header, d.knowTotal, d.failed, d.overallErr = header, knowTotal, failed, overallErr
@@ -692,7 +779,19 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 // It returns the banner rather than printing it. Gathering must not write to
 // stdout: in JSON mode a banner beside the document makes the whole output
 // unparseable, which is a worse failure than the one it describes.
-func noRows(o options, groups []string, failed []failure, empty, excluded int, profType string, typeVerified bool, runExpired bool) (string, error) {
+// noRowsVerdict is why a run produced no rows, in the four forms the callers
+// need: prose for a person, a structured note for a consumer, an outcome, and
+// an error that is nil unless the run genuinely could not look.
+type noRowsVerdict struct {
+	banner  string
+	note    noteJSON
+	outcome string
+	err     error
+}
+
+// noRows classifies a run that produced nothing. Four causes, and they are not
+// the same event: two are answers and two are failures to get one.
+func noRows(o options, groups []string, failed []failure, empty, excluded int, profType string, typeVerified bool, runExpired bool) noRowsVerdict {
 	if len(failed) > 0 {
 		// They mix: some queries can fail while every survivor comes back
 		// genuinely empty. Reporting that as "all N failed" off len(failed)
@@ -720,16 +819,36 @@ func noRows(o options, groups []string, failed []failure, empty, excluded int, p
 				len(failed), len(groups), o.by, rest)
 		}
 		b.WriteString(formatFailures(failed, mergeQuery, runExpired))
-		return b.String(), fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by)
+		return noRowsVerdict{
+			banner:  b.String(),
+			outcome: outcomeIncomplete,
+			note: noteJSON{
+				Code: "no_rows_queries_failed",
+				Message: fmt.Sprintf("%d of %d %s queries failed and nothing came back. "+
+					"Whether this window is idle is unknown: the failed queries were never answered.",
+					len(failed), len(groups), o.by),
+			},
+			err: fmt.Errorf("%d of %d %s queries failed; no results", len(failed), len(groups), o.by),
+		}
 	}
 	if !typeVerified {
 		// The warning about this went only to stderr, which is the case the
 		// project refuses: under 2>/dev/null a typo'd selector left an empty
 		// stdout that reads as an idle cluster.
-		return "!! No data, and the profile type was never verified against the\n" +
+		return noRowsVerdict{
+			banner: "!! No data, and the profile type was never verified against the\n" +
 				"!! server -- that lookup failed. A selector this server does not offer\n" +
 				"!! looks exactly like this. Check it with `parcareport types`.\n",
-			fmt.Errorf("no data in this window, and %q was never verified", profType)
+			outcome: outcomeIncomplete,
+			note: noteJSON{
+				Code: "profile_type_unverified",
+				Message: fmt.Sprintf("No data, and %q was never checked against the server "+
+					"because that lookup failed. A selector this server does not offer looks "+
+					"exactly like an idle window, so this is not evidence of either.", profType),
+				Command: "parcareport types",
+			},
+			err: fmt.Errorf("no data in this window, and %q was never verified", profType),
+		}
 	}
 	if excluded > 0 {
 		// Some or all of the empty groups were pruned by --match rather than
@@ -751,18 +870,45 @@ func noRows(o options, groups []string, failed []failure, empty, excluded int, p
 		if empty > 0 {
 			what = fmt.Sprintf("%d of %d", excluded, excluded+empty)
 		}
-		return fmt.Sprintf("!! No rows: %s %s values yielded nothing under --match '%s'.\n"+
+		return noRowsVerdict{
+			banner: fmt.Sprintf("!! No rows: %s %s values yielded nothing under --match '%s'.\n"+
 				"!! The label itself exists, so the values came from the server and the\n"+
 				"!! matcher is the likelier reason they yielded nothing than an idle window.\n"+
 				"!! That is also what a typo'd --match looks like. Check it with\n"+
 				"!! `parcareport labels`.\n",
 				what, o.by, o.match),
-			fmt.Errorf("no rows: %d of %d %s values yielded nothing under --match %q", excluded, excluded+empty, o.by, o.match)
+			// Every query was answered. The answer was nothing, which is a
+			// measurement, not a malfunction -- so the run succeeded and says
+			// loudly why the result looks like this.
+			outcome: outcomeEmpty,
+			note: noteJSON{
+				Code: "match_pruned_everything",
+				Message: fmt.Sprintf("%s %s values yielded nothing under --match %q. The label "+
+					"exists and the values came from the server, so the matcher is a likelier "+
+					"reason than an idle window -- and this is what a typo'd --match looks like.",
+					what, o.by, o.match),
+				Command: "parcareport labels " + shellQuote(o.by),
+			},
+		}
 	}
 	// Say so on stdout as well. A section heading followed by silence reads
 	// as truncated output, especially in an overview where other sections did
 	// produce tables.
-	return "(no data in this window)\n", errors.New("no data in this window")
+	//
+	// And say it as a SUCCESS. Every query was answered; the answer was that
+	// nothing ran. Reporting that as a failure is the conflation this whole
+	// distinction exists to end: a script that wraps this tool saw exit 1 for
+	// a correct measurement of an idle window.
+	return noRowsVerdict{
+		banner:  "(no data in this window)\n",
+		outcome: outcomeEmpty,
+		note: noteJSON{
+			Code: "empty_window",
+			Message: "Every query was answered and none of them found samples. This window " +
+				"is idle as far as this selector is concerned -- which is a measurement, " +
+				"not a failure. Widen --from, or check that an agent is still writing.",
+		},
+	}
 }
 
 // reportShortfall is the non-zero exit, naming what is missing.
@@ -1055,4 +1201,106 @@ func sumByOnce(ctx context.Context, c *Client, o options, profType string,
 	qctx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
 	return c.SumByLabel(qctx, selector(profType, "", "", o.match), o.by, start, end)
+}
+
+// headerFor is the column heading a profile type would produce, without a
+// profile to interpret.
+//
+// Used only when there are no rows: the unit is a property of the selector, so
+// a report with nothing in it still knows what its numbers would have meant,
+// and a consumer switching on `unit` should not have to handle an empty
+// string.
+//
+// It mirrors interpret() by reading the selector's parts rather than looking
+// for substrings anywhere in it. A substring version got wallclock wrong --
+// `parca_agent:wallclock:nanoseconds:samples:count:delta` contains
+// ":samples:count:" and was therefore read as CPU, so an empty off-CPU report
+// announced its unit as cores. Off-CPU time is emphatically not cores, and
+// saying so is the specific mistake this tool warns about elsewhere.
+func headerFor(profType string) (header string, rate bool) {
+	parts := strings.Split(profType, ":")
+	if len(parts) < 5 {
+		return "COUNT", false
+	}
+	sampleType, sampleUnit := parts[1], parts[2]
+	periodType, periodUnit := parts[3], parts[4]
+	isCPU := sampleType == "cpu" || periodType == "cpu"
+
+	switch {
+	case sampleUnit == "bytes":
+		return "BYTES", false
+	case sampleUnit == "count":
+		// A count with a time-based period is a sampled duration
+		// (parca-agent's CPU profile); a count with no such period is a real
+		// count.
+		if isTimeUnit(periodUnit) {
+			return "CORES", true
+		}
+		return "COUNT", false
+	case isTimeUnit(sampleUnit):
+		if isCPU {
+			return "CORES", true
+		}
+		if !isDeltaType(profType) {
+			// Cumulative since process start, so there is no window to
+			// average over.
+			return "SECONDS", false
+		}
+		return "BLOCKED", true
+	}
+	return "COUNT", false
+}
+
+// emptyWindowReport is the document for a window the server had nothing in.
+//
+// It exists because returning only an error made an idle window and a broken
+// run the same event to a caller: same exit code, same complete:false, and a
+// sentence to tell them apart. The run worked; what it found was nothing.
+func emptyWindowReport(o options, profType string, typeVerified bool, start, end time.Time, why error) *reportData {
+	window := end.Sub(start)
+	h, rate := headerFor(profType)
+	return &reportData{
+		ProfileType:  profType,
+		TypeVerified: &typeVerified,
+		Start:        start.UTC(),
+		End:          end.UTC(),
+		WindowSecs:   math.Round(window.Seconds()*1000) / 1000,
+		GroupBy:      o.by,
+		Match:        o.match,
+		// The unit is a property of the selector, so it is known even with
+		// nothing to show -- and Rate with it, since "cores" with rate:false
+		// is a contradiction.
+		Unit:     unitName(h),
+		Rate:     rate,
+		Delta:    isDeltaType(profType),
+		SortedBy: o.sortBy,
+		Outcome:  outcomeEmpty,
+		Complete: true,
+		Notes: []noteJSON{{
+			Code: "empty_window",
+			Message: explainedEmpty(why) +
+				" Every query was answered, so this is a measurement of an idle window, " +
+				"not a failure to take one.",
+		}},
+		Groups:    []groupJSON{},
+		Functions: []funcJSON{},
+		Failed:    []failJSON{},
+		// Nothing was priced, by either method. Spelled the same way the
+		// error document spells it, so "no breakdown happened" has one name.
+		Breakdown: breakdownNone,
+		window:    window,
+		noRows:    true,
+		banner:    "(no data in this window)\n",
+	}
+}
+
+// explainedEmpty strips the errEmptyWindow tag from the message a reader sees.
+// The sentinel is how the callers classify the answer; "empty window:" is not
+// a phrase the tool uses anywhere else and reads as an error class.
+func explainedEmpty(why error) string {
+	msg := why.Error()
+	if rest, ok := strings.CutPrefix(msg, errEmptyWindow.Error()+": "); ok {
+		return strings.ToUpper(rest[:1]) + rest[1:]
+	}
+	return msg
 }
