@@ -91,6 +91,12 @@ reports each in its own unit — dividing bytes by wall-time would be nonsense:
 | `…:wallclock:nanoseconds:…` | `BLOCKED` | average threads waiting (off-CPU) |
 | `memory:inuse_space:…` | `BYTES` | live heap |
 | `goroutine:…` / `mutex:contentions:…` | `COUNT` | totals |
+| `mutex:delay:…` / `block:delay:…` | `SECONDS` | total time waited |
+
+A duration is only averaged over the window when it is a *delta* profile.
+Go's `delay` counters accumulate since process start, so they are reported as
+the total they are: dividing them by `--from` would make the same data read
+six times larger over ten minutes than over an hour.
 
 ### Reading `BLOCKED` (off-CPU) honestly
 

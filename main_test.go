@@ -142,7 +142,7 @@ func TestTopFunctions(t *testing.T) {
 		Sample: []*profile.Sample{{Location: []*profile.Location{locA, locB}, Value: []int64{100}}},
 	}
 
-	rows, err := topFunctions(p, time.Second, sortCum)
+	rows, err := topFunctions(p, time.Second, sortCum, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +580,7 @@ func TestTopFunctionsSortsBySelfTimeByDefault(t *testing.T) {
 		Sample: []*profile.Sample{{Location: []*profile.Location{locWork, locGoexit}, Value: []int64{100}}},
 	}
 
-	flat, err := topFunctions(p, time.Second, sortFlat)
+	flat, err := topFunctions(p, time.Second, sortFlat, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestTopFunctionsSortsBySelfTimeByDefault(t *testing.T) {
 		t.Errorf("sorted by self time, want app.work first, got %q", flat[0].Name)
 	}
 
-	cum, err := topFunctions(p, time.Second, sortCum)
+	cum, err := topFunctions(p, time.Second, sortCum, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -928,7 +928,7 @@ func TestFlatIsNotDoubleCountedForRecursiveInlining(t *testing.T) {
 		Sample:     []*profile.Sample{{Location: []*profile.Location{leaf}, Value: []int64{100}}},
 	}
 
-	rows, err := topFunctions(p, time.Second, sortFlat)
+	rows, err := topFunctions(p, time.Second, sortFlat, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -967,7 +967,7 @@ func TestUnsymbolizedLeafStillCarriesSelfTime(t *testing.T) {
 		Sample:     []*profile.Sample{{Location: []*profile.Location{locLeaf, locCaller}, Value: []int64{100}}},
 	}
 
-	rows, err := topFunctions(p, time.Second, sortFlat)
+	rows, err := topFunctions(p, time.Second, sortFlat, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3701,5 +3701,68 @@ func TestReportFailedBranchNamesTheMatchForPrunedSurvivors(t *testing.T) {
 	// c matched nothing either, so "1 of 2" is the shape here: 2 of 3 pruned.
 	if strings.Contains(out, "2 had no samples") {
 		t.Errorf("they were pruned, not idle:\n%s", out)
+	}
+}
+
+// delayProfile builds the shape of Go's mutex/block profile: a nanosecond
+// "delay" counter accumulated per contention event, with no time-based period.
+func delayProfile(nanos int64) *profile.Profile {
+	return &profile.Profile{
+		SampleType: []*profile.ValueType{
+			{Type: "contentions", Unit: "count"},
+			{Type: "delay", Unit: "nanoseconds"},
+		},
+		PeriodType: &profile.ValueType{Type: "contentions", Unit: "count"},
+		Period:     1,
+		Sample:     []*profile.Sample{{Value: []int64{1, nanos}}},
+	}
+}
+
+// Go's mutex/block delay counters are cumulative since process start and are
+// merged over a single scrape, so dividing them by the report window invents a
+// rate the data cannot support -- the same counter would read six times larger
+// with --from=-10m than with --from=-1h. The value must not move with the
+// window, and must not claim to be a rate.
+func TestNonDeltaDurationIsTotalNotRate(t *testing.T) {
+	p := delayProfile(2e9) // 2s of accumulated delay
+
+	short, err := interpret(p, 10*time.Minute, false)
+	if err != nil {
+		t.Fatalf("interpret (10m): %v", err)
+	}
+	long, err := interpret(p, time.Hour, false)
+	if err != nil {
+		t.Fatalf("interpret (1h): %v", err)
+	}
+
+	if short.Value != long.Value {
+		t.Errorf("value moved with the window: %v (10m) vs %v (1h)", short.Value, long.Value)
+	}
+	if short.Value != 2 {
+		t.Errorf("want the 2s total, got %v", short.Value)
+	}
+	if short.Rate {
+		t.Error("a cumulative counter must not be reported as a rate")
+	}
+	if short.Header != "SECONDS" {
+		t.Errorf("header = %q, want SECONDS", short.Header)
+	}
+}
+
+// A delta duration (wallclock) really is a rate over the window, so it must
+// still be averaged -- 3600s of waiting across an hour is one thread blocked.
+func TestDeltaDurationStaysARate(t *testing.T) {
+	m, err := interpret(delayProfile(3600e9), time.Hour, true)
+	if err != nil {
+		t.Fatalf("interpret: %v", err)
+	}
+	if !m.Rate {
+		t.Error("a delta duration must still be a rate")
+	}
+	if m.Header != "BLOCKED" {
+		t.Errorf("header = %q, want BLOCKED", m.Header)
+	}
+	if m.Value != 1 {
+		t.Errorf("value = %v, want 1 blocked thread", m.Value)
 	}
 }

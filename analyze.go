@@ -34,7 +34,13 @@ type Metric struct {
 //     the same arithmetic, but it is not a core and must not say so.
 //   - Heap profiles are byte totals; goroutine and mutex profiles are counts.
 //     Neither is divided by anything.
-func interpret(p *profile.Profile, window time.Duration) (Metric, error) {
+//   - A duration that is NOT a delta (Go's mutex/block "delay" counters, which
+//     are cumulative since process start) is a total, not a rate. Dividing it
+//     by the report window would invent a per-second figure the data cannot
+//     support: the same counter, merged over one scrape, would read six times
+//     larger with --from=-10m than with --from=-1h. isDelta says which case
+//     this is; the caller knows it from the selector's last field.
+func interpret(p *profile.Profile, window time.Duration, isDelta bool) (Metric, error) {
 	idx, unit := valueIndex(p)
 	var total int64
 	for _, s := range p.Sample {
@@ -64,11 +70,16 @@ func interpret(p *profile.Profile, window time.Duration) (Metric, error) {
 		if err != nil {
 			return Metric{}, err
 		}
-		header := "BLOCKED" // wallclock: average threads waiting, not cores
 		if sampleTypeIsCPU(p, idx) {
-			header = "CORES"
+			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true}, nil
 		}
-		return Metric{Header: header, Value: cores(secs, window), Rate: true}, nil
+		if !isDelta {
+			// Cumulative since process start, so there is no window to
+			// average over -- report the total it actually is.
+			return Metric{Header: "SECONDS", Value: secs}, nil
+		}
+		// wallclock: average threads waiting, not cores.
+		return Metric{Header: "BLOCKED", Value: cores(secs, window), Rate: true}, nil
 	}
 	return Metric{}, fmt.Errorf("unsupported sample unit %q", unit)
 }
@@ -193,9 +204,9 @@ func parseSortKey(s string) (sortKey, error) {
 // percentage, which is true and useless; the frames actually burning CPU sit
 // below the cutoff and never appear. Self time asks "what code was running",
 // which is what the tool is for, so it is the default.
-func topFunctions(p *profile.Profile, window time.Duration, by sortKey) ([]Row, error) {
+func topFunctions(p *profile.Profile, window time.Duration, by sortKey, isDelta bool) ([]Row, error) {
 	idx, unit := valueIndex(p)
-	m, err := interpret(p, window)
+	m, err := interpret(p, window, isDelta)
 	if err != nil {
 		return nil, err
 	}

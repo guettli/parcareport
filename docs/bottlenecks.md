@@ -260,16 +260,17 @@ count. Before trusting either:
 - **`mutex:delay` attributes to the goroutine that _unlocked_**, not to the
   goroutines that waited. `block:delay` is the other way round — it attributes
   to the blocked goroutine. Read the stacks with that asymmetry in mind.
-- **Rank with `contentions`, not `delay`.** `mutex:delay` is a lifetime
-  cumulative counter and not a delta type, so it is merged over one scrape
-  interval but then divided by whatever `--from` window you typed and printed
-  under `BLOCKED` — a rate heading it does not deserve. `--from=-10m` and
-  `--from=-1h` will differ several-fold on identical data. Use
-  `--profile-type=mutex:contentions` (a clean `COUNT`) for cross-instance
-  ranking and read `mutex:delay` through its function table, not its totals.
+- **`delay` is a cumulative total, not a rate.** `mutex:delay` and `block:delay`
+  accumulate since process start, so they are reported as a `SECONDS` total
+  rather than averaged over the window — the number does not move when you
+  change `--from`. The age caveat from §2 applies in full: ranking instances by
+  a lifetime counter partly ranks them by uptime. For a like-for-like
+  comparison use `mutex:contentions` (a clean `COUNT`), or compare the same
+  instance before and after a change.
 
 ```sh
-parcareport --profile-type=mutex:contentions --by=instance
+parcareport --profile-type=mutex:contentions --by=instance   # comparable count
+parcareport --profile-type=mutex:delay --by=instance         # SECONDS waited
 ```
 
 ### ✅ Blocking on sync primitives (Go services)
