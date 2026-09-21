@@ -119,6 +119,7 @@ func renderTable(d *reportData) {
 		}
 		printFunctionTable(fns, d.header, len(fns), total, d.sortKey)
 	}
+	printDrillDowns(d.Groups, d.Match != "", len(d.Functions) > 0)
 }
 
 // renderJSON prints the report for a program to read.

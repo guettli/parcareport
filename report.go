@@ -118,6 +118,14 @@ type groupJSON struct {
 	// Unlabeled marks the residual row: series matching the selector that
 	// carry no value for the group-by label at all.
 	Unlabeled bool `json:"unlabeled,omitempty"`
+	// DrillDown is the command that narrows the report to this row. Null for
+	// the unlabeled row, which no matcher can select, and for a row already
+	// pinned by --match. See drillFor.
+	//
+	// No omitempty, for the same reason Pct has none: an absent key and a null
+	// one are different claims, and "there is no command for this row" is a
+	// fact worth stating rather than leaving to be inferred from a gap.
+	DrillDown *drillJSON `json:"drill_down"`
 }
 
 type funcJSON struct {
@@ -520,6 +528,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Cores > rows[j].Cores })
 	for _, r := range rows {
 		g := groupJSON{Name: r.Name, Value: r.Cores, Unlabeled: unlabeled >= 0 && r.Name == "(unlabeled)"}
+		g.DrillDown = drillFor(o, r.Name, g.Unlabeled)
 		if knowTotal {
 			pct := r.Pct
 			g.Pct = &pct

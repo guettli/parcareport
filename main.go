@@ -57,6 +57,10 @@ type options struct {
 	// resolvedType lets a caller that already knows the profile type skip the
 	// lookup. Not a flag: only overview sets it.
 	resolvedType string
+	// knownLabels is the server's label list when the caller already read it.
+	// Not a flag, and not fetched for its own sake: it only sharpens the
+	// drill-down hints. See nextBreakdown.
+	knownLabels  []string
 	bearerToken  string
 	tokenFile    string
 	username     string
@@ -897,6 +901,13 @@ comparable across clusters of different sizes, unlike raw sample counts.
 Functions are listed by self time (FLAT) by default -- the code that was
 actually on-CPU. --sort=cum orders by cumulative time instead, which shows
 what work a frame was part of, but puts runtime plumbing on top.
+
+The function table comes from the unfiltered merge, so it covers every row of
+the breakdown at once. To get one row's own functions, re-run with --match
+pinning it; a report prints the command for its largest rows.
+
+Which bottlenecks this can and cannot find -- and why some are invisible to
+any sampling profiler -- is written up in docs/bottlenecks.md.
 
 Flags:
 `
