@@ -40,6 +40,25 @@ type overviewData struct {
 	window time.Duration
 }
 
+// mergeDerivedNotes are the note codes computed from the unfiltered merge,
+// which is identical across every section sharing a profile type. Repeating
+// them per section is noise; the others genuinely differ by --by.
+var mergeDerivedNotes = map[string]bool{
+	"unsymbolized_dominates": true,
+	"gc_overhead":            true,
+}
+
+// notesFromGroups drops the notes a sibling section has already stated.
+func notesFromGroups(notes []noteJSON) []noteJSON {
+	out := []noteJSON{}
+	for _, n := range notes {
+		if !mergeDerivedNotes[n.Code] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 type skippedJSON struct {
 	What   string `json:"what"`
 	Reason string `json:"reason"`
@@ -248,6 +267,11 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		if shown[s.ProfileType] {
 			quiet := *s
 			quiet.Functions = nil
+			// The notes derived from that same unfiltered merge would repeat
+			// with it, word for word, once per section. The ones that vary by
+			// --by are kept: whether a label leaves a large residual, or which
+			// groups sit at one core, is a different answer per section.
+			quiet.Notes = notesFromGroups(s.Notes)
 			renderTable(&quiet)
 			continue
 		}

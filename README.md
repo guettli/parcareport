@@ -62,6 +62,67 @@ workload; a single frame at 76.9% was not.
 what larger piece of work a frame was part of, which is what you want once you
 already know which function is hot.
 
+## Notes: what the tool noticed
+
+A sorted table is not a pointer. `parcareport` calls itself a bottleneck report,
+so it now says when a plain rule spots something — and only then:
+
+```
+NOTES
+  [unsymbolized_dominates]
+    97% of this profile has no function names. That is a tooling gap, not a
+    finding: the CPU was measured but cannot be attributed to code. Native
+    binaries need debuginfo uploaded or a debuginfod the server can reach;
+    Go binaries are symbolized by the agent and are unaffected.
+    see docs/bottlenecks.md#symbolization
+```
+
+| code | fires when | why it matters |
+| :--- | :--- | :--- |
+| `unsymbolized_dominates` | over half the profile has no function names | the report cannot answer the question it was asked; the function table is not describing your workload |
+| `unlabeled_large` | over a tenth of the total carries no value for a `--by` label **every series ought to have** | every row is an underestimate by an unknown amount — usually an agent deployed without the label |
+| `single_core_ceiling` | a **process-scoped** group sits within 0.03 of exactly 1.000 `CORES` | the shape of a single-threaded ceiling *or* a throttled 1-core quota |
+| `gc_overhead` | over a fifth of on-CPU time is in Go's collector and allocator | the workload is spending its CPU on memory management |
+
+These are rules, not judgements: thresholds over numbers the report already
+has, so they cost nothing and cannot fail. Each carries a stable `code` to
+switch on, links into [docs/bottlenecks.md](docs/bottlenecks.md), and a command
+where there is one to run.
+
+**Scope is half of each rule.** `unlabeled_large` stays quiet under
+`namespace`, `workload`, `container` and `pod`, because a large `(unlabeled)`
+row there is every process *outside* a Kubernetes pod — kernel threads, the
+kubelet, anything on the host — which is [expected and
+correct](#breaking-down-by-other-labels), not a finding. `single_core_ceiling`
+fires only on labels where a group can plausibly *be* one runnable thread
+(`comm`, `workload`, `container`, `instance`): a cluster at 1.000 `CORES` is
+thousands of processes summing to a round number, and on a report with dozens
+of groups something lands in that band by chance.
+
+A rule that fires on a healthy report is worse than no rule, because it teaches
+the reader to skip the block.
+
+They are deliberately few. A report that flags everything flags nothing, which
+is why **"the biggest group is big" is not a note** — the drill-down block
+below the tables already names the largest rows and what to run against them.
+
+Two of them are explicitly inferences. `single_core_ceiling` says "consistent
+with both, and proof of neither", because whether work was queuing behind that
+group is not in any profile and neither is a cgroup quota; `gc_overhead`
+mentions `GOMAXPROCS` while saying the value itself is not in any profile.
+Stating either as a diagnosis would be the same error as reading a flamegraph
+percentage as an absolute.
+
+Notes need a denominator. When the unfiltered merge failed there is no total,
+so there are no shares and no notes — substituting the sum of the listed groups
+would make every percentage a percentage of the wrong number. When individual
+*group* queries failed, their samples land in the residual, and
+`unlabeled_large` says so rather than reporting the whole of it as unlabelled.
+
+They are also independent of `--top`: that flag shortens the function *table*,
+and says nothing about whether "can this profile be attributed at all" is worth
+asking. The rules read the untruncated list.
+
 ## The function table is not the breakdown of the row above it
 
 Both tables come from the same run, but not from the same query. The breakdown

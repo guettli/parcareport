@@ -46,6 +46,15 @@ type reportData struct {
 	// null for a delta, where the whole window was merged.
 	SnapshotAt *time.Time `json:"snapshot_at"`
 
+	// Notes are what the tool noticed, by rule, about the numbers below: a
+	// profile that cannot be attributed, a total that does not add up, a
+	// workload at a ceiling. Deliberately few; see notes.go.
+	//
+	// First in the document on purpose. A person reads the tables and then
+	// wants the caveat; a consumer wants the verdict before the data it
+	// qualifies, and encoding/json emits in declaration order.
+	Notes []noteJSON `json:"notes"`
+
 	Groups      []groupJSON `json:"groups"`
 	EmptyGroups int         `json:"empty_groups"`
 	// ExcludedGroups counts label values that yielded no row while a --match was
@@ -102,6 +111,11 @@ type reportData struct {
 	// runExpired says the run's --deadline is what cut the queries short, so
 	// the advice names --deadline instead of --timeout.
 	runExpired bool
+	// allFunctions is the function table before --top truncates it. The notes
+	// rules read it: a rule that exists to say "this profile cannot be
+	// attributed" must not be silenced by --top=0, which asks for no function
+	// TABLE and says nothing about whether the question should be asked.
+	allFunctions []funcJSON
 	// groupsSum is the sum of the labelled groups. It is what the fallback
 	// row shows when there is no measured total, and it is NOT the total:
 	// it omits every series carrying no group-by label.
@@ -353,9 +367,12 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		Match:        o.match,
 		SortedBy:     sortBy.String(),
 		window:       window,
-		Groups:       []groupJSON{},
-		Functions:    []funcJSON{},
-		Failed:       []failJSON{},
+		// Empty slices, not nil: these render as [] rather than null, and an
+		// absent finding and an uncomputed one are different claims.
+		Notes:     []noteJSON{},
+		Groups:    []groupJSON{},
+		Functions: []funcJSON{},
+		Failed:    []failJSON{},
 		// Set here rather than after the fan-out: a collapsed window can
 		// leave every group empty, and that is exactly the run where the
 		// reader most needs to know scrapes existed and the window missed
@@ -536,13 +553,14 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		d.Groups = append(d.Groups, g)
 	}
 
-	if o.top > 0 && overall != nil {
+	// Computed whenever there is a profile to compute it from, not only when a
+	// function TABLE was asked for: --top=0 suppresses the table, and used to
+	// suppress the notes rules that read it -- including the one whose whole
+	// job is to say the profile cannot be attributed to code.
+	if overall != nil {
 		fns, err := topFunctions(overall, window, sortBy, delta)
 		if err != nil {
 			return nil, err
-		}
-		if len(fns) > o.top {
-			fns = fns[:o.top]
 		}
 		for _, r := range fns {
 			f := funcJSON{Name: r.Name, Cum: r.Cores, Flat: r.Flat}
@@ -554,9 +572,18 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 				pct := v / grand * 100
 				f.Pct = &pct
 			}
-			d.Functions = append(d.Functions, f)
+			d.allFunctions = append(d.allFunctions, f)
+		}
+		if o.top > 0 {
+			d.Functions = d.allFunctions
+			if len(d.Functions) > o.top {
+				d.Functions = d.Functions[:o.top]
+			}
 		}
 	}
+	// After the groups and the functions: every rule is a share of numbers
+	// that must already be in place.
+	d.Notes = notesFor(o, d)
 
 	if overallErr != nil {
 		d.Failed = append(d.Failed, failJSON{Group: "(overall)", Error: shortErr(overallErr)})
