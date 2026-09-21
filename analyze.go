@@ -312,11 +312,17 @@ func sortRows(rows []Row, by sortKey) {
 	})
 }
 
+// unsymbolizedName is the bucket every nameless frame lands in. Named because
+// it is also a value the notes rule matches on, and two spellings of it would
+// mean the report could show the row while the note that explains it stays
+// silent.
+const unsymbolizedName = "[unsymbolized]"
+
 func funcName(l profile.Line) string {
 	if l.Function == nil || l.Function.Name == "" {
 		// Unsymbolized frames are common for system binaries without debuginfo.
 		// Bucket them so they do not fragment the top-N into noise.
-		return "[unsymbolized]"
+		return unsymbolizedName
 	}
 	return l.Function.Name
 }

@@ -120,6 +120,9 @@ func renderTable(d *reportData) {
 		printFunctionTable(fns, d.header, len(fns), total, d.sortKey)
 	}
 	printDrillDowns(d.Groups, d.Match != "", len(d.Functions) > 0)
+	// Last, under everything they qualify: a caveat read before the numbers
+	// it is about has nothing to attach to.
+	printNotes(d.Notes)
 }
 
 // renderJSON prints the report for a program to read.
@@ -157,6 +160,7 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 			Start:       start.UTC(),
 			End:         end.UTC(),
 			WindowSecs:  math.Round(end.Sub(start).Seconds()*1000) / 1000,
+			Notes:       []noteJSON{},
 			Groups:      []groupJSON{},
 			Functions:   []funcJSON{},
 			Failed:      []failJSON{},

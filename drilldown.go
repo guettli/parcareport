@@ -61,12 +61,26 @@ func drillFor(o options, groupName string, unlabeled bool) *drillJSON {
 
 	match := addMatcher(o.match, o.by, groupName)
 
+	args := baseCommandArgs(o, "")
+	args = append(args,
+		"--by "+shellQuote(by),
+		"--match "+shellQuote(match),
+	)
+	return &drillJSON{Command: strings.Join(args, " "), By: by, Match: match}
+}
+
+// baseCommandArgs is the leading part of any command this tool suggests:
+// everything that decides WHAT is queried and HOW the server is reached.
+//
+// Shared so a suggestion cannot drift from the run that produced it. A note
+// that named a different profile type, or omitted the TLS flags, would send
+// the reader somewhere else while claiming to be a closer look at this.
+//
+// profileTypeOverride replaces the run's own type, for a suggestion that
+// deliberately changes it -- "you are burning CPU on the allocator, go look at
+// alloc_space".
+func baseCommandArgs(o options, profileTypeOverride string) []string {
 	args := []string{"parcareport"}
-	// Carried: everything that decides WHAT is queried and HOW we reach it. A
-	// drill-down that dropped any of these would not be drilling into the
-	// report just printed -- it would quietly answer a different question, or
-	// fail to connect at all.
-	//
 	// Not carried: presentation and budgets (--top, --timeout, --deadline,
 	// --concurrency, --output). Those change how the answer is shown, not what
 	// it is, and the defaults are as good a starting point as the last run's.
@@ -91,12 +105,16 @@ func drillFor(o options, groupName string, unlabeled bool) *drillJSON {
 	if o.setFlags["password-file"] {
 		args = append(args, "--password-file "+shellQuote(o.passwordFile))
 	}
-	// resolvedType, not just the flag: overview REFUSES --profile-type and
-	// picks one per section, so setFlags never records it there. Gating on the
-	// flag alone made overview's heap section offer a command that re-ran
-	// against the default CPU profile -- a different profile, presented as a
-	// closer look at this one.
-	if pt := drillProfileType(o); pt != "" {
+	pt := profileTypeOverride
+	if pt == "" {
+		// resolvedType, not just the flag: overview REFUSES --profile-type and
+		// picks one per section, so setFlags never records it there. Gating on
+		// the flag alone made overview's heap section offer a command that
+		// re-ran against the default CPU profile -- a different profile,
+		// presented as a closer look at this one.
+		pt = drillProfileType(o)
+	}
+	if pt != "" {
 		args = append(args, "--profile-type "+shellQuote(pt))
 	}
 	if o.setFlags["from"] {
@@ -107,14 +125,10 @@ func drillFor(o options, groupName string, unlabeled bool) *drillJSON {
 	}
 	if o.setFlags["sort"] {
 		// Dropping --sort=cum flips the function table back to flat, and the
-		// function table is what the drill-down is for.
+		// function table is what these commands are for.
 		args = append(args, "--sort "+shellQuote(o.sortBy))
 	}
-	args = append(args,
-		"--by "+shellQuote(by),
-		"--match "+shellQuote(match),
-	)
-	return &drillJSON{Command: strings.Join(args, " "), By: by, Match: match}
+	return args
 }
 
 // drillProfileType returns the profile type the command must name, from

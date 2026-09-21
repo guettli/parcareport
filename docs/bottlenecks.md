@@ -40,6 +40,8 @@ or `alloc_space`. So "the overview found nothing" says nothing at all about
 lock contention, blocking, goroutine leaks, allocation churn or off-CPU waits —
 each of those needs its own explicit `--profile-type` run.
 
+<a id="coverage"></a>
+
 ## What this Parca actually collects
 
 Coverage comes in two tiers, and the tier decides which bottlenecks are visible
@@ -60,6 +62,8 @@ missing are skipped, not faked. The scrape tier carries `job`/`instance`
 instead, so it is grouped with `--by=instance`.
 
 Off-CPU (`wallclock`) additionally requires `--off-cpu-threshold` on the agents.
+
+<a id="symbolization"></a>
 
 **Symbolization is itself a coverage limit.** Without frame pointers or
 debuginfo, stacks collapse into `[unsymbolized]`. The CPU is still measured but
@@ -101,6 +105,8 @@ is visible as such (`do_syscall_64` routinely tops real tables). What you
 cannot get is a syscall *count* or per-syscall latency.
 → `strace`, `bpftrace`.
 
+<a id="amdahl"></a>
+
 ### ⚠️ Insufficient parallelism (serialization, Amdahl)
 An inference: a workload pinned at ≈1.0 `CORES` while work queues up is
 single-threaded. Parca has no notion of "work queued", so that half of the
@@ -116,6 +122,8 @@ count, so a container limited to 500m runs a scheduler and GC sized for a much
 bigger machine, producing throttling and GC thrash. Parca shows the symptom
 (GC and scheduler frames costing more than the work) but not the cause — the
 `GOMAXPROCS` value itself is not in any profile.
+
+<a id="throttling"></a>
 
 ### ❌ CPU throttling (cgroup quota)
 A throttled container is *runnable but not running*: not on-CPU, so the CPU
@@ -153,6 +161,8 @@ merged over a single scrape interval, so you get one number, not a series. Run
 it repeatedly, or walk `--to` backwards, and compare. Watch `stale_series` /
 `doubled_series` in the output — a series that disappeared is counted, not
 silently dropped.
+
+<a id="gc-pressure"></a>
 
 ### ✅ Allocation churn and GC pressure (Go services)
 

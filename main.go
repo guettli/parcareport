@@ -906,6 +906,11 @@ The function table comes from the unfiltered merge, so it covers every row of
 the breakdown at once. To get one row's own functions, re-run with --match
 pinning it; a report prints the command for its largest rows.
 
+A NOTES block appears when a plain rule spots something in the numbers: a
+profile that cannot be attributed, a total that does not add up, a workload at
+a one-core ceiling. Each note carries a stable code, a link into
+docs/bottlenecks.md, and a command when there is one to run.
+
 Which bottlenecks this can and cannot find -- and why some are invisible to
 any sampling profiler -- is written up in docs/bottlenecks.md.
 
