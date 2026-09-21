@@ -147,6 +147,8 @@ func unitName(header string) string {
 		return "bytes"
 	case "COUNT":
 		return "count"
+	case "SECONDS":
+		return "seconds"
 	}
 	return strings.ToLower(header)
 }
@@ -494,7 +496,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	knowTotal := overallErr == nil && overall != nil
 	unlabeled := -1
 	if overall != nil {
-		mt, err := interpret(overall, window)
+		mt, err := interpret(overall, window, delta)
 		if err != nil {
 			return nil, err
 		}
@@ -526,7 +528,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	}
 
 	if o.top > 0 && overall != nil {
-		fns, err := topFunctions(overall, window, sortBy)
+		fns, err := topFunctions(overall, window, sortBy, delta)
 		if err != nil {
 			return nil, err
 		}
@@ -723,7 +725,7 @@ func mergeOne(ctx context.Context, c *Client, o options, profType, g string,
 		// error because an empty answer is a normal, successful outcome.
 		return groupResult{name: g, empty: true}
 	}
-	m, err := interpret(p, window)
+	m, err := interpret(p, window, isDeltaType(profType))
 	return groupResult{name: g, value: m.Value, header: m.Header, rate: m.Rate, err: err}
 }
 
