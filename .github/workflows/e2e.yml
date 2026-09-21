@@ -51,7 +51,14 @@ jobs:
 
       - name: Start Parca scraping the zoo
         run: |
-          curl -fsSL --retry 3 --retry-all-errors -o /tmp/parca.tar.gz \
+          # --retry alone is not enough. curl's default backoff is 1s, 2s, 4s,
+          # so three retries give up after about seven seconds -- fine for a
+          # dropped packet, useless for the thing that actually happens, which
+          # is GitHub returning 504 for release assets for minutes at a time.
+          # Three consecutive runs failed that way with the asset serving 200
+          # from everywhere else. --retry-delay with a real budget rides it out.
+          curl -fsSL -o /tmp/parca.tar.gz \
+            --retry 10 --retry-delay 15 --retry-all-errors --retry-max-time 300 \
             "https://github.com/parca-dev/parca/releases/download/v${PARCA_VERSION}/parca_${PARCA_VERSION}_Linux_x86_64.tar.gz"
           echo "${PARCA_SHA256}  /tmp/parca.tar.gz" | sha256sum -c -
           mkdir -p /tmp/parca /tmp/parca-data
