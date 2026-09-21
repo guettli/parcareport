@@ -62,6 +62,46 @@ workload; a single frame at 76.9% was not.
 what larger piece of work a frame was part of, which is what you want once you
 already know which function is hot.
 
+## How the breakdown is priced, and what that costs you
+
+The group table is built with **one** `QueryRange` using `sum_by`, not one
+merge per label value. A merge reconstructs every distinct stacktrace so it can
+return a profile; summing a label needs none of that. The difference is not
+marginal — `--by=comm` on a real server has 1486 values:
+
+```
+                one merge per value          one range query
+--by=comm    1034 of 1196 queries died      40s, complete
+             on the deadline
+```
+
+`breakdown` in the JSON says which was used, `"sum_by"` or `"merge"`.
+
+**The limitation, stated plainly.** The range API answers in raw sample values
+and knows nothing about sampling periods, so the rows are converted to `CORES`
+with a factor taken from the unfiltered merge — and that merge has **one**
+period, the fleet's. If your agents run at different `--sampling-frequency`
+settings, the rows are priced wrongly, and *nothing in the output shows it*:
+they are scaled by the same factor as the total, so they sum to it however
+wrong the factor is.
+
+The old fan-out priced each group from its own profile, so such a fleet made
+the percentages exceed 100% — visibly wrong, which is worth more than silently
+consistent. **`--fan-out` gets that cross-check back.** It is slow by orders of
+magnitude; it is the right thing to run once if you suspect this, or if a
+number looks wrong and you want a second opinion computed a different way.
+
+What *is* checked automatically: that the range query and the merge summed to
+the same raw total (within 0.5%), and that the server did not fold several
+profiles into one data point. Either would mean the two queries saw different
+data, and the report falls back to merging rather than reporting a number it
+cannot stand behind.
+
+Snapshot profiles (heap, goroutine) always use the fan-out. They are levels
+measured repeatedly, and every group has to be read at one shared instant or
+the rows and the total describe different moments; a range query takes each
+series independently and cannot do that.
+
 ## Notes: what the tool noticed
 
 A sorted table is not a pointer. `parcareport` calls itself a bottleneck report,

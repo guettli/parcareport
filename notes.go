@@ -175,6 +175,15 @@ func unlabeledNote(d *reportData, total float64) *noteJSON {
 				"and every row above understates its share. Every series ought to carry %s, "+
 				"so this usually means an agent or scrape tier was deployed without it.",
 			share, d.GroupBy, d.GroupBy)
+		if d.DroppedGroups > 0 {
+			// The breakdown query named these values and the report did not
+			// show them, so their samples are in the total, in no row, and
+			// therefore inside this residual. Calling all of it unlabelled
+			// would be a plain misstatement.
+			msg += fmt.Sprintf(
+				" Note that %d values the breakdown returned were not in the label list "+
+					"and are inside this residual too -- it is not all unlabelled.", d.DroppedGroups)
+		}
 		if len(d.Failed) > 0 {
 			// The residual is the measured total minus the groups that came
 			// back, so a group whose query FAILED is inside it. Reporting that

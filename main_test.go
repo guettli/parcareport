@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	qgrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/query/v1alpha1/queryv1alpha1grpc"
+	profilestorepb "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/profilestore/v1alpha1"
 	qv1 "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/query/v1alpha1"
 	"github.com/google/pprof/profile"
 	"google.golang.org/grpc"
@@ -242,12 +244,30 @@ type fakeQuery struct {
 	// empty pprof, which is what Parca returns for a window with no samples.
 	merges    map[string]*profile.Profile
 	mergeErrs map[string]error
+	// rangeCalls counts sum_by range queries, so a test can show the cheap
+	// breakdown really replaced the fan-out rather than running beside it.
+	rangeCalls atomic.Int64
+	// noSumBy makes the server refuse sum_by, the way one too old to support
+	// it would. The report must then fall back to merging each group -- which
+	// is also how the tests about per-group failure and retry reach the
+	// fan-out at all, since the cheap path has no per-group queries to fail.
+	noSumBy bool
 	// maxParallel records the peak number of merges in flight, so a test can
 	// see what concurrency was actually used.
 	inFlight    atomic.Int64
 	maxParallel atomic.Int64
 	mergeDelay  time.Duration
-	// failFirstN fails that many merge attempts with a transient-looking
+	// sumByScale multiplies every sum_by value, so a test can make the range
+	// query disagree with the merge the way a truncated response would.
+	sumByScale float64
+	// sumByCount sets MetricsSample.Count, which is how a server says it
+	// folded several profiles into one data point.
+	sumByCount int32
+	// failOverallFirstN fails that many attempts at the UNFILTERED merge,
+	// transiently. See the comment where it is applied.
+	failOverallFirstN int64
+	overallFailCount  atomic.Int64
+	// failFirstN fails that many GROUP merge attempts with a transient-looking
 	// error before succeeding, the way an overloaded server does.
 	failFirstN int64
 	failCount  atomic.Int64
@@ -723,7 +743,22 @@ func (f *fakeQuery) Query(ctx context.Context, in *qv1.QueryRequest, _ ...grpc.C
 		return nil, status.Error(codes.Internal,
 			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
 	}
-	if f.failFirstN > 0 && f.failCount.Add(1) <= f.failFirstN {
+	// Group merges only. The unfiltered merge carries no matcher, and it now
+	// runs FIRST -- before the fan-out -- because the cheap breakdown is
+	// priced from its metadata. Letting it consume these failures would make
+	// every test that budgets N of them silently exercise something else.
+	// Tests that want the unfiltered merge to fail use failOverallFirstN,
+	// failSel or mergeErrs.
+	if f.failFirstN > 0 && strings.ContainsRune(sel, '{') && f.failCount.Add(1) <= f.failFirstN {
+		return nil, status.Error(codes.Internal,
+			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
+	}
+	// The unfiltered merge's own transient failures. It needs its own knob:
+	// failFirstN deliberately skips it, and failSel/mergeErrs fail EVERY
+	// attempt, so without this there is no way to make it fail once and
+	// recover -- which is the only behaviour its retry has.
+	if f.failOverallFirstN > 0 && !strings.ContainsRune(sel, '{') &&
+		f.overallFailCount.Add(1) <= f.failOverallFirstN {
 		return nil, status.Error(codes.Internal,
 			"stream terminated by RST_STREAM with error code: INTERNAL_ERROR")
 	}
@@ -1689,6 +1724,10 @@ func TestJSONReportCarriesTheNumbersAndTheirUnit(t *testing.T) {
 // `!!` to notice the numbers are wrong.
 func TestJSONMarksAnIncompleteRunAndNamesTheFailures(t *testing.T) {
 	f := reportFixture(t)
+	// Per-group failure and retry only exist on the fan-out: the cheap
+	// breakdown asks one range query, so there are no per-group queries to
+	// fail or re-ask. Refusing sum_by is how this reaches that path.
+	f.noSumBy = true
 	f.values["cluster"] = []string{"tc", "vps", "broken"}
 	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
 	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
@@ -2097,6 +2136,9 @@ func TestOverviewSaysWhatItDidNotReport(t *testing.T) {
 // One failing section must not take the whole overview with it.
 func TestOverviewSurvivesOneFailingSection(t *testing.T) {
 	f := overviewFixture(t)
+	// A per-group merge failure only exists on the fan-out; the cheap
+	// breakdown asks one range query. Refusing sum_by reaches that path.
+	f.noSumBy = true
 	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
 	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
 	f.merges[testType] = cpuProfile(t, 150)
@@ -2311,7 +2353,9 @@ func TestJSONKeepsFunctionsForEverySection(t *testing.T) {
 
 // One merge per label value, so a label with hundreds of them would swamp the
 // sections worth having.
-func TestOverviewSkipsAHighCardinalityBreakdown(t *testing.T) {
+// The cap exists because each label value used to cost a merge. Under
+// --fan-out it still does, so it still applies.
+func TestOverviewSkipsAHighCardinalityBreakdownWhenItCostsAMerge(t *testing.T) {
 	f := overviewFixture(t)
 	many := make([]string, 0, 200)
 	for i := 0; i < 200; i++ {
@@ -2326,12 +2370,13 @@ func TestOverviewSkipsAHighCardinalityBreakdown(t *testing.T) {
 
 	o := overviewOptions()
 	o.top = 0
+	o.fanOut = true
 	out, err := runOverview(t, f, o)
 	if err != nil {
 		t.Fatalf("skipping a wide breakdown is not a failure: %v", err)
 	}
 	if strings.Contains(out, "COMM") {
-		t.Errorf("a 200-value breakdown should be skipped:\n%s", out)
+		t.Errorf("a 200-value breakdown should be skipped when each costs a merge:\n%s", out)
 	}
 	if !strings.Contains(out, "200 values is more than") {
 		t.Errorf("and the reason should be stated:\n%s", out)
@@ -2339,6 +2384,44 @@ func TestOverviewSkipsAHighCardinalityBreakdown(t *testing.T) {
 	// The cheap sections still run.
 	if !strings.Contains(out, "CLUSTER") || !strings.Contains(out, "INSTANCE") {
 		t.Errorf("the affordable sections should still run:\n%s", out)
+	}
+}
+
+// ...and must NOT apply when the breakdown is one range query however many
+// values there are. `comm` is the most useful breakdown on the list -- it is
+// the one that names processes -- and the cap was refusing exactly the case it
+// was written to protect.
+func TestOverviewKeepsAHighCardinalityBreakdownWhenItIsCheap(t *testing.T) {
+	f := overviewFixture(t)
+	many := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		many = append(many, fmt.Sprintf("proc%d", i))
+		f.merges[testType+`{comm="proc`+fmt.Sprint(i)+`"}`] = cpuProfile(t, 1)
+	}
+	f.values["comm"] = many
+	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+	f.merges[testType] = cpuProfile(t, 350)
+	f.merges[heapType+`{instance="10.0.0.1:6060"}`] = heapProfile(t, 1<<30)
+	f.merges[heapType] = heapProfile(t, 1<<30)
+
+	o := overviewOptions()
+	o.top = 0
+	out, err := runOverview(t, f, o)
+	if err != nil {
+		t.Fatalf("a wide but cheap breakdown should just run: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "COMM") {
+		t.Errorf("a 200-value breakdown is one query now and should run:\n%s", out)
+	}
+	if strings.Contains(out, "values is more than") {
+		t.Errorf("nothing should have been skipped for cost:\n%s", out)
+	}
+	// And it cost one range query, not two hundred merges.
+	for i := 0; i < 200; i++ {
+		if n := f.callsFor(testType + `{comm="proc` + fmt.Sprint(i) + `"}`); n != 0 {
+			t.Fatalf("comm=proc%d was merged %d times; the breakdown should be one query", i, n)
+		}
 	}
 }
 
@@ -2585,6 +2668,10 @@ func TestOverviewLowersConcurrencyUnlessAsked(t *testing.T) {
 	// setting, and the assertion means nothing.
 	fixture := func() *fakeQuery {
 		f := overviewFixture(t)
+		// Per-group failure and retry only exist on the fan-out: the cheap
+		// breakdown asks one range query, so there are no per-group queries to
+		// fail or re-ask. Refusing sum_by is how this reaches that path.
+		f.noSumBy = true
 		f.types = profileTypesFrom([]string{testType})
 		f.names = []string{"cluster"}
 		f.values["cluster"] = []string{"c1", "c2", "c3", "c4", "c5"}
@@ -2632,6 +2719,10 @@ func (f *fakeQuery) callsFor(sel string) int {
 
 func TestATransientlyFailedGroupIsRetried(t *testing.T) {
 	f := overviewFixture(t)
+	// Per-group failure and retry only exist on the fan-out: the cheap
+	// breakdown asks one range query, so there are no per-group queries to
+	// fail or re-ask. Refusing sum_by is how this reaches that path.
+	f.noSumBy = true
 	f.types = profileTypesFrom([]string{testType})
 	// One label, so one section: this test is about the retry, not about
 	// other breakdowns having no data.
@@ -2666,6 +2757,10 @@ func TestATransientlyFailedGroupIsRetried(t *testing.T) {
 // failure says not to do.
 func TestRetryAsksOnlyTheGroupThatFailed(t *testing.T) {
 	f := overviewFixture(t)
+	// Per-group failure and retry only exist on the fan-out: the cheap
+	// breakdown asks one range query, so there are no per-group queries to
+	// fail or re-ask. Refusing sum_by is how this reaches that path.
+	f.noSumBy = true
 	f.types = profileTypesFrom([]string{testType})
 	f.names = []string{"cluster"}
 	f.values["cluster"] = []string{"a", "b", "c", "d", "e"}
@@ -2698,6 +2793,10 @@ func TestRetryAsksOnlyTheGroupThatFailed(t *testing.T) {
 // wrong query again.
 func TestPermanentFailuresAreNotRetried(t *testing.T) {
 	f := overviewFixture(t)
+	// Per-group failure and retry only exist on the fan-out: the cheap
+	// breakdown asks one range query, so there are no per-group queries to
+	// fail or re-ask. Refusing sum_by is how this reaches that path.
+	f.noSumBy = true
 	f.types = profileTypesFrom([]string{testType})
 	f.names = []string{"cluster"}
 	f.values["cluster"] = []string{"a", "b"}
@@ -2766,6 +2865,10 @@ func TestADroppedLabelLookupIsRetried(t *testing.T) {
 // in parallel would be a smaller version of the same mistake.
 func TestTheRetryGoesOneAtATime(t *testing.T) {
 	f := overviewFixture(t)
+	// Per-group failure and retry only exist on the fan-out: the cheap
+	// breakdown asks one range query, so there are no per-group queries to
+	// fail or re-ask. Refusing sum_by is how this reaches that path.
+	f.noSumBy = true
 	f.types = profileTypesFrom([]string{testType})
 	f.names = []string{"cluster"}
 	f.values["cluster"] = []string{"a", "b", "c", "d"}
@@ -2815,6 +2918,9 @@ func TestTheReportsOwnLabelLookupIsRetried(t *testing.T) {
 // run worse than no retry at all.
 func TestTheRetryStopsWhenTheBudgetRunsOut(t *testing.T) {
 	f := reportFixture(t)
+	// Per-group failure and retry only exist on the fan-out; the cheap
+	// breakdown asks one range query. Refusing sum_by reaches that path.
+	f.noSumBy = true
 	f.values["cluster"] = []string{"a", "b", "c", "d", "e", "f"}
 	for _, g := range f.values["cluster"] {
 		f.merges[testType+`{cluster="`+g+`"}`] = cpuProfile(t, 10)
@@ -2893,6 +2999,9 @@ func TestAFailedRetryKeepsTheFirstError(t *testing.T) {
 // so the retry made the run worse than no retry at all.
 func TestTheRetryPassLeavesBudgetForWhatComesNext(t *testing.T) {
 	f := reportFixture(t)
+	// Per-group failure and retry only exist on the fan-out; the cheap
+	// breakdown asks one range query. Refusing sum_by reaches that path.
+	f.noSumBy = true
 	f.values["cluster"] = []string{"a", "b", "c", "d", "e", "f", "g", "h"}
 	for _, g := range f.values["cluster"] {
 		f.merges[testType+`{cluster="`+g+`"}`] = cpuProfile(t, 10)
@@ -2947,6 +3056,10 @@ func TestNoLabelLookupRetryWithoutBudgetForIt(t *testing.T) {
 // get the whole fan-out again and again.
 func TestATransientFailureIsRetriedOnlyOnce(t *testing.T) {
 	f := overviewFixture(t)
+	// Per-group failure and retry only exist on the fan-out: the cheap
+	// breakdown asks one range query, so there are no per-group queries to
+	// fail or re-ask. Refusing sum_by is how this reaches that path.
+	f.noSumBy = true
 	f.types = profileTypesFrom([]string{testType})
 	f.names = []string{"cluster"}
 	f.values["cluster"] = []string{"a", "b"}
@@ -3007,6 +3120,12 @@ func (f *fakeQuery) QueryRange(ctx context.Context, in *qv1.QueryRangeRequest, _
 	if err := f.mergeErrs[sel]; err != nil {
 		return nil, err
 	}
+	if len(in.GetSumBy()) > 0 {
+		if f.noSumBy {
+			return nil, status.Error(codes.Unimplemented, "sum_by is not supported by this server")
+		}
+		return f.sumBy(sel, in.GetSumBy()[0], in.GetStart().AsTime(), in.GetEnd().AsTime())
+	}
 	if f.merges[sel] == nil {
 		// The real Parca answers NotFound here, not an empty response --
 		// unlike Merge, which answers OK with an empty pprof. Mirrored so the
@@ -3036,6 +3155,111 @@ func (f *fakeQuery) QueryRange(ctx context.Context, in *qv1.QueryRangeRequest, _
 			"No data found for the query, try a different query or time range or no data has been written to be queried yet.")
 	}
 	return &qv1.QueryRangeResponse{Series: series}, nil
+}
+
+// sumBy answers a sum_by range query from the very profiles the merges are
+// built from, so the cheap breakdown and the fan-out cannot disagree in the
+// fake when they would agree against a real server. A fake that made up its
+// own numbers here would let the two paths drift and still pass.
+//
+// Values are RAW sample sums -- a count of stacks for a CPU profile -- because
+// that is what the range API returns: it knows nothing about periods, which is
+// the whole reason the caller has to scale them.
+func (f *fakeQuery) sumBy(sel, label string, start, end time.Time) (*qv1.QueryRangeResponse, error) {
+	f.rangeCalls.Add(1)
+	// The same per-series scrape count the merge folds in. A real server's
+	// sum_by covers every profile in the window exactly as a merge does, so a
+	// fake whose two paths disagreed here would make the agreement test fail
+	// for a reason that exists only in the fake -- or, worse, pass while the
+	// real arithmetic was wrong.
+	factor := int64(0)
+	for i := 0; i < f.seriesCount(); i++ {
+		factor += int64(len(f.scrapeTimes(i, start, end)))
+	}
+	prefix := sel
+	if i := strings.IndexByte(prefix, '{'); i >= 0 {
+		prefix = prefix[:i]
+	}
+	var series []*qv1.MetricsSeries
+	for key, p := range f.merges {
+		if p == nil || !strings.HasPrefix(key, prefix+"{") {
+			continue
+		}
+		val, ok := matcherValue(key, label)
+		if !ok {
+			continue
+		}
+		var raw int64
+		for _, smp := range p.Sample {
+			if len(smp.Value) > 0 {
+				raw += smp.Value[0]
+			}
+		}
+		series = append(series, &qv1.MetricsSeries{
+			Labelset: &profilestorepb.LabelSet{
+				Labels: []*profilestorepb.Label{{Name: label, Value: val}},
+			},
+			Samples: []*qv1.MetricsSample{{Value: f.scaleSum(raw * factor), Count: f.sumByCount}},
+		})
+	}
+	// The residual, as a real server returns it: one series carrying no value
+	// for the label, holding whatever the unfiltered merge has that the
+	// labelled groups do not. Without it the two queries disagree on what they
+	// saw, which is exactly what the caller checks for -- so a fake that
+	// omitted it would make the cheap path look broken when it is not.
+	if overall := f.merges[prefix]; overall != nil {
+		var all int64
+		for _, smp := range overall.Sample {
+			if len(smp.Value) > 0 {
+				all += smp.Value[0]
+			}
+		}
+		var grouped int64
+		for _, s := range series {
+			grouped += s.GetSamples()[0].GetValue()
+		}
+		if r := all*factor - grouped; r > 0 {
+			series = append(series, &qv1.MetricsSeries{
+				Labelset: &profilestorepb.LabelSet{},
+				Samples:  []*qv1.MetricsSample{{Value: f.scaleSum(r), Count: f.sumByCount}},
+			})
+		}
+	}
+	if len(series) == 0 {
+		return nil, status.Error(codes.NotFound, "No data found for the query")
+	}
+	return &qv1.QueryRangeResponse{Series: series}, nil
+}
+
+// matcherValue pulls one label's value out of a selector like
+// `type{cluster="tc"}`. Only the exact-match form this tool builds.
+func matcherValue(sel, label string) (string, bool) {
+	i := strings.IndexByte(sel, '{')
+	j := strings.LastIndexByte(sel, '}')
+	if i < 0 || j < i {
+		return "", false
+	}
+	for _, m := range matchers(sel[i+1 : j]) {
+		name, rest, ok := strings.Cut(strings.TrimSpace(m), "=")
+		if !ok || name != label {
+			continue
+		}
+		v, err := strconv.Unquote(rest)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	}
+	return "", false
+}
+
+// scaleSum lets a test make the range query answer with less than the merge
+// summed, which is what a truncated or downsampled response looks like.
+func (f *fakeQuery) scaleSum(v int64) int64 {
+	if f.sumByScale == 0 {
+		return v
+	}
+	return int64(float64(v) * f.sumByScale)
 }
 
 func (f *fakeQuery) seriesCount() int {
@@ -3622,6 +3846,10 @@ func TestReportNoRowsMessageNamesTheMatcher(t *testing.T) {
 // a value with no samples really did have no samples.
 func TestReportWithoutMatchStillSaysNoSamples(t *testing.T) {
 	f := reportFixture(t)
+	// Deliberately NOT forcing the fan-out. A value with no samples has to be
+	// reported as such on the cheap path too, where it is an absence from the
+	// response rather than an empty merge -- and an earlier version of that
+	// path dropped the count silently.
 	f.values["cluster"] = []string{"tc", "vps", "idle"}
 	f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
 	f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
