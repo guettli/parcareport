@@ -14,9 +14,9 @@ $ parcareport --url parca.example:7070 --from=-6h
 parca_agent:samples:count:cpu:nanoseconds:delta  2026-08-26T03:00:00Z .. 2026-08-26T09:00:00Z  (6h0m0s)
 
 CLUSTER  CORES  %TOTAL
-vps      1.290  55.7
-tc       0.697  30.1
-p16      0.330  14.2
+eu1      1.290  55.7
+us       0.697  30.1
+ap1      0.330  14.2
 TOTAL    2.317  100.0
 
 FUNCTION                             CUM    FLAT*  %TOTAL
@@ -70,7 +70,7 @@ already know which function is hot.
 This is the point of the tool. Raw sample counts are not comparable between a
 big cluster and a small one, and a flamegraph's percentages are relative to
 whatever you happened to select. Cores are an absolute, physical unit, so
-"tc burns 0.7 cores" means the same thing everywhere and can be compared to
+"us burns 0.7 cores" means the same thing everywhere and can be compared to
 what you are paying for.
 
 Getting there takes one non-obvious step. `parca-agent`'s CPU profile has
@@ -101,7 +101,7 @@ stuck behind a lock, and there are usually far more of the former:
 ```
 WORKLOAD    BLOCKED   %TOTAL
 clickhouse  1816.692  41.4
-agentloop   232.447   5.3
+scheduler   232.447   5.3
 ```
 
 Almost all of the first row is `ThreadPoolImpl::ThreadFromThreadPool::worker`
@@ -167,7 +167,7 @@ and the command exits non-zero:
 !! INCOMPLETE
 !! 3 of 47 workload queries failed. The totals and percentages above
 !! EXCLUDE them and are therefore wrong.
-!!   context deadline exceeded  (3 groups: workload=agentloop, workload=api, workload=web)
+!!   context deadline exceeded  (3 groups: workload=scheduler, workload=api, workload=web)
 !! Raise --timeout, or narrow the window with --from so each merge is smaller.
 ```
 
@@ -231,8 +231,8 @@ percentages of a subtotal that silently omits whatever is missing.
 
 ```
 CLUSTER        CORES
-tc             2.316
-vps            0.655
+us             2.316
+eu1            0.655
 SUM OF LISTED  2.971
 
 !! INCOMPLETE
@@ -396,8 +396,8 @@ the failures as data:
   "unit": "cores",
   "rate": true,
   "groups": [
-    {"name": "tc", "value": 2.3160163, "pct": 77.95409962975428},
-    {"name": "vps", "value": 0.6549837, "pct": 22.045900370245704}
+    {"name": "us", "value": 2.3160163, "pct": 77.95409962975428},
+    {"name": "eu1", "value": 0.6549837, "pct": 22.045900370245704}
   ],
   "empty_groups": 0,
   "total": 2.971,
@@ -461,8 +461,8 @@ $ parcareport overview --from=-15m
 parca_agent:samples:count:cpu:nanoseconds:delta  ...
 
 CLUSTER  CORES  %TOTAL
-tc       2.316  78.0
-vps      0.655  22.0
+us       2.316  78.0
+eu1      0.655  22.0
 TOTAL    2.971  100.0
 
 FUNCTION                                                      CUM    FLAT*  %TOTAL
@@ -639,7 +639,7 @@ usually means an agent is missing its external label:
 ```yaml
 # parca-agent DaemonSet
 args:
-  - --metadata-external-labels=cluster=tc
+  - --metadata-external-labels=cluster=us
 ```
 
 ## Reaching a Parca that is not on localhost
@@ -730,7 +730,7 @@ come back as a bare 401 that says nothing about the flag having been dropped.
 
   ```
   LABEL    VALUES  SAMPLE
-  cluster  2       tc vps
+  cluster  2       us eu1
   comm     ?       !! context deadline exceeded
   node     3       n1 n2 n3
   !! These queries are normally instant, so a timeout means the server is slow

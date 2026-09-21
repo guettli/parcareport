@@ -53,11 +53,11 @@ for which workloads.
 **Labels are not guaranteed.** The agent tier always carries `node` and `comm`.
 `cluster` requires `--metadata-external-labels` on the agents;
 `namespace`, `workload`, `workload_kind` and `container` exist only if the
-agents were given `relabel_configs` via `--config-path`. On the server the
-README was written against, `overview` found just `cluster comm node` — three
-of those six were absent. Breakdowns whose label is missing are skipped, not
-faked. The scrape tier carries `job`/`instance` instead, so it is grouped with
-`--by=instance`.
+agents were given `relabel_configs` via `--config-path`. A stock agent
+deployment commonly offers only a subset — `overview` reporting just
+`cluster comm node` is a normal outcome, not a fault. Breakdowns whose label is
+missing are skipped, not faked. The scrape tier carries `job`/`instance`
+instead, so it is grouped with `--by=instance`.
 
 Off-CPU (`wallclock`) additionally requires `--off-cpu-threshold` on the agents.
 
