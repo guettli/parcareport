@@ -73,6 +73,8 @@ Legend: **✅ yes** · **⚠️ partially / only targeted / with caveats** · **
 ## 1. CPU
 
 ### ✅ CPU-bound compute (hot loops, expensive algorithms)
+
+*Tested: [`zooBurnCPU`](../cmd/zoo/main.go) planted, `cpu_hot_loop` asserted in [e2e_test.go](../e2e_test.go).*
 The core case, and the one everything else is measured against.
 
 ```sh
@@ -138,6 +140,8 @@ No code location; properties of the machine's power and topology state.
 ## 2. Memory
 
 ### ✅ Live heap and leaks (Go services)
+
+*Tested: [`zooHoldHeap`](../cmd/zoo/main.go) planted, `live_heap` asserted in [e2e_test.go](../e2e_test.go).*
 `memory:inuse_space` is the live heap by allocation site.
 
 ```sh
@@ -151,6 +155,8 @@ it repeatedly, or walk `--to` backwards, and compare. Watch `stale_series` /
 silently dropped.
 
 ### ✅ Allocation churn and GC pressure (Go services)
+
+*Tested: [`zooChurnAlloc`](../cmd/zoo/main.go) planted, `alloc_churn` asserted in [e2e_test.go](../e2e_test.go).*
 Two independent signals agree here, which is what makes it trustworthy:
 `memory:alloc_space` shows *which code allocates*, and the CPU profile shows
 the *cost* as time in `runtime.mallocgc`, `runtime.gcBgMarkWorker` and
@@ -250,6 +256,8 @@ wait to a downstream span.
 ## 5. Concurrency and synchronization
 
 ### ✅ Lock contention (Go services) — with three conditions
+
+*Tested: [`zooContendMutex`](../cmd/zoo/main.go) planted, `mutex_contention` asserted in [e2e_test.go](../e2e_test.go).*
 `mutex:delay` attributes contention time and `mutex:contentions` the event
 count. Before trusting either:
 
@@ -274,11 +282,15 @@ parcareport --profile-type=mutex:delay --by=instance         # SECONDS waited
 ```
 
 ### ✅ Blocking on sync primitives (Go services)
+
+*Tested: [`zooBlockOnChannel`](../cmd/zoo/main.go) planted, `block_on_channel` asserted in [e2e_test.go](../e2e_test.go).*
 `block:delay` / `block:contentions` cover channel sends/receives, `select`,
 `WaitGroup` and mutex waits, attributed to the blocking call site. Same three
 conditions as above.
 
 ### ✅ Goroutine leaks and runaway concurrency (Go services)
+
+*Tested: [`zooLeakGoroutines`](../cmd/zoo/main.go) planted, `goroutine_leak` asserted in [e2e_test.go](../e2e_test.go).*
 `goroutine` by instance; a count that climbs and never returns is a leak, and
 the profile names the function they are parked in. As with heap, growth needs
 repeated runs — one run is one number.
@@ -351,6 +363,33 @@ README, "Reading `BLOCKED` (off-CPU) honestly".
 This is why `overview` never sweeps off-CPU at all.
 
 ---
+
+## Which of these are covered by a test
+
+Six of the ✅ rows are proven end to end: [`cmd/zoo`](../cmd/zoo/main.go) plants
+the bottleneck in a real process, a real Parca scrapes it, and
+[`e2e_test.go`](../e2e_test.go) asserts the report blames the planted function
+**by rank and share** -- not merely that the name appears somewhere in the
+table, which several of these profiles are small enough to satisfy by accident.
+
+| Bottleneck | Planted by | Asserted by | Profile |
+|---|---|---|---|
+| CPU-bound compute | `zooBurnCPU` | `cpu_hot_loop` | `process_cpu` |
+| Allocation churn | `zooChurnAlloc` | `alloc_churn` | `memory:alloc_space` |
+| Live heap / retention | `zooHoldHeap` | `live_heap` | `memory:inuse_space` |
+| Goroutine leak | `zooLeakGoroutines` | `goroutine_leak` | `goroutine` |
+| Lock contention | `zooContendMutex` | `mutex_contention` | `mutex:delay` |
+| Blocking on a primitive | `zooBlockOnChannel` | `block_on_channel` | `block:delay` |
+
+Everything else has no test, for two different reasons, and the difference
+matters when you are deciding how much to trust a row:
+
+- **Detectable, but nothing plants it.** Regressions between two windows,
+  serialization cost, and self-hosted dependencies are ✅ and would work, but
+  no test exercises them. A regression in those paths would not be caught.
+- **Not detectable at all.** Every ⚠️ and ❌ row. There is nothing to assert:
+  a test that "proved" parcareport finds cache misses would be proving a
+  falsehood. What backs those rows is the explanation above them, not a test.
 
 ## Summary
 
