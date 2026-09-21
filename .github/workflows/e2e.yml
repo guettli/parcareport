@@ -1,0 +1,119 @@
+name: e2e
+
+# End-to-end: a real Parca scrapes a workload with deliberate, known
+# bottlenecks (cmd/zoo), and the test asserts parcareport blames the functions
+# we planted -- by rank and share, not mere presence -- and that it reported
+# the run complete while doing so.
+#
+# The unit tests answer a fake server, so they can only prove rendering. This
+# job is the one that can fail when parcareport stops *finding* things.
+#
+# No container runtime: Parca's released binary is enough, and starting it
+# directly is faster than pulling an image.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  zoo:
+    name: find planted bottlenecks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PARCA_VERSION: 0.28.0
+      # From the release's own checksums.txt. Release assets are mutable by the
+      # publisher, so the version alone is not a pin.
+      PARCA_SHA256: f08a2ecbe4490b539107d4aa4b9aae8362bf88e09e9e099c264c734eff9d4dd4
+      ZOO_ADDR: 127.0.0.1:6060
+      # Not 7070: leaves the default free, so running this locally does not
+      # collide with a Parca you already have.
+      PARCA_URL: 127.0.0.1:7071
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Start the bottleneck zoo
+        run: |
+          go build -o /tmp/zoo ./cmd/zoo
+          # Redirecting both streams matters: without it the step hangs waiting
+          # for EOF on the runner's pipe instead of backgrounding cleanly.
+          /tmp/zoo -addr "$ZOO_ADDR" >/tmp/zoo.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf "http://$ZOO_ADDR/debug/pprof/" >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::zoo did not come up"; cat /tmp/zoo.log; exit 1
+
+      - name: Start Parca scraping the zoo
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/parca.tar.gz \
+            "https://github.com/parca-dev/parca/releases/download/v${PARCA_VERSION}/parca_${PARCA_VERSION}_Linux_x86_64.tar.gz"
+          echo "${PARCA_SHA256}  /tmp/parca.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/parca /tmp/parca-data
+          tar xzf /tmp/parca.tar.gz -C /tmp/parca
+
+          # A 5s interval so a short wait is many samples. Only process_cpu is
+          # a delta; heap, goroutine, mutex and block are merged over ONE
+          # scrape, so they need to have been scraped at least once.
+          cat > /tmp/parca.yaml <<YAML
+          object_storage:
+            bucket:
+              type: "FILESYSTEM"
+              config:
+                directory: "/tmp/parca-data"
+          scrape_configs:
+            - job_name: "zoo"
+              scrape_interval: "5s"
+              static_configs:
+                - targets: [ '${ZOO_ADDR}' ]
+          YAML
+
+          /tmp/parca/parca --config-path=/tmp/parca.yaml \
+            --http-address="$PARCA_URL" >/tmp/parca.log 2>&1 &
+          echo "started parca, waiting for it to serve"
+
+      - name: Wait until every profile type has been scraped
+        # Parca has no HTTP health endpoint -- its UI mux answers 200 for any
+        # path, so probing one would pass even when nothing works. Asking the
+        # server which profile types it has is a real readiness signal AND
+        # answers the question that actually matters: did it find the target?
+        run: |
+          want="process_cpu:samples memory:alloc_space memory:inuse_space goroutine: mutex:delay block:delay"
+          for _ in $(seq 1 60); do
+            got=$(go run . types --url "$PARCA_URL" 2>/dev/null || true)
+            ok=1
+            for t in $want; do
+              echo "$got" | grep -q "$t" || ok=0
+            done
+            if [ "$ok" = 1 ]; then
+              echo "all six profile types present"
+              sleep 15   # a little more so the snapshot window is well fed
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::parca never reported all six profile types"
+          echo "$got"; tail -50 /tmp/parca.log; exit 1
+
+      - name: Assert the planted bottlenecks are found
+        run: |
+          # A dead zoo would otherwise surface as six empty profiles.
+          curl -sf "http://$ZOO_ADDR/debug/pprof/" >/dev/null || {
+            echo "::error::zoo died"; cat /tmp/zoo.log; exit 1; }
+          go test -tags e2e -run TestE2EZoo -timeout 5m -v .
+
+      - name: Logs
+        # always(), not failure(): a job-level timeout cancels the job, and
+        # failure() steps are skipped on cancellation -- exactly when the logs
+        # would be worth having.
+        if: always()
+        run: |
+          echo "--- parca ---"; tail -100 /tmp/parca.log || true
+          echo "--- zoo ---";   tail -50  /tmp/zoo.log   || true
+          echo "--- profile types the server actually had ---"
+          go run . types --url "$PARCA_URL" || true

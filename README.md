@@ -753,6 +753,34 @@ come back as a bare 401 that says nothing about the flag having been dropped.
 - Frames without debuginfo are bucketed as `[unsymbolized]` so they don't
   fragment the top-N into hex noise.
 
+## Testing
+
+Unit tests answer a fake Parca, so they prove *rendering*: given this profile,
+print these numbers. They cannot prove parcareport still **finds** anything,
+because a fake answers with whatever the test already believes.
+
+`cmd/zoo` is a workload with deliberate bottlenecks -- a hot loop, allocation
+churn, a retained heap, leaked goroutines, mutex contention and a blocked
+channel -- each in its own distinctively named function, one per row of
+[docs/bottlenecks.md](docs/bottlenecks.md). The end-to-end test points a real
+Parca at it and asserts the report blames the function that was planted, in the
+right unit, and that the run reported itself *complete* while doing so.
+
+```sh
+go build -o /tmp/zoo ./cmd/zoo
+/tmp/zoo -addr 127.0.0.1:6060 &
+
+# any parca.yaml whose scrape_configs target 127.0.0.1:6060
+parca --config-path=parca.yaml --http-address=127.0.0.1:7071 &
+
+PARCA_URL=127.0.0.1:7071 go test -tags e2e -run TestE2EZoo -v .
+```
+
+The `e2e` build tag keeps it out of `go test ./...`, and the test skips unless
+`PARCA_URL` is set, so the default suite stays hermetic. CI runs the whole
+sequence on every push (`.github/workflows/e2e.yml`); it needs no container
+runtime, just Parca's released binary.
+
 ## License
 
 Apache-2.0
