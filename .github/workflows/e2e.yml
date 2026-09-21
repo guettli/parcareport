@@ -1,0 +1,89 @@
+name: e2e
+
+# End-to-end: a real Parca scrapes a workload with deliberate, known
+# bottlenecks (cmd/zoo), and the test asserts parcareport blames the functions
+# we planted -- and that it reported the run complete while doing so.
+#
+# The unit tests answer a fake server, so they can only prove rendering. This
+# job is the one that can fail when parcareport stops *finding* things.
+#
+# No container runtime: Parca's released binary is enough, and starting it
+# directly is faster than pulling an image.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  zoo:
+    name: find planted bottlenecks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PARCA_VERSION: 0.28.0
+      ZOO_ADDR: 127.0.0.1:6060
+      # Not 7070: leaves the default free, so a developer running this locally
+      # does not collide with a Parca they already have.
+      PARCA_URL: 127.0.0.1:7071
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Start the bottleneck zoo
+        run: |
+          go build -o /tmp/zoo ./cmd/zoo
+          /tmp/zoo -addr "$ZOO_ADDR" >/tmp/zoo.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf "http://$ZOO_ADDR/debug/pprof/" >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::zoo did not come up"; cat /tmp/zoo.log; exit 1
+
+      - name: Start Parca scraping the zoo
+        run: |
+          curl -sSL -o /tmp/parca.tar.gz \
+            "https://github.com/parca-dev/parca/releases/download/v${PARCA_VERSION}/parca_${PARCA_VERSION}_Linux_x86_64.tar.gz"
+          mkdir -p /tmp/parca /tmp/parca-data
+          tar xzf /tmp/parca.tar.gz -C /tmp/parca
+
+          # A 5s interval so a minute of scraping is many samples. Non-delta
+          # types (heap, goroutine, mutex, block) are merged over ONE scrape,
+          # so they only need to have been scraped at least once.
+          cat > /tmp/parca.yaml <<'YAML'
+          object_storage:
+            bucket:
+              type: "FILESYSTEM"
+              config:
+                directory: "/tmp/parca-data"
+          scrape_configs:
+            - job_name: "zoo"
+              scrape_interval: "5s"
+              static_configs:
+                - targets: [ '127.0.0.1:6060' ]
+          YAML
+
+          /tmp/parca/parca --config-path=/tmp/parca.yaml \
+            --http-address="$PARCA_URL" >/tmp/parca.log 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf "http://$PARCA_URL/healthz" >/dev/null && exit 0
+            sleep 2
+          done
+          echo "::error::parca did not come up"; cat /tmp/parca.log; exit 1
+
+      - name: Let it scrape
+        run: sleep 60
+
+      - name: Assert the planted bottlenecks are found
+        run: go test -tags e2e -run TestE2EZoo -v .
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "--- parca ---"; tail -100 /tmp/parca.log || true
+          echo "--- zoo ---";   tail -50  /tmp/zoo.log   || true
+          echo "--- profile types the server actually had ---"
+          go run . types --url "$PARCA_URL" || true
