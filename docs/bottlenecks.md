@@ -25,14 +25,37 @@ visible. The rule excludes counters and device metrics, not kernel code.
 ## Three outcomes, not two
 
 Before reading any verdict, know that a run has three possible endings, and
-only one of them is evidence:
+only one of them is evidence. `--output=json` names which one in `outcome`:
+
+| `outcome` | `complete` | exit | means |
+| :--- | :--- | :--- | :--- |
+| `found` | `true` | 0 | rows were produced |
+| `empty` | `true` | 0 | every query was answered, and the answer was nothing |
+| `incomplete` | `false` | non-zero | something was not answered, so what is missing is unknown |
 
 1. **Found it** — a bottleneck is named.
-2. **Cannot see it** — this document's ❌ and ⚠️ rows. Absence of evidence.
-3. **The run was incomplete** — a breakdown runs one query per label value and
-   any of them can fail. `parcareport` never presents partial results as
-   complete: it prints `!! INCOMPLETE` and sets `"complete": false` in
-   `--output=json`. **Check that field before concluding anything.**
+2. **Cannot see it** — this document's ❌ and ⚠️ rows, or `outcome: "empty"`.
+   Absence of evidence, and it is *evidence of absence* only to the extent the
+   ❌ and ⚠️ rows allow.
+3. **The run was incomplete** — `outcome: "incomplete"`. `parcareport` never
+   presents partial results as complete: it prints `!! INCOMPLETE` and sets
+   `"complete": false`. **Check that before concluding anything.**
+
+The distinction between 2 and 3 is the difference between "this service is
+idle" and "your monitoring is broken", and it used to be unavailable: an
+answered query that found nothing and three dead queries both produced
+`complete: false` and a non-zero exit, separable only by reading an English
+error string. An idle window is now a **successful measurement** — exit 0, `complete: true` —
+and a `NOTES` entry says which flavour of nothing it was:
+
+| note code | outcome | exit | |
+| :--- | :--- | :--- | :--- |
+| `empty_window` | `empty` | 0 | every query answered, nothing there |
+| `match_pruned_everything` | `empty` | 0 | the matcher selected nothing — also what a typo'd `--match` looks like |
+| `no_rows_queries_failed` | `incomplete` | non-zero | nothing came back; whether the window is idle is **unknown** |
+| `profile_type_unverified` | `incomplete` | non-zero | no data *and* the type was never checked, so this is evidence of neither |
+
+The last two are outcome 3, not outcome 2: they did not look.
 
 Also note what `overview` actually sweeps: **CPU, plus live heap
 (`inuse_space`)**. It does not run `wallclock`, `mutex`, `block`, `goroutine`

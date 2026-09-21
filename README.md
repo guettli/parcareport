@@ -555,24 +555,29 @@ the failures as data:
   "group_by": "cluster",
   "unit": "cores",
   "rate": true,
+  "delta": true,
+  "snapshot_at": null,
+  "notes": [],
   "groups": [
-    {"name": "us", "value": 2.3160163, "pct": 77.95409962975428,
+    {"name": "us", "value": 2.3160163, "pct": 77.95409962975428, "unlabeled": false,
      "drill_down": {
        "command": "parcareport --by namespace --match 'cluster=\"us\"'",
        "by": "namespace", "match": "cluster=\"us\""}},
-    {"name": "eu1", "value": 0.6549837, "pct": 22.045900370245704,
+    {"name": "eu1", "value": 0.6549837, "pct": 22.045900370245704, "unlabeled": false,
      "drill_down": {
        "command": "parcareport --by namespace --match 'cluster=\"eu1\"'",
        "by": "namespace", "match": "cluster=\"eu1\""}}
   ],
   "empty_groups": 0,
+  "breakdown": "sum_by",
   "total": 2.971,
   "functions": [
     {"name": "github.com/parquet-go/parquet-go/encoding/thrift.(*structDecoder).decode",
-     "cum": 0.8312841, "flat": 0.1203611, "pct": 4.05119824974756}
+     "cum": 0.8312841, "flat": 0.1203611, "pct": 4.05119824974756, "unsymbolized": false}
   ],
   "functions_sorted_by": "flat",
   "failed": [],
+  "outcome": "found",
   "complete": true
 }
 ```
@@ -583,9 +588,25 @@ is `null` for the `(unlabeled)` row, because no matcher selects "carries no
 value for this label at all" — `cluster=""` is a claim about the value, and
 offering it would quietly report something else.
 
-Two fields matter more than the rest. **`complete`** is the machine-checkable
-form of the `!! INCOMPLETE` banner, and **`failed`** says exactly which groups
-are missing and why. Without them a consumer would have to grep stdout for
+**`outcome`** is the field to switch on: `"found"`, `"empty"` or
+`"incomplete"`. The first two exit 0 — an answered query that found nothing is
+a successful measurement of an idle window, not a broken run — and only
+`"incomplete"` exits non-zero. **`complete`** is kept as the boolean it always
+was (`outcome != "incomplete"`), so existing consumers keep working; it simply
+no longer has to answer a question it cannot. **`failed`** says exactly which
+groups are missing, why, and — now — what to do about it, in `hint`.
+
+Where a run produced nothing, a `NOTES` entry says which flavour of nothing.
+Two of them are answers and two are failures to get one:
+
+| note code | `outcome` | exit |
+| :--- | :--- | :--- |
+| `empty_window` | `empty` | 0 |
+| `match_pruned_everything` | `empty` | 0 |
+| `no_rows_queries_failed` | `incomplete` | non-zero |
+| `profile_type_unverified` | `incomplete` | non-zero |
+
+That distinction used to exist only in prose on stdout. Without them a consumer would have to grep stdout for
 `!!` to notice the totals were wrong, which is the same trap the banner exists
 to avoid for human readers.
 
@@ -598,9 +619,15 @@ to put there.
 rather than the column heading, which is free to be reworded. `rate` says
 whether the value was divided by the window; bytes and counts are not rates.
 
-A run that produces nothing still emits a document, with `complete: false` and
-`error` set. Printing only prose in that case would leave a script unable to
-tell an empty window from a broken command.
+A run that produces nothing still emits a document. `error` is set only when
+something actually went wrong — an empty window leaves it out, because nothing
+did. Printing only prose would leave a script unable to tell an empty window
+from a broken command, which is the conflation this format exists to prevent.
+
+`groups[].unlabeled` and `functions[].unsymbolized` are flags, not spellings.
+`"(unlabeled)"` and `"[unsymbolized]"` are display names that sit in the same
+field as real label values and real symbols, and a consumer should not have to
+match a string this tool is free to reword.
 
 ## Install
 

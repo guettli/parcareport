@@ -34,10 +34,43 @@ type overviewData struct {
 	Labels       []string      `json:"labels"`
 	Sections     []*reportData `json:"sections"`
 	Skipped      []skippedJSON `json:"skipped"`
-	Complete     bool          `json:"complete"`
+	// Outcome and Complete mean what they do on a report: "found" when a
+	// section produced rows, "empty" when every query was answered and none
+	// did, "incomplete" when something was not answered. An overview is the
+	// least complete of its sections -- one broken breakdown makes the whole
+	// picture partial -- but an overview of an idle server is a successful
+	// measurement, not a failure.
+	Outcome  string `json:"outcome"`
+	Complete bool   `json:"complete"`
+	// Error is why the overview could not be produced at all. The report
+	// document has had one since it existed; this one reached stderr only, so
+	// a consumer parsing the JSON saw an overview with no sections and no
+	// stated reason.
+	Error string `json:"error,omitempty"`
 
 	// Kept as a Duration so the heading rounds rather than truncates.
 	window time.Duration
+}
+
+// emitOverviewFailure writes the one-document-whatever-happened form for a
+// failure that happened before there was anything to put in it.
+func emitOverviewFailure(out string, start, end time.Time, err error) error {
+	if out != outputJSON {
+		return err
+	}
+	_ = emitOverviewJSON(&overviewData{
+		Start:        start.UTC(),
+		End:          end.UTC(),
+		WindowSecs:   math.Round(end.Sub(start).Seconds()*1000) / 1000,
+		ProfileTypes: []string{},
+		Labels:       []string{},
+		Sections:     []*reportData{},
+		Skipped:      []skippedJSON{},
+		Outcome:      outcomeIncomplete,
+		Error:        err.Error(),
+		window:       end.Sub(start),
+	})
+	return err
 }
 
 // mergeDerivedNotes are the note codes computed from the unfiltered merge,
@@ -86,13 +119,20 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		}
 	}
 
+	// Both of these fail before any document exists, and returning only an
+	// error printed NOTHING at all under --output=json: a consumer got an
+	// empty stdout and a non-zero exit, which is the silence this format was
+	// written to refuse. They are also the likeliest way an overview fails,
+	// being the first two things it asks for.
 	types, err := c.ProfileTypeNames(ctx)
 	if err != nil {
-		return fmt.Errorf("overview needs the profile type list to know what to report on: %w", err)
+		err = fmt.Errorf("overview needs the profile type list to know what to report on: %w", err)
+		return emitOverviewFailure(out, start, end, err)
 	}
 	labels, err := c.LabelNames(ctx, start, end)
 	if err != nil {
-		return fmt.Errorf("overview needs the label list to know what to break down by: %w", err)
+		err = fmt.Errorf("overview needs the label list to know what to break down by: %w", err)
+		return emitOverviewFailure(out, start, end, err)
 	}
 	have := map[string]bool{}
 	for _, l := range labels {
@@ -203,6 +243,10 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			"in this window, and none of them makes a breakdown this command knows how to build",
 			len(types), len(labels))
 		if out == outputJSON {
+			// The reason, in the document. It used to reach stderr only, so a
+			// consumer saw an overview with no sections and nothing saying
+			// why -- the same silence the report format refuses.
+			d.Outcome, d.Complete, d.Error = outcomeIncomplete, false, err.Error()
 			_ = emitOverviewJSON(d)
 			return err
 		}
@@ -229,7 +273,12 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		o.concurrency = overviewConcurrency
 	}
 
-	d.Complete = true
+	// Not unconditionally true: a label lookup that FAILED was recorded as a
+	// skip above, and starting from true erased it. The overview then claimed
+	// outcome "empty" -- documented as "every query was answered, and the
+	// answer was nothing" -- for a run where a query was not answered, in the
+	// very field this change tells consumers to switch on.
+	d.Complete = !lookupFailed
 	for _, p := range plan {
 		so := o
 		// The type came from the list read above, so it needs no lookup and
@@ -256,6 +305,21 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			d.Complete = false
 		}
 		d.Sections = append(d.Sections, sd)
+	}
+
+	// The overview is as complete as its least complete section, and as
+	// "found" as its most productive one: a single breakdown with rows means
+	// the server is not idle, whatever the others came back with.
+	d.Outcome = outcomeEmpty
+	if !d.Complete {
+		d.Outcome = outcomeIncomplete
+	} else {
+		for _, sd := range d.Sections {
+			if sd.Outcome == outcomeFound {
+				d.Outcome = outcomeFound
+				break
+			}
+		}
 	}
 
 	if out == outputJSON {

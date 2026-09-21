@@ -890,12 +890,20 @@ func TestReportDistinguishesFailedFromEmpty(t *testing.T) {
 	}
 }
 
-// A window that is genuinely empty must not be dressed up as a failure.
-func TestReportSaysNoDataWhenNothingFailed(t *testing.T) {
+// A window that is genuinely empty must not be dressed up as a failure -- and
+// that includes the exit code.
+//
+// Every query was answered; the answer was that nothing ran. A script wrapping
+// this tool used to see exit 1 for a correct measurement of an idle window,
+// which is indistinguishable from the tool being broken.
+func TestAnIdleWindowIsASuccess(t *testing.T) {
 	f := reportFixture(t)
-	_, err := runReport(t, f, testOptions())
-	if err == nil || !strings.Contains(err.Error(), "no data") {
-		t.Errorf("want a plain no-data error, got %v", err)
+	out, err := runReport(t, f, testOptions())
+	if err != nil {
+		t.Errorf("an answered query that found nothing is not a failure: %v", err)
+	}
+	if !strings.Contains(out, "no data in this window") {
+		t.Errorf("it should still say so on stdout:\n%s", out)
 	}
 }
 
@@ -1796,15 +1804,106 @@ func TestJSONEmitsADocumentEvenWhenThereIsNothingToReport(t *testing.T) {
 		err = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
 			time.Now().Add(-time.Hour), time.Now())
 	})
-	if err == nil {
-		t.Error("want a non-zero exit")
+	if err != nil {
+		t.Errorf("an idle window is a successful measurement: %v", err)
 	}
 	d := decodeReport(t, out)
-	if d.Complete {
-		t.Error("complete must be false")
+	// The whole point of the field: "I looked and there is nothing here" is
+	// not "I could not look", and docs/bottlenecks.md tells readers to use
+	// these to tell them apart.
+	if d.Outcome != "empty" {
+		t.Errorf("outcome = %q, want empty", d.Outcome)
 	}
-	if d.Error == "" {
-		t.Error("the reason should be in the document")
+	if !d.Complete {
+		t.Error("every query was answered, so the run is complete")
+	}
+	if d.Error != "" {
+		t.Errorf("nothing went wrong, so there is no error to report: %q", d.Error)
+	}
+	// The reason still reaches a consumer -- as a note, not as prose it would
+	// have to parse out of stdout.
+	var found bool
+	for _, n := range d.Notes {
+		if n.Code == "empty_window" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the reason should be in the document: %+v", d.Notes)
+	}
+}
+
+// Three outcomes, three behaviours. This is the table docs/bottlenecks.md
+// promises its readers, asserted end to end.
+func TestOutcomeSeparatesIdleFromBroken(t *testing.T) {
+	cases := []struct {
+		name     string
+		setup    func(*fakeQuery)
+		outcome  string
+		complete bool
+		wantErr  bool
+	}{
+		{
+			name: "found",
+			setup: func(f *fakeQuery) {
+				f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+				f.merges[testType+`{cluster="vps"}`] = cpuProfile(t, 50)
+				f.merges[testType] = cpuProfile(t, 150)
+			},
+			outcome: "found", complete: true, wantErr: false,
+		},
+		{
+			name:    "empty: answered, nothing there",
+			setup:   func(f *fakeQuery) {},
+			outcome: "empty", complete: true, wantErr: false,
+		},
+		{
+			name: "incomplete: could not look",
+			setup: func(f *fakeQuery) {
+				f.noSumBy = true
+				f.mergeErrs[testType+`{cluster="tc"}`] = errors.New("boom")
+				f.mergeErrs[testType+`{cluster="vps"}`] = errors.New("boom")
+			},
+			outcome: "incomplete", complete: false, wantErr: true,
+		},
+		{
+			name: "incomplete: rows, but something was not answered",
+			setup: func(f *fakeQuery) {
+				f.noSumBy = true
+				f.merges[testType+`{cluster="tc"}`] = cpuProfile(t, 100)
+				f.merges[testType] = cpuProfile(t, 150)
+				f.mergeErrs[testType+`{cluster="vps"}`] = errors.New("boom")
+			},
+			outcome: "incomplete", complete: false, wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := reportFixture(t)
+			tc.setup(f)
+			var err error
+			out := captureStdout(t, func() {
+				err = report(context.Background(), testClient(f, time.Minute), jsonOptions(),
+					time.Now().Add(-time.Hour), time.Now())
+			})
+			if (err != nil) != tc.wantErr {
+				t.Errorf("error = %v, want error: %v", err, tc.wantErr)
+			}
+			d := decodeReport(t, out)
+			if d.Outcome != tc.outcome {
+				t.Errorf("outcome = %q, want %q", d.Outcome, tc.outcome)
+			}
+			if d.Complete != tc.complete {
+				t.Errorf("complete = %v, want %v", d.Complete, tc.complete)
+			}
+			// complete is kept as the boolean it always was, so old consumers
+			// keep working -- it just no longer has to answer a question it
+			// cannot.
+			if d.Complete != (d.Outcome != "incomplete") {
+				t.Errorf("complete (%v) disagrees with outcome (%q)", d.Complete, d.Outcome)
+			}
+		})
 	}
 }
 
@@ -3804,8 +3903,11 @@ func TestReportSaysMatchPrunedEverything(t *testing.T) {
 	o := testOptions()
 	o.match = `namespace="typo"`
 	out, err := runReport(t, f, o)
-	if err == nil {
-		t.Fatal("want a non-zero exit when there are no rows")
+	// A matcher that selects nothing is a question answered, not a tool that
+	// broke. The distinction the reader needs is in the banner and in the
+	// note's code, which an exit status cannot carry.
+	if err != nil {
+		t.Fatalf("a matcher that pruned everything is not a failure: %v", err)
 	}
 	// The two empties must not be summed into one "no samples" story.
 	if strings.Contains(out, "no samples in this window") {
@@ -3825,8 +3927,8 @@ func TestReportNoRowsMessageNamesTheMatcher(t *testing.T) {
 	o := testOptions()
 	o.match = `namespace="typo"`
 	out, err := runReport(t, f, o)
-	if err == nil {
-		t.Fatal("want a non-zero exit")
+	if err != nil {
+		t.Fatalf("a matcher that pruned everything is not a failure: %v", err)
 	}
 	if !strings.Contains(out, `namespace="typo"`) {
 		t.Errorf("the banner must quote the matcher that pruned everything:\n%s", out)
@@ -3837,8 +3939,53 @@ func TestReportNoRowsMessageNamesTheMatcher(t *testing.T) {
 	if strings.Contains(out, "no data in this window") {
 		t.Errorf("the window is not the problem here:\n%s", out)
 	}
-	if !strings.Contains(err.Error(), "typo") {
-		t.Errorf("the error should carry the matcher too: %v", err)
+}
+
+// ...and a consumer gets the same distinction without parsing prose: the two
+// empty outcomes differ by note code, not by exit status.
+func TestEmptyOutcomesAreDistinguishedByNoteCode(t *testing.T) {
+	idle := reportFixture(t)
+	pruned := reportFixture(t)
+	pruned.values["cluster"] = []string{"tc", "vps"}
+
+	for _, tc := range []struct {
+		name  string
+		f     *fakeQuery
+		match string
+		want  string
+	}{
+		{"idle window", idle, "", "empty_window"},
+		{"matcher pruned everything", pruned, `namespace="typo"`, "match_pruned_everything"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := jsonOptions()
+			o.match = tc.match
+			var err error
+			out := captureStdout(t, func() {
+				err = report(context.Background(), testClient(tc.f, time.Minute), o,
+					time.Now().Add(-time.Hour), time.Now())
+			})
+			if err != nil {
+				t.Fatalf("both are answered questions: %v", err)
+			}
+			d := decodeReport(t, out)
+			if d.Outcome != "empty" {
+				t.Errorf("outcome = %q, want empty", d.Outcome)
+			}
+			var codes []string
+			for _, n := range d.Notes {
+				codes = append(codes, n.Code)
+			}
+			var found bool
+			for _, c := range codes {
+				if c == tc.want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("want note %q, got %v", tc.want, codes)
+			}
+		})
 	}
 }
 

@@ -52,6 +52,10 @@ func renderTable(d *reportData) {
 		printRetried(d)
 		// The banner says which of the two reasons it is.
 		fmt.Print(d.banner)
+		// And the notes carry it in the same words the JSON does. Without
+		// this the document explained an empty result and the page did not,
+		// which is the asymmetry the two renderers exist to avoid.
+		printNotes(d.Notes)
 		return
 	}
 
@@ -148,12 +152,22 @@ func renderJSON(d *reportData) error {
 // everywhere else.
 func renderJSONError(o options, d *reportData, start, end time.Time, err error) {
 	if d == nil {
+		emptyUnit, emptyRate := "", false
+		if o.profileType != "" {
+			h, r := headerFor(o.profileType)
+			emptyUnit, emptyRate = unitName(h), r
+		}
 		// Nothing was gathered, so only what was asked for is known. In
 		// particular profile_type_verified is left null rather than false:
 		// its documented meaning is "the check failed", and asserting that
 		// about a run which never got as far as the check would point a
 		// reader at the wrong thing.
 		d = &reportData{
+			// What was ASKED for, which with no --profile-type is nothing.
+			// Empty here means the type was never resolved -- the run did not
+			// get far enough to pick one -- and profile_type_verified is null
+			// beside it saying the check never ran. Filling in a guess would
+			// record a type this run never used.
 			ProfileType: o.profileType,
 			GroupBy:     o.by,
 			Match:       o.match,
@@ -161,12 +175,22 @@ func renderJSONError(o options, d *reportData, start, end time.Time, err error) 
 			End:         end.UTC(),
 			WindowSecs:  math.Round(end.Sub(start).Seconds()*1000) / 1000,
 			Notes:       []noteJSON{},
-			Groups:      []groupJSON{},
-			Functions:   []funcJSON{},
-			Failed:      []failJSON{},
+			// Unit and Rate are properties of the selector, not of the rows,
+			// so a document for a run that produced nothing still says what
+			// its numbers would have meant. Empty only when no selector was
+			// resolved either, which profile_type records beside it.
+			Unit:      emptyUnit,
+			Rate:      emptyRate,
+			Breakdown: breakdownNone,
+			Groups:    []groupJSON{},
+			Functions: []funcJSON{},
+			Failed:    []failJSON{},
 		}
 	}
 	d.Complete = false
+	// Nothing was gathered, or gathering failed: either way the run did not
+	// see everything it asked for.
+	d.Outcome = outcomeIncomplete
 	if err != nil {
 		d.Error = err.Error()
 	}

@@ -310,7 +310,16 @@ func listLabels(ctx context.Context, c *Client, name, match string, start, end t
 			// Printing nothing and exiting 0 is the worst of the three
 			// readings: a typo'd label, an empty window and a failed query all
 			// looked like success. Say which one it is.
-			return explainNoValues(ctx, c, name, start, end)
+			err := explainNoValues(ctx, c, name, start, end)
+			if errors.Is(err, errEmptyWindow) {
+				// Answered, and the answer is that nothing was written. The
+				// same window makes `report` exit 0, and two subcommands
+				// disagreeing about whether an idle server is a failure is
+				// the conflation this all exists to end.
+				fmt.Fprintf(os.Stderr, "parcareport: %s\n", explainedEmpty(err))
+				return nil
+			}
+			return err
 		}
 		sort.Strings(vals)
 		for _, v := range vals {
@@ -416,6 +425,11 @@ func report(ctx context.Context, c *Client, o options, start, end time.Time) err
 	return gerr
 }
 
+// errEmptyWindow marks the answers that mean "there is nothing here", as
+// opposed to "I could not find out". Wrapped rather than compared by string:
+// the callers decide the outcome and the exit code from it.
+var errEmptyWindow = errors.New("empty window")
+
 // explainNoValues turns an empty label-values response into a specific
 // conclusion instead of the most convenient one.
 //
@@ -438,8 +452,12 @@ func explainNoValues(ctx context.Context, c *Client, label string, start, end ti
 			label, err)
 	}
 	if len(names) == 0 {
-		return fmt.Errorf("the server has no labels at all in %s: nothing was written in this window. "+
-			"Widen --from/--to, or check that an agent is still writing", window)
+		// Answered, and the answer is that nothing was written. That is a
+		// measurement of an idle window, not a failure to take one -- and
+		// reporting it as a failure is how querying last month's data came to
+		// look identical to a broken server.
+		return fmt.Errorf("%w: the server has no labels at all in %s, so nothing was written. "+
+			"Widen --from/--to, or check that an agent is still writing", errEmptyWindow, window)
 	}
 	for _, n := range names {
 		if n == label {
@@ -928,3 +946,18 @@ any sampling profiler -- is written up in docs/bottlenecks.md.
 
 Flags:
 `
+
+// plainHint is hintFor's advice with the banner markers stripped, for the JSON
+// document. The `!! ` prefix is a convention of the printed page, and a
+// consumer reading a field should not have to know about it.
+func plainHint(msgs []string, kind failureKind, runExpired bool) string {
+	h := hintFor(msgs, kind, runExpired)
+	if h == "" {
+		return ""
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimRight(h, "\n"), "\n") {
+		out = append(out, strings.TrimPrefix(strings.TrimPrefix(line, "!! "), "!!"))
+	}
+	return strings.Join(out, " ")
+}
