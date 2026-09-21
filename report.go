@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -83,6 +84,20 @@ type reportData struct {
 	// dropped the first attempt. A run that quietly takes twice as long is
 	// the kind of thing this tool says out loud.
 	Retried int `json:"retried,omitempty"`
+	// RetriedOverall counts re-asks of the unfiltered merge. Separate from
+	// Retried, which is rendered as "N <label> queries were asked again": the
+	// unfiltered merge carries no matcher and is not one of the groups.
+	RetriedOverall int `json:"retried_overall,omitempty"`
+	// DroppedGroups counts label values the breakdown query returned that the
+	// label list did not have, and which were therefore not shown. Their
+	// samples are inside the total but in no row, so the residual overstates
+	// how much of the profile is genuinely unlabelled.
+	DroppedGroups int `json:"dropped_groups,omitempty"`
+	// Breakdown says how the group table was priced: "sum_by" for one range
+	// query, "merge" for one merge per value. It decides what the numbers can
+	// be trusted to mean -- see sumByGroups on per-target sampling periods --
+	// so a consumer should not have to infer it from timing.
+	Breakdown string `json:"breakdown"`
 	// Total is null when the unfiltered merge failed or came back empty. There
 	// is then no denominator, and the sum of the groups is not it: it omits
 	// every series carrying no group-by label. Percentages are null too.
@@ -386,7 +401,86 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		d.SnapshotAt = &at
 	}
 
-	results := mergeGroups(ctx, c, o, profType, groups, qstart, qend, window)
+	// Everything matching the selector, including series carrying no value for
+	// the group-by label. Those exist -- an agent deployed without the label,
+	// say -- and summing only the labelled groups would let them vanish from
+	// the report while still burning CPU.
+	//
+	// Bounded like every per-group merge: carrying no matcher at all, this is
+	// the widest query in the run and the likeliest to be slow.
+	//
+	// First, not last. It used to run after the fan-out, when it was only a
+	// denominator. It now also carries the metadata that lets the breakdown be
+	// priced with one range query instead of one merge per value, so the cheap
+	// path cannot start until it has answered.
+	overallSel := selector(profType, "", "", o.match)
+	octx, ocancel := context.WithTimeout(ctx, o.timeout)
+	overallRaw, overallErr := c.MergePprof(octx, overallSel, qstart, qend)
+	ocancel()
+	// Asked again on a dropped stream, exactly as a group is. A dropped stream
+	// is the server going away mid-answer, not the query being wrong.
+	//
+	// This merge is now the first thing the run does, which is why it needs
+	// its own retry: it used to run after the fan-out and a transient failure
+	// landed on a group, where the retry pass caught it. Losing this one loses
+	// the denominator, the residual, the function table AND -- since the
+	// breakdown is priced from its metadata -- the cheap path with it.
+	if overallErr != nil && looksTransient(overallErr) && budgetLeftFor(ctx, o.timeout) {
+		rctx, rcancel := context.WithTimeout(ctx, o.timeout)
+		if again, err := c.MergePprof(rctx, overallSel, qstart, qend); err == nil {
+			overallRaw, overallErr = again, nil
+			d.RetriedOverall++
+		}
+		rcancel()
+	}
+	var overall *profile.Profile
+	if overallErr == nil {
+		overall, overallErr = parsePprof(overallRaw)
+	}
+	var overallMetric Metric
+	if overall != nil {
+		var err error
+		if overallMetric, err = interpret(overall, window, delta); err != nil {
+			return nil, err
+		}
+	}
+
+	// The cheap path, when it is available, wanted and sound.
+	//
+	// Delta only. A snapshot profile is a level measured repeatedly, and the
+	// merge path goes to some trouble to put every group on ONE window so the
+	// rows and the total describe the same instant -- an instance that stopped
+	// scraping ten minutes ago must not report its last heap at full value
+	// against a total that excludes it. A range query picks each series'
+	// newest sample independently and would undo exactly that, so snapshots
+	// keep the fan-out.
+	var results []groupResult
+	var summed bool
+	if delta && overall != nil && !o.fanOut {
+		valid := make(map[string]bool, len(groups))
+		for _, g := range groups {
+			valid[g] = true
+		}
+		rs, drop, err := sumByGroups(ctx, c, o, profType, overallMetric, qstart, qend, valid)
+		if err == nil {
+			results, summed, d.DroppedGroups = rs, true, drop
+		} else {
+			// Not fatal: fall back to the fan-out, which is what this run
+			// would have done anyway. Said out loud, because a run that
+			// quietly takes a hundred times longer is the kind of thing this
+			// tool exists to point out.
+			fmt.Fprintf(os.Stderr, "parcareport: cheap breakdown unavailable (%v), merging each %s\n",
+				shortErr(err), o.by)
+		}
+	}
+
+	if !summed {
+		results = mergeGroups(ctx, c, o, profType, groups, qstart, qend, window)
+	}
+	d.Breakdown = "merge"
+	if summed {
+		d.Breakdown = "sum_by"
+	}
 
 	// A dropped stream is the server going away mid-answer, not the query
 	// being wrong, and it is transient. Ask again -- but only for the groups
@@ -397,7 +491,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	// Once each. A second failure keeps the first error rather than replacing
 	// it with a less informative one, and there is no third attempt: past
 	// that, retrying is just the same load again.
-	if again := transientGroups(results); len(again) > 0 {
+	if again := transientGroups(results); !summed && len(again) > 0 {
 		// Half of what is left, at most, when something comes after this.
 		// Checking only "is there room for one more" let a section with
 		// fifteen dropped groups keep passing the check until the budget was
@@ -493,21 +587,6 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 		return d, err
 	}
 
-	// Everything matching the selector, including series carrying no value for
-	// the group-by label. Those exist -- an agent deployed without the label,
-	// say -- and summing only the labelled groups would let them vanish from
-	// the report while still burning CPU.
-	//
-	// Bounded like every per-group merge: carrying no matcher at all, this is
-	// the widest query in the run and the likeliest to be slow.
-	octx, ocancel := context.WithTimeout(ctx, o.timeout)
-	overallRaw, overallErr := c.MergePprof(octx, selector(profType, "", "", o.match), qstart, qend)
-	ocancel()
-	var overall *profile.Profile
-	if overallErr == nil {
-		overall, overallErr = parsePprof(overallRaw)
-	}
-
 	d.groupsSum = total
 	grand := total
 	header := groupHeader
@@ -521,10 +600,7 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 	knowTotal := overallErr == nil && overall != nil
 	unlabeled := -1
 	if overall != nil {
-		mt, err := interpret(overall, window, delta)
-		if err != nil {
-			return nil, err
-		}
+		mt := overallMetric
 		header = mt.Header
 		d.Rate = mt.Rate
 		grand = mt.Value
@@ -542,7 +618,16 @@ func gatherReport(ctx context.Context, c *Client, o options, start, end time.Tim
 			}
 		}
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Cores > rows[j].Cores })
+	// Name breaks ties so the order is decided by the data rather than by
+	// whichever query answered first. Two runs over the same window should
+	// print the same table, and equal values are not rare: a residual that
+	// happens to match a group, or several idle groups at zero.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Cores != rows[j].Cores {
+			return rows[i].Cores > rows[j].Cores
+		}
+		return rows[i].Name < rows[j].Name
+	})
 	for _, r := range rows {
 		g := groupJSON{Name: r.Name, Value: r.Cores, Unlabeled: unlabeled >= 0 && r.Name == "(unlabeled)"}
 		g.DrillDown = drillFor(o, r.Name, g.Unlabeled)
@@ -829,4 +914,145 @@ func looksTransient(err error) bool {
 		}
 	}
 	return false
+}
+
+// sumByGroups prices every label value with ONE range query instead of one
+// merge each.
+//
+// A merge reconstructs every distinct stacktrace so it can return a profile.
+// Summing a label needs none of that, and the server will do it with sum_by.
+// The cost stops scaling with the number of values, which is what made the
+// breakdown unusable: `--by=comm` against a real server has 1486 values, and a
+// run that merged each of them had 1034 die on the deadline.
+//
+// The catch is units. The range API answers in raw sample values and knows
+// nothing about periods, so a CPU profile comes back as a count of stack
+// samples with no way to turn it into cores. The unfiltered merge does carry
+// that metadata, so its Value/Raw ratio is the conversion -- which is why this
+// runs after it and only when it succeeded.
+//
+// That ratio is built from ONE sampling period, the merged profile's. It is a
+// per-target property, so a fleet whose agents run at different frequencies is
+// priced wrongly here, and the rows give no sign of it: they are scaled by the
+// same factor as the total, so they sum to it however wrong the factor is. The
+// fan-out priced each group from its own profile and such a fleet made the
+// percentages exceed 100 -- visibly wrong, which is worth more than silently
+// consistent. --fan-out exists to get that cross-check back, and the report
+// says which method it used.
+//
+// What CAN be checked is that the two queries saw the same data, and that is
+// worth doing: it catches a server that bucketed or truncated the range
+// response, and a sum over a different sample-type column than the merge
+// summed. Both would otherwise be invisible.
+func sumByGroups(ctx context.Context, c *Client, o options, profType string,
+	overall Metric, start, end time.Time, valid map[string]bool,
+) ([]groupResult, int, error) {
+	if overall.Raw == 0 {
+		// Nothing to scale by, and dividing would give every row an infinity.
+		return nil, 0, errors.New("the unfiltered merge summed to zero, so raw values cannot be converted")
+	}
+
+	sums, err := sumByOnce(ctx, c, o, profType, start, end)
+	if err != nil && looksTransient(err) && budgetLeftFor(ctx, o.timeout) {
+		// One retry, as every other query in this run gets. A dropped stream
+		// is the server going away mid-answer, and giving up here costs a
+		// merge per label value -- the very thing this exists to avoid.
+		sums, err = sumByOnce(ctx, c, o, profType, start, end)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Every series the server returned, including the ones carrying no value
+	// for this label. If that does not match what the merge summed, the two
+	// queries did not see the same data and no scaling of one describes the
+	// other.
+	var rawAll float64
+	for _, g := range sums {
+		if g.Aggregated {
+			return nil, 0, errors.New("the server folded several profiles into one data point, " +
+				"and whether that point carries their sum is not something the API promises")
+		}
+		rawAll += g.Total
+	}
+	if rawAll == 0 {
+		return nil, 0, errors.New("the range query summed to zero where the merge did not")
+	}
+	if d := math.Abs(rawAll-overall.Raw) / overall.Raw; d > sumByTolerance {
+		return nil, 0, fmt.Errorf("the range query summed to %.0f where the merge summed to %.0f, "+
+			"a %.0f%% difference, so they did not see the same data", rawAll, overall.Raw, d*100)
+	}
+
+	// Normalised against the range query's OWN total, not the merge's.
+	//
+	// The two are separate queries. Against a window still being written they
+	// routinely differ by a per cent or so -- profiles for it are still
+	// arriving between one call and the next -- and dividing by the merge's
+	// total would push that difference straight into every row, leaving them
+	// summing to something other than 100%. Dividing by rawAll makes the rows
+	// the range query's own proportions, carried onto the total the merge
+	// measured: internally consistent, and immune to a scrape landing between
+	// the two calls.
+	//
+	// The check above is therefore for gross disagreement -- a truncated
+	// response, a different sample-type column -- not for drift.
+	scale := overall.Value / rawAll
+	seen := make(map[string]bool, len(sums))
+	dropped := 0
+	out := make([]groupResult, 0, len(sums))
+	for _, g := range sums {
+		if g.Value == "" {
+			// Series carrying no value for this label. Left out so the
+			// residual is derived by subtraction exactly as the fan-out
+			// derives it, and counted into rawAll above so the check can see
+			// them.
+			continue
+		}
+		if !valid[g.Value] {
+			// A value the label list did not have. Counted, not silently
+			// folded into the residual: that row would then say this CPU
+			// carries no label, when we were told its name and discarded it.
+			dropped++
+			continue
+		}
+		seen[g.Value] = true
+		out = append(out, groupResult{
+			name:   g.Value,
+			value:  g.Total * scale,
+			header: overall.Header,
+			rate:   overall.Rate,
+		})
+	}
+
+	// A value the label list had and the range query did not answer for has no
+	// samples in this window. The fan-out learned that by merging it and
+	// getting nothing back; here it is an absence, and saying nothing about it
+	// would drop the "N values had no samples" and "N values yielded nothing
+	// under --match" lines that exist to stop a reader blaming the wrong thing.
+	for v := range valid {
+		if !seen[v] {
+			out = append(out, groupResult{name: v, empty: true})
+		}
+	}
+	return out, dropped, nil
+}
+
+// sumByTolerance is how far the range query's total may sit from the merge's
+// before the two are treated as describing different data rather than the same
+// data seen a moment apart.
+//
+// Deliberately loose. Small differences are normal and are handled by
+// normalising (see sumByGroups), so this is only a guard against the failures
+// that would make the whole conversion meaningless: a truncated or downsampled
+// response, or a sum over a different column than the merge summed. Those are
+// not subtle. Measured against a live server, two calls seconds apart over a
+// window still being written differed by 1.1%.
+const sumByTolerance = 0.10
+
+func sumByOnce(ctx context.Context, c *Client, o options, profType string,
+	start, end time.Time,
+) ([]GroupTotal, error) {
+	qctx, cancel := context.WithTimeout(ctx, o.timeout)
+	defer cancel()
+	return c.SumByLabel(qctx, selector(profType, "", "", o.match), o.by, start, end)
 }

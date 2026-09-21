@@ -257,3 +257,78 @@ func (c *Client) MergePprof(ctx context.Context, selector string, start, end tim
 	}
 	return resp.GetPprof(), nil
 }
+
+// GroupTotal is one label value and the raw sample value it summed to.
+//
+// Raw, not converted: the range API knows nothing about sampling periods, so a
+// CPU profile's total here is a count of stacks. Turning that into cores needs
+// metadata this API does not return, and is the caller's job.
+type GroupTotal struct {
+	Value string
+	Total float64
+	// Aggregated is true when the server folded several profiles into one data
+	// point. It says so with MetricsSample.Count, and the caller has to care:
+	// whether an aggregated point carries the SUM of what it folded -- which is
+	// what adding these up assumes -- is not something the API promises.
+	Aggregated bool
+}
+
+// SumByLabel breaks a profile down by one label using a range query, which is
+// the cheap way to do it: the server aggregates with sum_by and never
+// materializes a stack.
+//
+// The alternative -- one merge per label value -- is what makes a breakdown
+// expensive. A merge reconstructs every distinct stacktrace so it can return a
+// profile; summing a label needs none of that, and the cost stops scaling with
+// the number of values.
+//
+// Delta profiles only. A non-delta profile is a level measured repeatedly, and
+// its groups have to be read at one shared instant or the rows and the total
+// describe different moments; a range query takes each series independently and
+// cannot do that. The caller enforces it -- there is no parameter here, because
+// there is no correct non-delta behaviour to select.
+//
+// Series sharing a label value are summed, not listed twice. A server that does
+// not understand sum_by ignores the field rather than failing, and answers with
+// one series per target; without folding them the same name would appear once
+// per instance, each with a fraction of its value, and no error to fall back on.
+func (c *Client) SumByLabel(ctx context.Context, selector, label string, start, end time.Time) ([]GroupTotal, error) {
+	resp, err := c.q.QueryRange(ctx, &qv1.QueryRangeRequest{
+		Query: selector,
+		Start: timestamppb.New(start),
+		End:   timestamppb.New(end),
+		SumBy: []string{label},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("range query %q by %s: %w", selector, label, err)
+	}
+
+	byValue := map[string]*GroupTotal{}
+	var order []string
+	for _, s := range resp.GetSeries() {
+		value := ""
+		for _, l := range s.GetLabelset().GetLabels() {
+			if l.GetName() == label {
+				value = l.GetValue()
+			}
+		}
+		g, seen := byValue[value]
+		if !seen {
+			g = &GroupTotal{Value: value}
+			byValue[value] = g
+			order = append(order, value)
+		}
+		for _, smp := range s.GetSamples() {
+			g.Total += float64(smp.GetValue())
+			if smp.GetCount() > 1 {
+				g.Aggregated = true
+			}
+		}
+	}
+
+	out := make([]GroupTotal, 0, len(order))
+	for _, v := range order {
+		out = append(out, *byValue[v])
+	}
+	return out, nil
+}

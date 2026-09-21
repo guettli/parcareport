@@ -50,7 +50,12 @@ type options struct {
 	moreToCome bool
 	// setFlags records which flags were given, so a subcommand can refuse one
 	// it would otherwise ignore.
-	setFlags    map[string]bool
+	setFlags map[string]bool
+	// fanOut forces one merge per label value instead of the single range
+	// query. Slower by orders of magnitude, and the only way to price each
+	// group from its own profile -- which is the cross-check that can reveal
+	// a fleet whose agents sample at different frequencies.
+	fanOut      bool
 	concurrency int
 	timeout     time.Duration
 	deadline    time.Duration
@@ -82,6 +87,8 @@ func run(args []string) error {
 	fs.StringVar(&o.sortBy, "sort", defaultSortBy, "order functions by 'flat' (self time) or 'cum' (cumulative)")
 	fs.StringVar(&o.output, "output", outputTable, "'table' for a person, 'json' for a script")
 	fs.IntVar(&o.maxGroups, "max-group-values", 50, "overview: skip a breakdown whose label has more values than this")
+	fs.BoolVar(&o.fanOut, "fan-out", false,
+		"price each group with its own merge instead of one range query: far slower, but the only way to cross-check the breakdown")
 	fs.IntVar(&o.concurrency, "concurrency", 4, "parallel queries: group merges, and the labels fan-out (overview lowers this to 2 unless given)")
 	fs.DurationVar(&o.timeout, "timeout", 60*time.Second, "per-query timeout; a slow group fails visibly instead of stalling the run")
 	fs.DurationVar(&o.deadline, "deadline", 10*time.Minute, "budget for the whole run; 0 removes it and relies on --timeout alone")
@@ -905,6 +912,11 @@ what work a frame was part of, but puts runtime plumbing on top.
 The function table comes from the unfiltered merge, so it covers every row of
 the breakdown at once. To get one row's own functions, re-run with --match
 pinning it; a report prints the command for its largest rows.
+
+The breakdown is priced with one range query, not one merge per label value,
+which is what makes a wide label like comm affordable. --fan-out forces the
+slow path: it is the only way to price each group from its own profile, and so
+the only cross-check on a fleet whose agents sample at different frequencies.
 
 A NOTES block appears when a plain rule spots something in the numbers: a
 profile that cannot be attributed, a total that does not add up, a workload at

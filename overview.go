@@ -147,7 +147,15 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 				})
 				continue
 			}
-			if o.maxGroups > 0 && len(vals) > o.maxGroups {
+			// The cap exists because each value used to cost a merge. A delta
+			// CPU breakdown is now one range query however many values there
+			// are, so applying it there would refuse the case it was written
+			// to protect -- `comm` has over a thousand values and is the most
+			// useful breakdown on the list, being the one that names
+			// processes. It still applies under --fan-out, where the old cost
+			// is back.
+			costsAMerge := o.fanOut || !isDeltaType(cpu[0])
+			if costsAMerge && o.maxGroups > 0 && len(vals) > o.maxGroups {
 				d.Skipped = append(d.Skipped, skippedJSON{
 					What: "CPU by " + by,
 					Reason: fmt.Sprintf("%d values is more than --max-group-values=%d, and each one costs a merge; "+

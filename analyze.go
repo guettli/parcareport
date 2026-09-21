@@ -34,6 +34,15 @@ type Metric struct {
 	// divided, and collapsing both into Rate would print its function table in
 	// raw nanoseconds against a group table in seconds.
 	Duration bool
+
+	// Raw is the untouched sum of sample values, before any unit conversion.
+	//
+	// It exists so a breakdown can be priced without merging each group: the
+	// server can sum a label cheaply, but it answers in these raw units and
+	// knows nothing about periods or seconds. Value/Raw is the factor that
+	// turns one into the other, taken from the one profile that carries the
+	// metadata to compute it.
+	Raw float64
 }
 
 // interpret summarizes a profile the way its units actually mean.
@@ -61,7 +70,7 @@ func interpret(p *profile.Profile, window time.Duration, isDelta bool) (Metric, 
 
 	switch unit {
 	case "bytes":
-		return Metric{Header: "BYTES", Value: float64(total)}, nil
+		return Metric{Header: "BYTES", Value: float64(total), Raw: float64(total)}, nil
 	case "count":
 		// A count with a time-based period is a sampled duration (parca-agent's
 		// CPU profile); a count with no such period is a real count.
@@ -70,9 +79,9 @@ func interpret(p *profile.Profile, window time.Duration, isDelta bool) (Metric, 
 			if err != nil {
 				return Metric{}, err
 			}
-			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true, Duration: true}, nil
+			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true, Duration: true, Raw: float64(total)}, nil
 		}
-		return Metric{Header: "COUNT", Value: float64(total)}, nil
+		return Metric{Header: "COUNT", Value: float64(total), Raw: float64(total)}, nil
 	}
 
 	if isTimeUnit(unit) {
@@ -81,15 +90,15 @@ func interpret(p *profile.Profile, window time.Duration, isDelta bool) (Metric, 
 			return Metric{}, err
 		}
 		if sampleTypeIsCPU(p, idx) {
-			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true, Duration: true}, nil
+			return Metric{Header: "CORES", Value: cores(secs, window), Rate: true, Duration: true, Raw: float64(total)}, nil
 		}
 		if !isDelta {
 			// Cumulative since process start, so there is no window to
 			// average over -- report the total it actually is.
-			return Metric{Header: "SECONDS", Value: secs, Duration: true}, nil
+			return Metric{Header: "SECONDS", Value: secs, Duration: true, Raw: float64(total)}, nil
 		}
 		// wallclock: average threads waiting, not cores.
-		return Metric{Header: "BLOCKED", Value: cores(secs, window), Rate: true, Duration: true}, nil
+		return Metric{Header: "BLOCKED", Value: cores(secs, window), Rate: true, Duration: true, Raw: float64(total)}, nil
 	}
 	return Metric{}, fmt.Errorf("unsupported sample unit %q", unit)
 }
