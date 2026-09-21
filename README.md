@@ -62,6 +62,59 @@ workload; a single frame at 76.9% was not.
 what larger piece of work a frame was part of, which is what you want once you
 already know which function is hot.
 
+## The function table is not the breakdown of the row above it
+
+Both tables come from the same run, but not from the same query. The breakdown
+merges each label value separately; the function table comes from the **one
+unfiltered merge**, so it describes every row at once and belongs to none of
+them:
+
+```
+NODE              CORES  %TOTAL
+tc                0.936   43.1     <- these are per-node
+p16               0.672   31.0
+coffee-and-sugar  0.564   25.9
+
+FUNCTION                    CUM    FLAT*  %TOTAL
+[unsymbolized]              2.018  2.011   92.6  <- this is all three together
+```
+
+Reading the functions as `tc`'s is the obvious mistake, and it is wrong by
+whatever the other rows contribute. To get one row's own functions, re-run
+narrowed to it — which is what the report now prints for its largest rows:
+
+```
+The functions above are fleet-wide -- they describe every row together,
+not any one of them. To get one row's own functions:
+  tc                parcareport --url parca.example:7070 --by node --match 'node="tc"'
+  p16               parcareport --url parca.example:7070 --by node --match 'node="p16"'
+  coffee-and-sugar  parcareport --url parca.example:7070 --by node --match 'node="coffee-and-sugar"'
+```
+
+That is not a cosmetic difference. On a real server the fleet-wide table was
+99.8% `[unsymbolized]` with nothing else visible; narrowed to one node the same
+run surfaced `operator new`, `operator delete` and `std::_Rb_tree_increment` —
+frames that existed all along, buried under everything else.
+
+The commands carry what decides *what* is asked and *how the server is
+reached*: `--url`, `--insecure=false`, the credential **file** flags,
+`--profile-type`, `--from`, `--to` and `--sort`. Presentation and budgets
+(`--top`, `--timeout`, `--deadline`, `--concurrency`) are left at their
+defaults, and flags you did not pass are not invented. `--bearer-token` and
+`--password` are deliberately **not** echoed — they take the secret on the
+command line, and a printed command ends up in terminals and logs.
+
+One thing the commands cannot pin: a **relative** `--from` is re-evaluated when
+you run it, so `--from=-6h` means six hours before *then*, not before the
+original run. Pass absolute RFC3339 times if you need the identical window. For
+a non-delta profile the snapshot instant is recomputed from the narrowed
+selector too, so it can land on a different scrape.
+
+A row already pinned by `--match` and grouped the same way gets no command,
+because it would hand back the report you are reading. Pinned but *regrouped*
+still gets one — `--by namespace --match 'cluster="tc"'` is a different report
+from the cluster breakdown.
+
 ## CORES, and why not percentages of a flamegraph
 
 `CORES` is **average cores busy over the window**: CPU-seconds ÷ wall-seconds.
@@ -402,8 +455,14 @@ the failures as data:
   "unit": "cores",
   "rate": true,
   "groups": [
-    {"name": "us", "value": 2.3160163, "pct": 77.95409962975428},
-    {"name": "eu1", "value": 0.6549837, "pct": 22.045900370245704}
+    {"name": "us", "value": 2.3160163, "pct": 77.95409962975428,
+     "drill_down": {
+       "command": "parcareport --by namespace --match 'cluster=\"us\"'",
+       "by": "namespace", "match": "cluster=\"us\""}},
+    {"name": "eu1", "value": 0.6549837, "pct": 22.045900370245704,
+     "drill_down": {
+       "command": "parcareport --by namespace --match 'cluster=\"eu1\"'",
+       "by": "namespace", "match": "cluster=\"eu1\""}}
   ],
   "empty_groups": 0,
   "total": 2.971,
@@ -416,6 +475,12 @@ the failures as data:
   "complete": true
 }
 ```
+
+`drill_down` is the command that narrows the report to that row, given both
+ready to run and split into parts so a consumer can compose its own call. It
+is `null` for the `(unlabeled)` row, because no matcher selects "carries no
+value for this label at all" — `cluster=""` is a claim about the value, and
+offering it would quietly report something else.
 
 Two fields matter more than the rest. **`complete`** is the machine-checkable
 form of the `!! INCOMPLETE` banner, and **`failed`** says exactly which groups

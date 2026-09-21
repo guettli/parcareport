@@ -208,6 +208,10 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		// The type came from the list read above, so it needs no lookup and
 		// no validation -- passing it as resolvedType skips both.
 		so.resolvedType, so.by = p.profType, p.by
+		// The label list was read above, so the drill-down hints can name a
+		// finer label instead of leaving --by where it is. A plain report has
+		// no list and does not fetch one; see nextBreakdown.
+		so.knownLabels = labels
 		so.moreToCome = true
 		so.profileType = p.profType
 		sd, serr := gatherReport(ctx, c, so, start, end)

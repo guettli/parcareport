@@ -103,3 +103,49 @@ func truncate(s string, n int) string {
 	// n-1 runes plus the one-rune ellipsis, so the result is exactly n wide.
 	return string(r[:n-1]) + "…"
 }
+
+// drillDownsShown is how many rows get their command printed. The table lists
+// every group, but a wall of near-identical commands is not more useful than
+// the few that matter, and the biggest rows are the ones a reader acts on.
+// JSON carries one for every row regardless.
+const drillDownsShown = 3
+
+// printDrillDowns prints the command that narrows the report to a row.
+//
+// It is here because of what the function table is NOT: it comes from the
+// unfiltered merge, so it describes every row at once and belongs to none of
+// them. Someone reading "tc 65.9%" above a list of functions will reasonably
+// assume the functions are tc's. They are not, and the only way to make them so
+// is to re-run narrowed -- which is what these commands do.
+func printDrillDowns(groups []groupJSON, narrowed, hasFunctions bool) {
+	shown := make([]groupJSON, 0, drillDownsShown)
+	for _, g := range groups {
+		if g.DrillDown == nil {
+			continue
+		}
+		if shown = append(shown, g); len(shown) == drillDownsShown {
+			break
+		}
+	}
+	if len(shown) == 0 {
+		return
+	}
+
+	if !hasFunctions {
+		// Nothing was printed for the claim below to be about.
+		fmt.Print("\nTo narrow this report to one row:\n")
+	} else {
+		scope := "fleet-wide"
+		if narrowed {
+			scope = "for everything --match selected"
+		}
+		fmt.Printf("\nThe functions above are %s -- they describe every row together,\n"+
+			"not any one of them. To get one row's own functions:\n", scope)
+	}
+
+	w := newTab()
+	for _, g := range shown {
+		fmt.Fprintf(w, "  %s\t%s\n", truncate(g.Name, 30), g.DrillDown.Command)
+	}
+	w.Flush()
+}
