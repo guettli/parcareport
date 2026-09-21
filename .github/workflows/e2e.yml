@@ -49,10 +49,31 @@ jobs:
           done
           echo "::error::zoo did not come up"; cat /tmp/zoo.log; exit 1
 
+      # The release binary is immutable for a given version+checksum, so cache
+      # it: most runs then skip GitHub entirely instead of betting the whole
+      # job on its CDN being up. A re-run of a failed job restores the cache
+      # too, so a GitHub blip does not reproduce on the retry.
+      - name: Cache the Parca release binary
+        id: parca-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/parca.tar.gz
+          key: parca-${{ env.PARCA_VERSION }}-linux-x86_64-${{ env.PARCA_SHA256 }}
+
+      - name: Download Parca
+        if: steps.parca-cache.outputs.cache-hit != 'true'
+        run: |
+          # GitHub's release CDN answers 504 for stretches at a time; --retry 3
+          # gave up inside ten seconds. Retry longer, with a delay, to ride out
+          # a transient outage rather than fail the run on it.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 180 \
+            --retry-all-errors -o /tmp/parca.tar.gz \
+            "https://github.com/parca-dev/parca/releases/download/v${PARCA_VERSION}/parca_${PARCA_VERSION}_Linux_x86_64.tar.gz"
+
       - name: Start Parca scraping the zoo
         run: |
-          curl -fsSL --retry 3 --retry-all-errors -o /tmp/parca.tar.gz \
-            "https://github.com/parca-dev/parca/releases/download/v${PARCA_VERSION}/parca_${PARCA_VERSION}_Linux_x86_64.tar.gz"
+          # Verify here, not in Download: a restored cache is unsigned bytes on
+          # disk, so the checksum has to gate the cache hit as well.
           echo "${PARCA_SHA256}  /tmp/parca.tar.gz" | sha256sum -c -
           mkdir -p /tmp/parca /tmp/parca-data
           tar xzf /tmp/parca.tar.gz -C /tmp/parca
