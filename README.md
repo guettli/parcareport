@@ -102,6 +102,60 @@ measured repeatedly, and every group has to be read at one shared instant or
 the rows and the total describe different moments; a range query takes each
 series independently and cannot do that.
 
+## What the overview did *not* look at
+
+`overview` sweeps **CPU and live heap**. On a server offering eleven profile
+types that is two of them, and the header saying `11 profile types` reads as
+coverage rather than as a menu it sampled twice. So it now names the rest, with
+the command that would look at each:
+
+```
+-- not reported, 9 of them: overview sweeps CPU and live heap; this type needs an explicit --profile-type
+   block:contentions:count:contentions:count
+     parcareport --url parca:7070 --profile-type block:contentions:count:contentions:count --from -5m --by instance
+   block:delay:nanoseconds:contentions:count
+     parcareport --url parca:7070 --profile-type block:delay:nanoseconds:contentions:count --from -5m --by instance
+   goroutine:goroutine:count:goroutine:count
+     parcareport --url parca:7070 --profile-type goroutine:goroutine:count:goroutine:count --from -5m --by instance
+   ...
+   parca_agent:wallclock:nanoseconds:samples:count:delta
+     parcareport --url parca:7070 --profile-type parca_agent:wallclock:nanoseconds:samples:count:delta --from -5m --by comm
+```
+
+This is a coverage disclosure and a drill-down hint at once — every capability
+the overview declined to exercise gets a runnable command beside it. It matters
+because ["the overview found nothing" says nothing about lock contention,
+blocking, goroutine leaks, allocation churn or off-CPU
+waits](docs/bottlenecks.md), and until now you had to know that.
+
+The suggested `--by` is read from the profile, not guessed. `parca-agent` tags
+its own profiles with the fleet labels (`cluster`, `namespace`, `workload`,
+`comm`, `node`); everything scraped from a `/debug/pprof` endpoint carries only
+`job` and `instance`. Pairing one with the other's labels reports an empty
+window for a profile with plenty — a real failure this tool hit once already.
+Where no label the profile carries is available, **no command is offered**, and
+the reason says so.
+
+Off-CPU is the one exception: `wallclock` is suggested `--by comm`, not
+`--by cluster`, because [a wallclock total is mostly
+idleness](docs/bottlenecks.md) and only the stacks are worth judging — a
+two-row cluster table is the shape that doc warns against.
+
+The run's `--match` is **not** carried onto a suggestion that changes the
+profile type, for the same reason: a matcher written for one tier's labels
+selects nothing on the other's.
+
+In `--output=json`, `skipped[].command` is a field. It used to be a clause
+inside the reason, which is prose to a person and a regex to an agent. Each
+skip also carries a `kind` — the same distinction `outcome` draws for the run
+as a whole:
+
+| `kind` | |
+| :--- | :--- |
+| `not_swept` | this command has no policy for it; nothing went wrong |
+| `too_costly` | it would have run, but was refused on cost — `command` says how to get it anyway |
+| `unavailable` | it could not run: a query failed, or nothing exists to group it by |
+
 ## Notes: what the tool noticed
 
 A sorted table is not a pointer. `parcareport` calls itself a bottleneck report,

@@ -84,6 +84,10 @@ func baseCommandArgs(o options, profileTypeOverride string) []string {
 	// Not carried: presentation and budgets (--top, --timeout, --deadline,
 	// --concurrency, --output). Those change how the answer is shown, not what
 	// it is, and the defaults are as good a starting point as the last run's.
+	//
+	// A relative --from is carried verbatim, so `--from -6h` in a suggestion
+	// means six hours before you run it, not before the run that printed it.
+	// Pass absolute times if you need the identical window; the README says so.
 	if o.setFlags["url"] {
 		args = append(args, "--url "+shellQuote(o.addr))
 	}
@@ -122,6 +126,13 @@ func baseCommandArgs(o options, profileTypeOverride string) []string {
 	}
 	if o.setFlags["to"] {
 		args = append(args, "--to "+shellQuote(o.to))
+	}
+	if o.fanOut {
+		// Carried because it changes what is measured, not how it is shown: a
+		// suggestion offered *because* the fan-out is expensive must re-run
+		// the fan-out, or it answers a different question than the one that
+		// was refused.
+		args = append(args, "--fan-out")
 	}
 	if o.setFlags["sort"] {
 		// Dropping --sort=cum flips the function table back to flat, and the
