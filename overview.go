@@ -92,9 +92,32 @@ func notesFromGroups(notes []noteJSON) []noteJSON {
 	return out
 }
 
+// Why something was left out. The same distinction the report's `outcome`
+// draws: a choice is not a failure, and one heading covering both put "we do
+// not sweep this type" beside "this query died" with nothing to tell them
+// apart.
+const (
+	// skipNotSwept: this command has no policy for it. Nothing went wrong.
+	skipNotSwept = "not_swept"
+	// skipTooCostly: it would have been run, but it was refused on cost. A
+	// choice, and a recoverable one -- the command says how.
+	skipTooCostly = "too_costly"
+	// skipUnavailable: it could not be run. A query failed, or nothing exists
+	// to group it by.
+	skipUnavailable = "unavailable"
+)
+
 type skippedJSON struct {
-	What   string `json:"what"`
+	What string `json:"what"`
+	// Kind is skipNotSwept, skipTooCostly or skipUnavailable.
+	Kind   string `json:"kind"`
 	Reason string `json:"reason"`
+	// Command is what to run to get the thing that was skipped, when there is
+	// such a thing to run. Separate from Reason because a consumer should not
+	// have to pull a command out of an English sentence -- the reasons used to
+	// end "run `parcareport --by=comm` directly if you want it", which is a
+	// hint an agent has to regex.
+	Command string `json:"command,omitempty"`
 }
 
 // overview answers the questions a person meeting a new Parca would ask,
@@ -157,6 +180,7 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		// guessing which of several to report would misattribute the fleet.
 		d.Skipped = append(d.Skipped, skippedJSON{
 			What:   "CPU breakdowns",
+			Kind:   skipUnavailable,
 			Reason: fmt.Sprintf("the server offers %d CPU delta profiles, so there is no single one to report on", len(cpu)),
 		})
 	}
@@ -183,6 +207,7 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 				lookupFailed = true
 				d.Skipped = append(d.Skipped, skippedJSON{
 					What:   "CPU by " + by,
+					Kind:   skipUnavailable,
 					Reason: shortErr(err),
 				})
 				continue
@@ -198,8 +223,11 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			if costsAMerge && o.maxGroups > 0 && len(vals) > o.maxGroups {
 				d.Skipped = append(d.Skipped, skippedJSON{
 					What: "CPU by " + by,
-					Reason: fmt.Sprintf("%d values is more than --max-group-values=%d, and each one costs a merge; "+
-						"run `parcareport --by=%s` directly if you want it", len(vals), o.maxGroups, by),
+					Kind: skipTooCostly,
+					Reason: fmt.Sprintf("%d values is more than --max-group-values=%d, and each one costs a merge",
+						len(vals), o.maxGroups),
+					// Same profile type, so the run's --match still applies.
+					Command: sectionCommand(o, cpu[0], by, true),
 				})
 				continue
 			}
@@ -214,7 +242,7 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 			if lookupFailed {
 				reason = "the label lookups above failed, so there was nothing left to break the CPU profile down by"
 			}
-			d.Skipped = append(d.Skipped, skippedJSON{What: "CPU breakdowns", Reason: reason})
+			d.Skipped = append(d.Skipped, skippedJSON{What: "CPU breakdowns", Kind: skipUnavailable, Reason: reason})
 		}
 	}
 	// Live heap, if the server has it. It is not a rate and says something the
@@ -227,16 +255,38 @@ func overview(ctx context.Context, c *Client, o options, start, end time.Time) e
 		// in this window)" for a heap profile that has plenty -- the same
 		// conflation of "absent label" with "no data" the tool refuses
 		// everywhere else.
-		by := firstPresent(labels, "instance", "job")
+		by := breakdownLabelFor(heap, labels)
 		if by == "" {
 			d.Skipped = append(d.Skipped, skippedJSON{
 				What:   "live heap",
+				Kind:   skipUnavailable,
 				Reason: "no instance or job label to group by; heap profiles come from scrape targets, which carry those",
 			})
 		} else {
 			plan = append(plan, struct{ profType, by string }{heap, by})
 		}
 	}
+
+	// Everything the server offers that this command has no policy for.
+	//
+	// Seeded with the types it DOES have a policy for, not merely the ones it
+	// ran. A type the overview considered and declined already carries its own
+	// honest skip -- "no instance or job label to group by", "the server offers
+	// 2 CPU delta profiles" -- and letting it fall through here overwrote that
+	// with "overview sweeps CPU and live heap", which is false of exactly those
+	// types. It listed the live-heap type as unswept two lines under a sentence
+	// naming live heap as swept.
+	used := map[string]bool{}
+	for _, p := range plan {
+		used[p.profType] = true
+	}
+	for _, t := range cpu {
+		used[t] = true
+	}
+	if h := findHeapType(types); h != "" {
+		used[h] = true
+	}
+	d.Skipped = append(d.Skipped, unanalyzedTypes(o, types, used, labels)...)
 
 	if len(plan) == 0 {
 		err := fmt.Errorf("nothing to report on: the server has %d profile types and %d labels "+
@@ -388,9 +438,46 @@ func printSkipped(skipped []skippedJSON) {
 		return
 	}
 	fmt.Println()
+	// Grouped by reason for the page, one entry per thing in the document.
+	// Nine profile types each repeating the same sentence is a wall a reader
+	// skips; a consumer still wants them separable, so the grouping lives here
+	// rather than in the data.
+	//
+	// By reason, not by adjacency. The entries are appended from several
+	// places and sorted inside one of them, so two sharing a reason are not
+	// guaranteed to be neighbours -- a run-length version printed the same
+	// heading twice and called the second group "2 of them" when five shared
+	// it.
+	var order []string
+	groups := map[string][]skippedJSON{}
 	for _, s := range skipped {
-		fmt.Printf("-- not reported: %s (%s)\n", s.What, s.Reason)
+		if _, seen := groups[s.Reason]; !seen {
+			order = append(order, s.Reason)
+		}
+		groups[s.Reason] = append(groups[s.Reason], s)
 	}
+
+	for _, reason := range order {
+		g := groups[reason]
+		if len(g) == 1 {
+			fmt.Printf("-- not reported: %s\n   %s\n", g[0].What, reason)
+			if g[0].Command != "" {
+				fmt.Printf("   %s\n", g[0].Command)
+			}
+			continue
+		}
+		fmt.Printf("-- not reported, %d of them: %s\n", len(g), reason)
+		for _, s := range g {
+			fmt.Printf("   %s\n", s.What)
+			if s.Command != "" {
+				// On its own line, and runnable. It used to be a clause inside
+				// the reason, which made it prose to a person and a regex to
+				// an agent.
+				fmt.Printf("     %s\n", s.Command)
+			}
+		}
+	}
+
 }
 
 // findHeapType picks the live-heap profile by its parts rather than by a
@@ -418,4 +505,101 @@ func firstPresent(have []string, names ...string) string {
 		}
 	}
 	return ""
+}
+
+// unanalyzedTypes lists the profile types the overview did not look at, with
+// the command that would look at each.
+//
+// The header says "11 profile types", which reads as coverage. It is a menu:
+// an overview sweeps CPU and live heap, so on that server it sampled two of
+// eleven and said nothing about the other nine. docs/bottlenecks.md warns that
+// "the overview found nothing" says nothing about contention, blocking,
+// goroutine leaks, allocation churn or off-CPU waits -- the doc said it and the
+// tool did not.
+//
+// This is a coverage disclosure and a drill-down hint at once, which is why it
+// is worth more than its size: every capability the overview declined to
+// exercise gets a runnable command next to it.
+func unanalyzedTypes(o options, all []string, used map[string]bool, labels []string) []skippedJSON {
+	// Sorted, because the server's own order is not stable and two runs over
+	// the same window should print the same page.
+	rest := make([]string, 0, len(all))
+	for _, t := range all {
+		if !used[t] {
+			rest = append(rest, t)
+		}
+	}
+	sort.Strings(rest)
+
+	var out []skippedJSON
+	for _, t := range rest {
+		by := breakdownLabelFor(t, labels)
+		sk := skippedJSON{
+			What:   t,
+			Kind:   skipNotSwept,
+			Reason: "overview sweeps CPU and live heap; this type needs an explicit --profile-type",
+		}
+		if by == "" {
+			// No sensible label to group it by, so no command: one that named
+			// a label these series do not carry would report "(no data)" for a
+			// profile with plenty, which is the conflation of "absent label"
+			// with "no data" this tool refuses everywhere else.
+			sk.Kind = skipUnavailable
+			sk.Reason += ", and no label it carries is available to group it by"
+		} else {
+			sk.Command = sectionCommand(o, t, by, false)
+		}
+		out = append(out, sk)
+	}
+	return out
+}
+
+// breakdownLabelFor picks the label to suggest for a type the overview did not
+// run.
+//
+// Which labels a series carries depends on who wrote it. parca-agent tags its
+// own profiles with the fleet labels -- cluster, node, comm -- while everything
+// scraped from a /debug/pprof endpoint carries only job and instance. Pairing
+// one with the other's labels is a real failure mode and is documented a few
+// lines above: the heap section once defaulted to `cluster`, matched nothing,
+// and reported an empty window for a profile that had plenty.
+//
+// The profile name is the first field of the selector and says which tier
+// wrote it, so the choice is read rather than guessed.
+func breakdownLabelFor(profType string, labels []string) string {
+	name, rest, _ := strings.Cut(profType, ":")
+	if name != "parca_agent" {
+		return firstPresent(labels, "instance", "job")
+	}
+	if strings.HasPrefix(rest, "wallclock:") {
+		// Off-CPU wants the process, not the cluster. docs/bottlenecks.md is
+		// explicit that a wallclock total is mostly idleness and that the
+		// stacks are the only thing worth judging -- so a two-row cluster
+		// table is the shape it warns against, while `comm` at least names
+		// what to look inside.
+		return firstPresent(labels, "comm", "workload", "container", "node", "cluster")
+	}
+	// node is in the list even though overviewBreakdowns omits it: the agent
+	// tier always carries it, and it is a useful breakdown for a type the
+	// overview is not going to run itself.
+	return firstPresent(labels, append(append([]string{}, overviewBreakdowns...), "node")...)
+}
+
+// sectionCommand is the command that runs one breakdown the overview did not.
+// Built from the same parts as every other suggestion this tool prints, so it
+// carries the url, TLS and credential-file flags the run was given.
+//
+// carryMatch is false for a suggestion that changes the profile type. The run's
+// --match was written for the labels of the type it was run against, and a
+// scrape-tier profile does not carry parca-agent's: copying
+// `--match 'cluster="tc"'` onto a goroutine profile selects nothing and reports
+// an empty window for a profile with plenty, which is the exact mistake the
+// label choice above exists to avoid.
+func sectionCommand(o options, profType, by string, carryMatch bool) string {
+	args := baseCommandArgs(o, profType)
+	args = append(args, "--by "+shellQuote(by))
+	if carryMatch && o.match != "" {
+		args = append(args, "--match "+shellQuote(o.match))
+	}
+	return strings.Join(args, " ")
 }
